@@ -3,13 +3,12 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import re
 
-app = FastAPI(title="OTT Caption Rules Engine", version="0.2.0")
+app = FastAPI(title="OTT Caption Rules Engine", version="0.3.0")
 
 # -----------------------------
 # Models
 # -----------------------------
 class Word(BaseModel):
-    # AssemblyAI word-level timestamps typically include these fields
     text: str
     start: int  # ms
     end: int    # ms
@@ -17,7 +16,7 @@ class Word(BaseModel):
     confidence: Optional[float] = None
 
 class Rules(BaseModel):
-    # Common OTT defaults (configurable per request)
+    # Preset A defaults (OTT broadcast-ish)
     maxCharsPerLine: int = 32
     maxLines: int = 2
     maxCPS: float = 17.0
@@ -25,7 +24,6 @@ class Rules(BaseModel):
     maxDurationMs: int = 7000
     minGapMs: int = 80
 
-    # Optional behavior toggles (future-proof)
     preferPunctuationBreaks: bool = True
 
 class BuildRequest(BaseModel):
@@ -60,7 +58,9 @@ def ms_to_vtt_ts(ms: int) -> str:
 def wrap_lines(text: str, max_len: int) -> List[str]:
     """Greedy word wrap."""
     t = re.sub(r"\s+", " ", text.strip())
-    words = t.split(" ") if t else []
+    if not t:
+        return []
+    words = t.split(" ")
     lines: List[str] = []
     cur = ""
     for w in words:
@@ -72,7 +72,7 @@ def wrap_lines(text: str, max_len: int) -> List[str]:
                 lines.append(cur)
                 cur = w
             else:
-                # extremely long token fallback
+                # very long token: hard split
                 lines.append(w[:max_len])
                 cur = w[max_len:]
     if cur:
@@ -87,103 +87,130 @@ def calc_cps(text: str, dur_ms: int) -> float:
 def is_boundary_token(token: str) -> bool:
     return bool(PUNCT_BOUNDARY.search(token))
 
+def cue_text_from_words(words: List[Word], rules: Rules) -> str:
+    raw = " ".join(w.text for w in words).strip()
+    lines = wrap_lines(raw, rules.maxCharsPerLine)
+    return "\n".join(lines[:rules.maxLines])
+
+def would_violate(words: List[Word], start_ms: int, end_ms: int, rules: Rules) -> bool:
+    dur = end_ms - start_ms
+    text = cue_text_from_words(words, rules)
+    lines = text.splitlines() if text else []
+    # too many lines after wrapping
+    if len(wrap_lines(" ".join(w.text for w in words).strip(), rules.maxCharsPerLine)) > rules.maxLines:
+        return True
+    # any line too long (shouldn't happen, but guard)
+    if any(len(ln) > rules.maxCharsPerLine for ln in lines):
+        return True
+    # duration too long
+    if dur > rules.maxDurationMs:
+        return True
+    # cps too high (only meaningful when dur > 0)
+    if dur > 0 and calc_cps(text, dur) > rules.maxCPS:
+        return True
+    return False
+
 # -----------------------------
 # Core caption builder
 # -----------------------------
 def build_cues(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
     """
-    Build cues from word-level timestamps.
+    Build phrase-level cues from word timestamps.
 
-    Best-effort constraints:
-      - max chars/line
-      - max lines
-      - max CPS
-      - min/max duration
-      - no overlaps
+    Strategy:
+      - Keep appending words to current cue until adding next word would violate constraints.
+      - Prefer breaking at punctuation, but only after minDurationMs.
+      - Enforce non-overlap + minGapMs in a post-pass.
     """
+    # Clean input
+    ws = [w for w in words if w.text and w.end >= w.start]
+    ws.sort(key=lambda w: (w.start, w.end))
+
     cues: List[Dict[str, Any]] = []
+
     current: List[Word] = []
+    cue_start: Optional[int] = None
 
     def finalize(chunk: List[Word]):
         if not chunk:
             return
         start = chunk[0].start
         end = chunk[-1].end
-        raw = " ".join(w.text for w in chunk).strip()
-        lines = wrap_lines(raw, rules.maxCharsPerLine)
-
-        # If > maxLines, split chunk and retry (best-effort)
-        if len(lines) > rules.maxLines and len(chunk) > 1:
-            mid = max(1, len(chunk) // 2)
-            finalize(chunk[:mid])
-            finalize(chunk[mid:])
-            return
-
+        text = cue_text_from_words(chunk, rules)
         cues.append({
             "start": start,
             "end": end,
-            "text": "\n".join(lines[:rules.maxLines]),
+            "text": text,
             "speaker": chunk[0].speaker
         })
 
-    for w in words:
-        if not w.text:
+    for w in ws:
+        if not current:
+            current = [w]
+            cue_start = w.start
             continue
 
-        current.append(w)
+        candidate = current + [w]
+        start = cue_start if cue_start is not None else candidate[0].start
+        end = candidate[-1].end
 
-        start = current[0].start
-        end = current[-1].end
-        dur = end - start
+        # If adding this word breaks hard constraints, finalize current and start new cue
+        if would_violate(candidate, start, end, rules):
+            finalize(current)
+            current = [w]
+            cue_start = w.start
+            continue
 
-        raw = " ".join(x.text for x in current).strip()
-        lines = wrap_lines(raw, rules.maxCharsPerLine)
-        text = "\n".join(lines[:rules.maxLines])
+        # Otherwise accept
+        current = candidate
 
-        too_many_lines = len(lines) > rules.maxLines
-        too_fast = calc_cps(text, dur) > rules.maxCPS
-        too_long = dur > rules.maxDurationMs
-
-        if too_many_lines or too_fast or too_long:
-            # Choose a cut point (prefer punctuation)
-            cut_at = None
-            if rules.preferPunctuationBreaks:
-                for j in range(len(current) - 2, 0, -1):
-                    if is_boundary_token(current[j].text):
-                        cut_at = j + 1
-                        break
-            if cut_at is None:
-                cut_at = max(1, len(current) - 1)
-
-            left = current[:cut_at]
-            right = current[cut_at:]
-
-            finalize(left)
-            current = right
+        # If we have enough duration and hit punctuation, it's a good place to break
+        dur = current[-1].end - (cue_start if cue_start is not None else current[0].start)
+        if rules.preferPunctuationBreaks and dur >= rules.minDurationMs and is_boundary_token(w.text):
+            finalize(current)
+            current = []
+            cue_start = None
 
     finalize(current)
 
-    # Post-process: enforce min duration by extending into available gaps; prevent overlap
+    # -----------------------------
+    # Post-pass timing normalization
+    # -----------------------------
     cues.sort(key=lambda c: (c["start"], c["end"]))
+
+    # Enforce gaps + min duration without overlaps
     for i, c in enumerate(cues):
-        # clamp max duration
+        # Start must be >= previous end + gap
+        if i > 0:
+            prev = cues[i - 1]
+            min_start = prev["end"] + rules.minGapMs
+            if c["start"] < min_start:
+                c["start"] = min_start
+
+        # Ensure end >= start (and try to satisfy minDuration)
+        if c["end"] <= c["start"]:
+            c["end"] = c["start"] + rules.minDurationMs
+
+        # Clamp max duration
         if c["end"] - c["start"] > rules.maxDurationMs:
             c["end"] = c["start"] + rules.maxDurationMs
 
-        # enforce min duration
+        # Try to enforce minDuration using available gap to next cue
         dur = c["end"] - c["start"]
         if dur < rules.minDurationMs:
-            needed = rules.minDurationMs - dur
+            need = rules.minDurationMs - dur
             if i < len(cues) - 1:
-                gap = cues[i + 1]["start"] - c["end"]
-                take = min(needed, max(0, gap - rules.minGapMs))
-                c["end"] += take
+                next_c = cues[i + 1]
+                latest_end = next_c["start"] - rules.minGapMs
+                c["end"] = min(latest_end, c["end"] + need)
             else:
-                c["end"] += needed
+                c["end"] = c["end"] + need
 
-        # prevent overlap with next cue
-        if i < len(cues) - 1 and c["end"] > cues[i + 1]["start"] - rules.minGapMs:
-            c["end"] = max(c["start"] + rules.minDurationMs, cues[i + 1]["start"] - rules.minGapMs)
+        # Final overlap guard with next cue
+        if i < len(cues) - 1:
+            next_c = cues[i + 1]
+            if c["end"] > next_c["start"] - rules.minGapMs:
+                c["end"] = max(c["start"] + 1, next_c["start"] - rules.minGapMs)
 
     return cues
 
@@ -223,9 +250,15 @@ def qc_report(cues: List[Dict[str, Any]], rules: Rules) -> Dict[str, Any]:
         if dur > rules.maxDurationMs:
             issues.append({"cue": i, "type": "too_long_ms", "value": dur})
 
-        value_cps = calc_cps(c["text"], dur)
-        if value_cps > rules.maxCPS:
-            issues.append({"cue": i, "type": "cps_high", "value": round(value_cps, 2)})
+        cps = calc_cps(c["text"], dur)
+        if cps > rules.maxCPS:
+            issues.append({"cue": i, "type": "cps_high", "value": round(cps, 2)})
+
+        # overlap check
+        if i > 1:
+            prev = cues[i - 2]
+            if c["start"] < prev["end"] + rules.minGapMs:
+                issues.append({"cue": i, "type": "overlap_or_gap_violation", "value": c["start"] - prev["end"]})
 
     return {"issuesCount": len(issues), "issues": issues}
 
