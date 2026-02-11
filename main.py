@@ -1,38 +1,55 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 import re
 
-app = FastAPI(title="OTT Caption Rules Engine", version="0.3.0")
+app = FastAPI(title="OTT Caption Rules Engine", version="1.0.0")
 
 # -----------------------------
 # Models
 # -----------------------------
+
 class Word(BaseModel):
     text: str
-    start: int  # ms
-    end: int    # ms
+    start: int
+    end: int
     speaker: Optional[str] = None
     confidence: Optional[float] = None
 
+class Event(BaseModel):
+    # Use events to inject things like:
+    # - [Speaking Spanish]
+    # - [♪ MUSIC ♪]
+    type: Literal["foreign_language", "music", "custom"]
+    start: int
+    end: int
+    language: Optional[str] = None
+    text: Optional[str] = None
+    speaker: Optional[str] = "A"
+
 class Rules(BaseModel):
-    # Preset A defaults (OTT broadcast-ish)
+    # Caption layout + timing
     maxCharsPerLine: int = 32
     maxLines: int = 2
-    maxCPS: float = 17.0
+    maxCPS: float = 17.0            # QC target (NOT used to split)
     minDurationMs: int = 1000
     maxDurationMs: int = 7000
     minGapMs: int = 80
-
     preferPunctuationBreaks: bool = True
+
+    # SCC / broadcast-ish settings
+    sccFrameRate: float = 29.97     # default; can override per job
+    startAtHour00: bool = True      # Andrea test exception: start at 00:00:00:00
 
 class BuildRequest(BaseModel):
     words: List[Word]
+    events: Optional[List[Event]] = []
     rules: Optional[Rules] = Rules()
 
 # -----------------------------
 # Helpers
 # -----------------------------
+
 PUNCT_BOUNDARY = re.compile(r"[.!?]$|[,;:]$")
 
 def ms_to_srt_ts(ms: int) -> str:
@@ -56,7 +73,6 @@ def ms_to_vtt_ts(ms: int) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 def wrap_lines(text: str, max_len: int) -> List[str]:
-    """Greedy word wrap."""
     t = re.sub(r"\s+", " ", text.strip())
     if not t:
         return []
@@ -72,7 +88,6 @@ def wrap_lines(text: str, max_len: int) -> List[str]:
                 lines.append(cur)
                 cur = w
             else:
-                # very long token: hard split
                 lines.append(w[:max_len])
                 cur = w[max_len:]
     if cur:
@@ -92,56 +107,34 @@ def cue_text_from_words(words: List[Word], rules: Rules) -> str:
     lines = wrap_lines(raw, rules.maxCharsPerLine)
     return "\n".join(lines[:rules.maxLines])
 
-def would_violate(words: List[Word], start_ms: int, end_ms: int, rules: Rules) -> bool:
+def would_violate_layout_or_duration(words: List[Word], start_ms: int, end_ms: int, rules: Rules) -> bool:
     dur = end_ms - start_ms
-    text = cue_text_from_words(words, rules)
-    lines = text.splitlines() if text else []
-    # too many lines after wrapping
-    if len(wrap_lines(" ".join(w.text for w in words).strip(), rules.maxCharsPerLine)) > rules.maxLines:
-        return True
-    # any line too long (shouldn't happen, but guard)
-    if any(len(ln) > rules.maxCharsPerLine for ln in lines):
-        return True
-    # duration too long
     if dur > rules.maxDurationMs:
         return True
-    # cps too high (only meaningful when dur > 0)
-    if dur > 0 and calc_cps(text, dur) > rules.maxCPS:
+    raw = " ".join(w.text for w in words).strip()
+    wrapped = wrap_lines(raw, rules.maxCharsPerLine)
+    if len(wrapped) > rules.maxLines:
+        return True
+    if any(len(ln) > rules.maxCharsPerLine for ln in wrapped):
         return True
     return False
 
-# -----------------------------
-# Core caption builder
-# -----------------------------
-def build_cues(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
-    """
-    Build phrase-level cues from word timestamps.
-
-    Strategy:
-      - Keep appending words to current cue until adding next word would violate constraints.
-      - Prefer breaking at punctuation, but only after minDurationMs.
-      - Enforce non-overlap + minGapMs in a post-pass.
-    """
-    # Clean input
+def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
     ws = [w for w in words if w.text and w.end >= w.start]
     ws.sort(key=lambda w: (w.start, w.end))
 
     cues: List[Dict[str, Any]] = []
-
     current: List[Word] = []
     cue_start: Optional[int] = None
 
     def finalize(chunk: List[Word]):
         if not chunk:
             return
-        start = chunk[0].start
-        end = chunk[-1].end
-        text = cue_text_from_words(chunk, rules)
         cues.append({
-            "start": start,
-            "end": end,
-            "text": text,
-            "speaker": chunk[0].speaker
+            "start": chunk[0].start,
+            "end": chunk[-1].end,
+            "text": cue_text_from_words(chunk, rules),
+            "speaker": chunk[0].speaker or "A"
         })
 
     for w in ws:
@@ -154,17 +147,14 @@ def build_cues(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
         start = cue_start if cue_start is not None else candidate[0].start
         end = candidate[-1].end
 
-        # If adding this word breaks hard constraints, finalize current and start new cue
-        if would_violate(candidate, start, end, rules):
+        if would_violate_layout_or_duration(candidate, start, end, rules):
             finalize(current)
             current = [w]
             cue_start = w.start
             continue
 
-        # Otherwise accept
         current = candidate
 
-        # If we have enough duration and hit punctuation, it's a good place to break
         dur = current[-1].end - (cue_start if cue_start is not None else current[0].start)
         if rules.preferPunctuationBreaks and dur >= rules.minDurationMs and is_boundary_token(w.text):
             finalize(current)
@@ -173,46 +163,73 @@ def build_cues(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
 
     finalize(current)
 
-    # -----------------------------
-    # Post-pass timing normalization
-    # -----------------------------
+    # Normalize timing: enforce gaps, extend ends when possible
     cues.sort(key=lambda c: (c["start"], c["end"]))
 
-    # Enforce gaps + min duration without overlaps
     for i, c in enumerate(cues):
-        # Start must be >= previous end + gap
+        # enforce start after previous end + gap
         if i > 0:
             prev = cues[i - 1]
             min_start = prev["end"] + rules.minGapMs
             if c["start"] < min_start:
                 c["start"] = min_start
 
-        # Ensure end >= start (and try to satisfy minDuration)
+        # ensure end >= start
         if c["end"] <= c["start"]:
-            c["end"] = c["start"] + rules.minDurationMs
+            c["end"] = c["start"] + 1
 
-        # Clamp max duration
+        # clamp max duration
         if c["end"] - c["start"] > rules.maxDurationMs:
             c["end"] = c["start"] + rules.maxDurationMs
 
-        # Try to enforce minDuration using available gap to next cue
-        dur = c["end"] - c["start"]
-        if dur < rules.minDurationMs:
-            need = rules.minDurationMs - dur
-            if i < len(cues) - 1:
-                next_c = cues[i + 1]
-                latest_end = next_c["start"] - rules.minGapMs
-                c["end"] = min(latest_end, c["end"] + need)
-            else:
-                c["end"] = c["end"] + need
-
-        # Final overlap guard with next cue
+        # try to extend to minDuration and reduce CPS if there's room
+        target_end = c["start"] + rules.minDurationMs
         if i < len(cues) - 1:
             next_c = cues[i + 1]
-            if c["end"] > next_c["start"] - rules.minGapMs:
-                c["end"] = max(c["start"] + 1, next_c["start"] - rules.minGapMs)
+            latest_end = next_c["start"] - rules.minGapMs
+            if c["end"] < target_end:
+                c["end"] = min(target_end, latest_end)
+            max_allowed = min(c["start"] + rules.maxDurationMs, latest_end)
+            if c["end"] < max_allowed:
+                c["end"] = min(max_allowed, c["end"] + 500)
+        else:
+            if c["end"] < target_end:
+                c["end"] = target_end
 
     return cues
+
+def event_to_cue(ev: Event) -> Dict[str, Any]:
+    if ev.type == "foreign_language":
+        lang = (ev.language or "language").strip()
+        txt = f"[Speaking {lang}]"
+    elif ev.type == "music":
+        txt = ev.text.strip() if ev.text else "[♪ MUSIC ♪]"
+    else:
+        txt = ev.text.strip() if ev.text else "[EVENT]"
+    return {"start": ev.start, "end": ev.end, "text": txt, "speaker": ev.speaker or "A"}
+
+def merge_cues_with_events(cues: List[Dict[str, Any]], events: List[Event], rules: Rules) -> List[Dict[str, Any]]:
+    # Inject event cues, then re-sort and enforce minGap.
+    ev_cues = [event_to_cue(e) for e in (events or [])]
+    all_cues = cues + ev_cues
+    all_cues.sort(key=lambda c: (c["start"], c["end"]))
+
+    # Enforce gap + no negative durations
+    fixed: List[Dict[str, Any]] = []
+    for c in all_cues:
+        c["start"] = max(int(c["start"]), 0)
+        c["end"] = max(int(c["end"]), c["start"] + 1)
+        if not fixed:
+            fixed.append(c)
+            continue
+        prev = fixed[-1]
+        min_start = prev["end"] + rules.minGapMs
+        if c["start"] < min_start:
+            c["start"] = min_start
+            if c["end"] <= c["start"]:
+                c["end"] = c["start"] + 1
+        fixed.append(c)
+    return fixed
 
 def cues_to_srt(cues: List[Dict[str, Any]]) -> str:
     out = []
@@ -254,17 +271,55 @@ def qc_report(cues: List[Dict[str, Any]], rules: Rules) -> Dict[str, Any]:
         if cps > rules.maxCPS:
             issues.append({"cue": i, "type": "cps_high", "value": round(cps, 2)})
 
-        # overlap check
         if i > 1:
             prev = cues[i - 2]
-            if c["start"] < prev["end"] + rules.minGapMs:
-                issues.append({"cue": i, "type": "overlap_or_gap_violation", "value": c["start"] - prev["end"]})
+            gap = c["start"] - prev["end"]
+            if gap < rules.minGapMs:
+                issues.append({"cue": i, "type": "overlap_or_gap_violation", "value": gap})
 
     return {"issuesCount": len(issues), "issues": issues}
 
+def cues_to_scc(cues: List[Dict[str, Any]], rules: Rules) -> str:
+    """
+    SCC is binary-encoded CEA-608 hex — do NOT hand-roll it.
+    We convert from SRT using a proven library.
+    """
+    try:
+        from pycaption import CaptionConverter
+        from pycaption import SRTReader, SCCWriter
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"SCC export requires 'pycaption' installed. Error: {str(e)}"
+        )
+
+    # Andrea test: start at 00:00:00:00
+    # Our cue times already start near 0ms. If you want to force rebase to 0, do it here.
+    if rules.startAtHour00 and cues:
+        base = cues[0]["start"]
+        for c in cues:
+            c["start"] -= base
+            c["end"] -= base
+            c["start"] = max(c["start"], 0)
+            c["end"] = max(c["end"], c["start"] + 1)
+
+    srt = cues_to_srt(cues)
+
+    converter = CaptionConverter()
+    converter.read(srt, SRTReader())
+    caption_set = converter.captions
+
+    writer = SCCWriter()
+    # Some versions of pycaption accept frame_rate; others ignore it.
+    try:
+        return writer.write(caption_set, frame_rate=rules.sccFrameRate)
+    except TypeError:
+        return writer.write(caption_set)
+
 # -----------------------------
-# API
+# Endpoints
 # -----------------------------
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -272,11 +327,34 @@ def health():
 @app.post("/build-captions")
 def build(req: BuildRequest) -> Dict[str, Any]:
     rules = req.rules or Rules()
-    cues = build_cues(req.words, rules)
+
+    # 1) Build from words
+    cues = build_cues_from_words(req.words, rules)
+
+    # 2) Inject NBCU/Andrea events (foreign language, music, etc.)
+    cues = merge_cues_with_events(cues, req.events or [], rules)
+
+    # 3) Outputs
+    srt = cues_to_srt(cues)
+    vtt = cues_to_vtt(cues)
+    qc = qc_report(cues, rules)
+
+    # 4) SCC output
+    scc = cues_to_scc([dict(c) for c in cues], rules)
+
     return {
         "rules": rules.model_dump(),
         "cues": cues,
-        "srt": cues_to_srt(cues),
-        "vtt": cues_to_vtt(cues),
-        "qc": qc_report(cues, rules),
+        "srt": srt,
+        "vtt": vtt,
+        "scc": scc,
+        "qc": qc
     }
+
+@app.post("/export-scc")
+def export_scc(req: BuildRequest) -> Dict[str, Any]:
+    rules = req.rules or Rules()
+    cues = build_cues_from_words(req.words, rules)
+    cues = merge_cues_with_events(cues, req.events or [], rules)
+    scc = cues_to_scc([dict(c) for c in cues], rules)
+    return {"scc": scc, "qc": qc_report(cues, rules), "rules": rules.model_dump()}
