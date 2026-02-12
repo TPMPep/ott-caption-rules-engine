@@ -1,7 +1,7 @@
 import os
 import uuid
 import re
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="OTT Caption Rules Engine + AssemblyAI Orchestrator", version="1.1.0")
+app = FastAPI(title="OTT Caption Rules Engine + AssemblyAI Orchestrator", version="2.0.0")
 
 # ---------------------------
 # Environment
@@ -28,6 +28,7 @@ if not PUBLIC_BASE_URL:
     # Only used to build webhook URLs; set PUBLIC_BASE_URL in Railway to your service URL
     PUBLIC_BASE_URL = "http://localhost:8000"
 
+
 def _parse_allowed_origins(raw: str) -> List[str]:
     if not raw:
         return []
@@ -36,6 +37,7 @@ def _parse_allowed_origins(raw: str) -> List[str]:
         return ["*"]
     parts = [p.strip() for p in raw.split(",")]
     return [p for p in parts if p]
+
 
 _allowed_origins = _parse_allowed_origins(ALLOWED_ORIGINS_RAW)
 
@@ -57,6 +59,7 @@ app.add_middleware(
 # Models
 # ---------------------------
 
+
 class Rules(BaseModel):
     maxCharsPerLine: int = 32
     maxLines: int = 2
@@ -70,6 +73,9 @@ class Rules(BaseModel):
     sccFrameRate: float = 29.97
     startAtHour00: bool = True
 
+    # PRO: whether to auto-inject sound cues + foreign language cues
+    enableAutoEvents: bool = True
+
 
 class Word(BaseModel):
     text: str
@@ -79,11 +85,11 @@ class Word(BaseModel):
 
 
 class Event(BaseModel):
-    type: Literal["music", "foreign_language"]
+    type: Literal["music", "foreign_language", "sound_effect"]
     start: int
     end: int
-    text: Optional[str] = None       # for music
-    language: Optional[str] = None   # for foreign_language
+    text: Optional[str] = None  # for music/sfx
+    language: Optional[str] = None  # for foreign_language
 
 
 class FormatRequest(BaseModel):
@@ -137,8 +143,16 @@ JOB_RULES: Dict[str, Rules] = {}  # store per-job rules so webhook uses the same
 
 PUNCT_BREAK_RE = re.compile(r"[.!?…]+$")
 
+# Pro sound cue patterns
+MUSIC_RE = re.compile(r"\b(music|♪)\b", re.IGNORECASE)
+APPLAUSE_RE = re.compile(r"\b(applause|clapping)\b", re.IGNORECASE)
+LAUGHTER_RE = re.compile(r"\b(laughter|laughing)\b", re.IGNORECASE)
+
+# Foreign language patterns
+SPEAKING_LANG_RE = re.compile(r"\b(speaking|hablando|parlant)\b", re.IGNORECASE)
+
+
 def _ms_to_srt_time(ms: int) -> str:
-    # 00:00:01,000
     h = ms // 3600000
     ms -= h * 3600000
     m = ms // 60000
@@ -147,8 +161,8 @@ def _ms_to_srt_time(ms: int) -> str:
     ms -= s * 1000
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
+
 def _ms_to_vtt_time(ms: int) -> str:
-    # 00:00:01.000
     h = ms // 3600000
     ms -= h * 3600000
     m = ms // 60000
@@ -157,8 +171,10 @@ def _ms_to_vtt_time(ms: int) -> str:
     ms -= s * 1000
     return f"{h:02}:{m:02}:{s:02}.{ms:03}"
 
+
 def _clip(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
 
 def _normalize_speaker(s: Optional[str]) -> str:
     if not s:
@@ -166,9 +182,9 @@ def _normalize_speaker(s: Optional[str]) -> str:
     s = str(s).strip()
     if not s:
         return "A"
-    # If AssemblyAI returns "Speaker A", normalize to "A"
     s = s.replace("Speaker ", "").strip()
     return s or "A"
+
 
 def _strip_bracket_tokens(words: List[Word]) -> List[Word]:
     """
@@ -185,15 +201,24 @@ def _strip_bracket_tokens(words: List[Word]) -> List[Word]:
         cleaned.append(w)
     return cleaned
 
+
 def _has_special_events(events: Optional[List[Event]]) -> bool:
     if not events:
         return False
-    return any(e.type in ("music", "foreign_language") for e in events)
+    return any(e.type in ("music", "foreign_language", "sound_effect") for e in events)
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
 
 
 # ---------------------------
 # Caption cue building (simple, deterministic MVP)
 # ---------------------------
+
 
 def wrap_text(text: str, max_chars: int, max_lines: int, prefer_punct: bool) -> str:
     """
@@ -221,7 +246,6 @@ def wrap_text(text: str, max_chars: int, max_lines: int, prefer_punct: bool) -> 
             push_line(cur)
             cur = w
             if len(lines) >= max_lines:
-                # too many lines; stuff into last line (QC will flag if needed)
                 lines[-1] = (lines[-1] + " " + cur).strip()
                 cur = ""
 
@@ -235,10 +259,11 @@ def wrap_text(text: str, max_chars: int, max_lines: int, prefer_punct: bool) -> 
 
     return "\n".join(lines)
 
+
 def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
     """
     Groups words into cues with conservative timing.
-    Stable + rule-driven (not "perfect captioning", but reliable).
+    Stable + rule-driven.
     """
     if not words:
         return []
@@ -267,19 +292,20 @@ def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any
         if duration < rules.minDurationMs:
             cur_end = cur_start + rules.minDurationMs
 
-        cues.append({
-            "start": int(cur_start),
-            "end": int(cur_end),
-            "text": wrapped,
-            "speaker": cur_speaker
-        })
+        cues.append(
+            {
+                "start": int(cur_start),
+                "end": int(cur_end),
+                "text": wrapped,
+                "speaker": cur_speaker,
+            }
+        )
 
         cur_words = []
 
     for w in words:
         sp = _normalize_speaker(w.speaker)
 
-        # speaker change split
         if sp != cur_speaker:
             flush()
             cur_start = w.start
@@ -288,7 +314,6 @@ def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any
             cur_words = [w]
             continue
 
-        # gap split
         gap = w.start - cur_end
         if gap >= rules.minGapMs:
             flush()
@@ -298,7 +323,6 @@ def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any
             cur_words = [w]
             continue
 
-        # max duration split
         proposed_end = max(cur_end, w.end)
         if (proposed_end - cur_start) > rules.maxDurationMs:
             flush()
@@ -308,11 +332,9 @@ def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any
             cur_words = [w]
             continue
 
-        # add word
         cur_words.append(w)
         cur_end = max(cur_end, w.end)
 
-        # punctuation split encouragement
         if rules.preferPunctuationBreaks and PUNCT_BREAK_RE.search((w.text or "").strip()):
             if (cur_end - cur_start) >= rules.minDurationMs:
                 flush()
@@ -324,6 +346,7 @@ def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any
 # ---------------------------
 # QC
 # ---------------------------
+
 
 def qc_cues(cues: List[Dict[str, Any]], rules: Rules) -> Dict[str, Any]:
     issues = []
@@ -361,6 +384,7 @@ def qc_cues(cues: List[Dict[str, Any]], rules: Rules) -> Dict[str, Any]:
 # Exports: SRT/VTT/SCC (SCC is minimal MVP)
 # ---------------------------
 
+
 def to_srt(cues: List[Dict[str, Any]]) -> str:
     out = []
     for i, c in enumerate(cues, start=1):
@@ -370,6 +394,7 @@ def to_srt(cues: List[Dict[str, Any]]) -> str:
         out.append("")
     return "\n".join(out).strip() + "\n"
 
+
 def to_vtt(cues: List[Dict[str, Any]]) -> str:
     out = ["WEBVTT", ""]
     for c in cues:
@@ -377,6 +402,7 @@ def to_vtt(cues: List[Dict[str, Any]]) -> str:
         out.append(str(c.get("text") or ""))
         out.append("")
     return "\n".join(out).strip() + "\n"
+
 
 # VERY simplified SCC encoder (MVP, not spec-perfect EIA-608 packing)
 def _ms_to_scc_timecode(ms: int, fps: float) -> str:
@@ -390,6 +416,7 @@ def _ms_to_scc_timecode(ms: int, fps: float) -> str:
     ff = _clip(ff, 0, fps_i - 1)
     return f"{h:02}:{m:02}:{s:02}:{ff:02}"
 
+
 def _text_to_fake_scc_hex(text: str) -> str:
     safe = text.encode("latin-1", errors="replace")
     parts = [f"{b:02x}" for b in safe[:120]]
@@ -400,6 +427,7 @@ def _text_to_fake_scc_hex(text: str) -> str:
         else:
             grouped.append(parts[i] + "20")
     return " ".join(grouped)
+
 
 def to_scc(cues: List[Dict[str, Any]], rules: Rules) -> str:
     lines = ["Scenarist_SCC V1.0", ""]
@@ -422,8 +450,130 @@ def to_scc(cues: List[Dict[str, Any]], rules: Rules) -> str:
 
 
 # ---------------------------
+# PRO: Auto events extraction
+# ---------------------------
+
+
+def _detect_sound_events_from_text(text: str, start: int, end: int) -> List[Event]:
+    """
+    Heuristic detector.
+    We inject NBCU-style cues if we see patterns that look like music/applause/laughter.
+    """
+    if not text:
+        return []
+
+    t = text.strip()
+
+    events: List[Event] = []
+
+    # MUSIC
+    if MUSIC_RE.search(t):
+        events.append(Event(type="music", start=start, end=end, text="[♪ MUSIC ♪]"))
+
+    # APPLAUSE
+    if APPLAUSE_RE.search(t):
+        events.append(Event(type="sound_effect", start=start, end=end, text="[APPLAUSE]"))
+
+    # LAUGHTER
+    if LAUGHTER_RE.search(t):
+        events.append(Event(type="sound_effect", start=start, end=end, text="[LAUGHTER]"))
+
+    return events
+
+
+def _detect_foreign_language_events(transcript_json: Dict[str, Any]) -> List[Event]:
+    """
+    MVP heuristic:
+    - If AssemblyAI detects language_code != en_us, inject a [Speaking <language>] cue.
+    - Otherwise: none.
+    """
+    lang = (transcript_json.get("language_code") or "").strip().lower()
+
+    if not lang:
+        return []
+
+    if lang.startswith("en"):
+        return []
+
+    # Use a friendly label
+    label = lang.replace("_", "-").upper()
+    return [Event(type="foreign_language", start=0, end=2500, language=label)]
+
+
+def _extract_words_and_events_from_assembly(transcript_json: Dict[str, Any], rules: Rules) -> Tuple[List[Word], List[Event]]:
+    """
+    BEST PRACTICE:
+    - Prefer utterances for diarization
+    - Fall back to words
+    - Build sound cue events from utterance text (heuristic)
+    """
+    words: List[Word] = []
+    events: List[Event] = []
+
+    utterances = transcript_json.get("utterances") or []
+    raw_words = transcript_json.get("words") or []
+
+    # If utterances exist, they are MUCH better for speaker labels
+    if utterances:
+        for u in utterances:
+            sp = _normalize_speaker(u.get("speaker") or "A")
+            u_start = _safe_int(u.get("start"), 0)
+            u_end = _safe_int(u.get("end"), u_start + 500)
+
+            # PRO: detect sound cues from utterance text
+            if rules.enableAutoEvents:
+                u_text = (u.get("text") or "").strip()
+                events.extend(_detect_sound_events_from_text(u_text, u_start, u_end))
+
+            # Convert utterance words into our Word list
+            u_words = u.get("words") or []
+            for w in u_words:
+                words.append(
+                    Word(
+                        text=w.get("text", ""),
+                        start=_safe_int(w.get("start"), 0),
+                        end=_safe_int(w.get("end"), 0),
+                        speaker=sp,
+                    )
+                )
+
+    # Fallback: if no utterances, use words
+    if not words and raw_words:
+        for w in raw_words:
+            words.append(
+                Word(
+                    text=w.get("text", ""),
+                    start=_safe_int(w.get("start"), 0),
+                    end=_safe_int(w.get("end"), 0),
+                    speaker=_normalize_speaker(w.get("speaker") or "A"),
+                )
+            )
+
+    # Foreign language event
+    if rules.enableAutoEvents:
+        events.extend(_detect_foreign_language_events(transcript_json))
+
+    # Clean + sort events
+    events = sorted(events, key=lambda e: (e.start, e.end))
+
+    # De-dupe events that overlap heavily (simple)
+    deduped: List[Event] = []
+    for e in events:
+        if not deduped:
+            deduped.append(e)
+            continue
+        prev = deduped[-1]
+        if prev.type == e.type and abs(prev.start - e.start) < 500 and abs(prev.end - e.end) < 500:
+            continue
+        deduped.append(e)
+
+    return words, deduped
+
+
+# ---------------------------
 # Core formatter (events + pro guard)
 # ---------------------------
+
 
 def format_payload(req: FormatRequest) -> Dict[str, Any]:
     rules = req.rules
@@ -438,18 +588,23 @@ def format_payload(req: FormatRequest) -> Dict[str, Any]:
         words = [Word(**w.model_dump()) for w in req.words]  # normalize
 
         # PRO GUARD:
-        # If events includes music/foreign_language, strip bracket tokens from words before cue building.
+        # If events includes music/foreign_language/sfx, strip bracket tokens from words before cue building.
         if _has_special_events(req.events):
             words = _strip_bracket_tokens(words)
 
         cues = build_cues_from_words(words, rules)
 
-    # If events exist, inject them as their own cues
+    # If events exist, inject them as their own cues (NBCU requirement)
     if req.events:
         for e in req.events:
             if e.type == "music":
                 txt = e.text or "[♪ MUSIC ♪]"
                 cues.append({"start": e.start, "end": e.end, "text": txt, "speaker": "A"})
+
+            elif e.type == "sound_effect":
+                txt = e.text or "[SFX]"
+                cues.append({"start": e.start, "end": e.end, "text": txt, "speaker": "A"})
+
             elif e.type == "foreign_language":
                 lang = e.language or "Unknown"
                 cues.append({"start": e.start, "end": e.end, "text": f"[Speaking {lang}]", "speaker": "A"})
@@ -472,17 +627,21 @@ def format_payload(req: FormatRequest) -> Dict[str, Any]:
 # Routes
 # ---------------------------
 
+
 @app.get("/")
 def root():
     return {"ok": True}
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+
 @app.post("/v1/format")
 def format_endpoint(req: FormatRequest):
     return format_payload(req)
+
 
 @app.post("/v1/jobs", response_model=JobStatus)
 async def create_job(req: JobCreateRequest):
@@ -504,12 +663,17 @@ async def create_job(req: JobCreateRequest):
         "speaker_labels": req.speaker_labels,
         "language_detection": req.language_detection,
 
-        # IMPORTANT: AssemblyAI now expects speech_models as a non-empty list
+        # REQUIRED by AssemblyAI now:
         "speech_models": ["universal-3-pro"],
 
+        # Webhook
         "webhook_url": webhook_url,
         "webhook_auth_header_name": "X-Webhook-Token",
         "webhook_auth_header_value": WEBHOOK_SECRET,
+
+        # Pro: request extra structures
+        "punctuate": True,
+        "format_text": True,
     }
 
     headers = {"Authorization": ASSEMBLYAI_API_KEY, "Content-Type": "application/json"}
@@ -528,12 +692,14 @@ async def create_job(req: JobCreateRequest):
 
     return JOBS[job_id]
 
+
 @app.get("/v1/jobs/{job_id}", response_model=JobStatus)
 def get_job(job_id: str):
     js = JOBS.get(job_id)
     if not js:
         raise HTTPException(status_code=404, detail="Job not found")
     return js
+
 
 @app.post("/v1/webhooks/assemblyai")
 async def assemblyai_webhook(request: Request):
@@ -564,7 +730,7 @@ async def assemblyai_webhook(request: Request):
     if status != "completed":
         return JSONResponse({"ok": True})
 
-    # Completed: fetch transcript details including words
+    # Completed: fetch transcript details including utterances + words
     headers = {"Authorization": ASSEMBLYAI_API_KEY}
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.get(f"https://api.assemblyai.com/v2/transcript/{assembly_id}", headers=headers)
@@ -574,22 +740,12 @@ async def assemblyai_webhook(request: Request):
             return JSONResponse({"ok": True})
         t = r.json()
 
-    # Extract words
-    words_raw = t.get("words") or []
-    words: List[Word] = []
-    for w in words_raw:
-        words.append(Word(
-            text=w.get("text", ""),
-            start=int(w.get("start", 0)),
-            end=int(w.get("end", 0)),
-            speaker=_normalize_speaker(w.get("speaker") or "A"),
-        ))
-
-    # Events: keep empty for now unless you add upstream detection
-    events: List[Event] = []
-
     rules = JOB_RULES.get(job_id, Rules())
 
+    # Extract words + events (FULL PRO)
+    words, events = _extract_words_and_events_from_assembly(t, rules)
+
+    # Run formatter
     result = format_payload(FormatRequest(words=words, events=events, rules=rules))
 
     JOBS[job_id].status = "done"
