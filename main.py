@@ -1,7 +1,6 @@
 import os
 import uuid
 import re
-import math
 from typing import Any, Dict, List, Optional, Literal, Tuple
 
 import httpx
@@ -10,16 +9,14 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ============================================================
-# AI CC CREATOR — PRO BROADCAST ENFORCEMENT ENGINE
-# FastAPI + AssemblyAI Orchestrator + NBCU/SDH Caption Engine
-# ============================================================
+app = FastAPI(
+    title="AI CC Creator — Rules Engine + AssemblyAI Orchestrator",
+    version="2.0.0",
+)
 
-app = FastAPI(title="AI CC Creator — Pro Broadcast Engine", version="2.0.0")
-
-# ---------------------------
+# =============================================================================
 # Environment
-# ---------------------------
+# =============================================================================
 
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -31,7 +28,9 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 ALLOWED_ORIGINS_RAW = os.getenv("ALLOWED_ORIGINS", "").strip()
 
 if not PUBLIC_BASE_URL:
+    # Only used to build webhook URLs; set PUBLIC_BASE_URL in Railway to your service URL
     PUBLIC_BASE_URL = "http://localhost:8000"
+
 
 def _parse_allowed_origins(raw: str) -> List[str]:
     if not raw:
@@ -42,9 +41,10 @@ def _parse_allowed_origins(raw: str) -> List[str]:
     parts = [p.strip() for p in raw.split(",")]
     return [p for p in parts if p]
 
+
 _allowed_origins = _parse_allowed_origins(ALLOWED_ORIGINS_RAW)
 
-# CORS for Base44 preview/prod
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins if _allowed_origins else [],
@@ -56,50 +56,33 @@ app.add_middleware(
     max_age=86400,
 )
 
-# ---------------------------
+# =============================================================================
 # Models
-# ---------------------------
+# =============================================================================
+
 
 class Rules(BaseModel):
-    # Caption geometry
     maxCharsPerLine: int = 32
     maxLines: int = 2
-
-    # Speed
     maxCPS: float = 17.0
 
-    # Timing
     minDurationMs: int = 1000
     maxDurationMs: int = 7000
     minGapMs: int = 80
 
-    # Behavior
     preferPunctuationBreaks: bool = True
-
-    # Output modes
-    mode: Literal["standard", "sdh", "nbcu_strict"] = "nbcu_strict"
-
-    # Speaker policy:
-    # - "none" -> do not show
-    # - "brackets" -> [A] style
-    # - "dash" -> — speaker
-    speakerStyle: Literal["none", "brackets", "dash"] = "none"
-
-    # SDH policy
-    enableSoundCues: bool = True
-    soundCueMinGapMs: int = 900         # silence threshold to consider SDH insert
-    soundCueMaxDurationMs: int = 5000   # don't create absurdly long SDH cues
 
     # SCC specifics
     sccFrameRate: float = 29.97
     startAtHour00: bool = True
+
 
 class Word(BaseModel):
     text: str
     start: int
     end: int
     speaker: Optional[str] = "A"
-    confidence: Optional[float] = None
+
 
 class Event(BaseModel):
     type: Literal["music", "foreign_language", "sound_effect"]
@@ -108,17 +91,28 @@ class Event(BaseModel):
     text: Optional[str] = None
     language: Optional[str] = None
 
+
 class FormatRequest(BaseModel):
     rules: Rules = Field(default_factory=Rules)
+
+    # You can send EITHER:
+    # - words (recommended)
+    # - cues (if you already grouped them)
     words: Optional[List[Word]] = None
-    cues: Optional[List[Dict[str, Any]]] = None
+    cues: Optional[List[Dict[str, Any]]] = None  # {start,end,text,speaker?}
+
+    # optional events layer
     events: Optional[List[Event]] = None
+
 
 class JobCreateRequest(BaseModel):
     mediaUrl: str
     rules: Rules = Field(default_factory=Rules)
+
+    # AssemblyAI toggles
     speaker_labels: bool = True
     language_detection: bool = True
+
 
 class JobStatus(BaseModel):
     id: str
@@ -127,66 +121,31 @@ class JobStatus(BaseModel):
     assembly_id: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
 
-# ---------------------------
-# In-memory store (MVP)
-# ---------------------------
+
+# =============================================================================
+# In-memory job store (MVP)
+# =============================================================================
 
 JOBS: Dict[str, JobStatus] = {}
 JOB_RULES: Dict[str, Rules] = {}
 
-# ---------------------------
-# Utilities
-# ---------------------------
+# =============================================================================
+# Constants / Helpers
+# =============================================================================
 
 PUNCT_BREAK_RE = re.compile(r"[.!?…]+$")
-SOFT_BREAK_RE = re.compile(r"[,;:]+$")
 
-SFX_KEYWORDS = [
-    "music",
-    "applause",
-    "laughter",
-    "cheering",
-    "crowd",
-    "gasps",
-    "sighs",
-    "door",
-    "ringing",
-    "phone",
-    "gunshot",
-    "explosion",
-    "thunder",
+# SDH sound cues dictionary (expand anytime)
+SOUND_CUE_PATTERNS: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\b(applause|clapping)\b", re.I), "[APPLAUSE]"),
+    (re.compile(r"\b(laughter|laughing)\b", re.I), "[LAUGHTER]"),
+    (re.compile(r"\b(music)\b", re.I), "[♪ MUSIC ♪]"),
+    (re.compile(r"\b(door slam|door slams)\b", re.I), "[DOOR SLAMS]"),
+    (re.compile(r"\b(gunshot|gunshots)\b", re.I), "[GUNSHOTS]"),
+    (re.compile(r"\b(siren|sirens)\b", re.I), "[SIRENS]"),
+    (re.compile(r"\b(explosion|explosions)\b", re.I), "[EXPLOSION]"),
 ]
 
-def _clip(v: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, v))
-
-def _normalize_speaker(s: Optional[str]) -> str:
-    if not s:
-        return "A"
-    s = str(s).strip()
-    if not s:
-        return "A"
-    s = s.replace("Speaker ", "").strip()
-    return s or "A"
-
-def _is_bracket_token(t: str) -> bool:
-    t = (t or "").strip()
-    if not t:
-        return False
-    if t.startswith("[") and t.endswith("]"):
-        return True
-    if t.startswith("[") or t.endswith("]"):
-        return True
-    return False
-
-def _strip_bracket_tokens(words: List[Word]) -> List[Word]:
-    cleaned: List[Word] = []
-    for w in words:
-        t = (w.text or "").strip()
-        if _is_bracket_token(t):
-            continue
-        cleaned.append(w)
-    return cleaned
 
 def _ms_to_srt_time(ms: int) -> str:
     h = ms // 3600000
@@ -197,6 +156,7 @@ def _ms_to_srt_time(ms: int) -> str:
     ms -= s * 1000
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
+
 def _ms_to_vtt_time(ms: int) -> str:
     h = ms // 3600000
     ms -= h * 3600000
@@ -206,402 +166,392 @@ def _ms_to_vtt_time(ms: int) -> str:
     ms -= s * 1000
     return f"{h:02}:{m:02}:{s:02}.{ms:03}"
 
-# SCC MVP (still placeholder — spec-perfect SCC is later)
-def _ms_to_scc_timecode(ms: int, fps: float) -> str:
-    fps_i = 30 if abs(fps - 29.97) < 0.05 else int(round(fps))
-    total_seconds = ms / 1000.0
-    h = int(total_seconds // 3600)
-    m = int((total_seconds % 3600) // 60)
-    s = int(total_seconds % 60)
-    frac = total_seconds - int(total_seconds)
-    ff = int(round(frac * fps_i))
-    ff = _clip(ff, 0, fps_i - 1)
-    return f"{h:02}:{m:02}:{s:02}:{ff:02}"
 
-def _text_to_fake_scc_hex(text: str) -> str:
-    safe = text.encode("latin-1", errors="replace")
-    parts = [f"{b:02x}" for b in safe[:120]]
-    grouped = []
-    for i in range(0, len(parts), 2):
-        if i + 1 < len(parts):
-            grouped.append(parts[i] + parts[i + 1])
-        else:
-            grouped.append(parts[i] + "20")
-    return " ".join(grouped)
+def _clip(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
 
-# ---------------------------
-# Caption Helpers
-# ---------------------------
 
-def _split_into_semantic_units(words: List[Word]) -> List[List[Word]]:
+def _normalize_speaker(s: Optional[str]) -> str:
+    if not s:
+        return "A"
+    s = str(s).strip()
+    if not s:
+        return "A"
+    s = s.replace("Speaker ", "").strip()
+    return s or "A"
+
+
+def _strip_bracket_tokens(words: List[Word]) -> List[Word]:
     """
-    Creates semantic chunks based on punctuation and speaker boundaries.
-    This is the first major upgrade vs naive gap grouping.
+    Removes tokens like [Music], [Speaking Spanish], etc from "words" stream.
+    This prevents bracket tokens from being treated as spoken dialog.
     """
-    if not words:
-        return []
-
-    units: List[List[Word]] = []
-    cur: List[Word] = []
-
-    prev_speaker = _normalize_speaker(words[0].speaker)
-
+    cleaned: List[Word] = []
     for w in words:
-        sp = _normalize_speaker(w.speaker)
         t = (w.text or "").strip()
-
-        if not cur:
-            cur = [w]
-            prev_speaker = sp
+        if t.startswith("[") and t.endswith("]"):
             continue
-
-        # speaker boundary = hard semantic boundary
-        if sp != prev_speaker:
-            units.append(cur)
-            cur = [w]
-            prev_speaker = sp
+        if t.startswith("[") or t.endswith("]"):
             continue
+        cleaned.append(w)
+    return cleaned
 
-        cur.append(w)
 
-        # punctuation boundary encourages semantic boundary
-        if PUNCT_BREAK_RE.search(t):
-            units.append(cur)
-            cur = []
+def _has_special_events(events: Optional[List[Event]]) -> bool:
+    if not events:
+        return False
+    return any(e.type in ("music", "foreign_language", "sound_effect") for e in events)
 
-    if cur:
-        units.append(cur)
 
-    return units
+# =============================================================================
+# Wrapping / Layout
+# =============================================================================
 
-def _wrap_lines(text: str, max_chars: int, max_lines: int) -> List[str]:
+def _wrap_two_lines_best_effort(text: str, max_chars: int) -> str:
     """
-    Greedy wrapper producing <= max_lines, each <= max_chars when possible.
+    Returns a 1-2 line wrapped string trying to fill lines toward max_chars.
     """
     words = text.split()
     if not words:
-        return [""]
+        return ""
 
+    # If it already fits on one line, keep it
+    if len(text) <= max_chars:
+        return text.strip()
+
+    # Try to split into 2 lines as balanced as possible
+    best = None
+    best_score = None
+
+    for i in range(1, len(words)):
+        l1 = " ".join(words[:i]).strip()
+        l2 = " ".join(words[i:]).strip()
+        if not l1 or not l2:
+            continue
+
+        if len(l1) > max_chars or len(l2) > max_chars:
+            continue
+
+        # Score: prefer both lines filled close to max_chars
+        score = abs(max_chars - len(l1)) + abs(max_chars - len(l2))
+        if best is None or score < best_score:
+            best = (l1, l2)
+            best_score = score
+
+    if best:
+        return best[0] + "\n" + best[1]
+
+    # If we couldn't fit into 2 clean lines, do greedy
     lines: List[str] = []
     cur = ""
-
-    def push(s: str):
-        s = s.strip()
-        if s:
-            lines.append(s)
-
     for w in words:
         if not cur:
             cur = w
         elif len(cur) + 1 + len(w) <= max_chars:
-            cur = f"{cur} {w}"
+            cur = cur + " " + w
         else:
-            push(cur)
+            lines.append(cur)
             cur = w
-            if len(lines) >= max_lines:
-                # overflow: stuff into last line
+            if len(lines) >= 2:
+                # Stuff the rest into line 2 (will QC flag)
                 lines[-1] = (lines[-1] + " " + cur).strip()
                 cur = ""
 
     if cur:
-        push(cur)
+        lines.append(cur)
 
-    # squash overflow
-    if len(lines) > max_lines:
-        head = lines[:max_lines - 1]
-        tail = " ".join(lines[max_lines - 1:])
-        lines = head + [tail]
+    if len(lines) == 1:
+        return lines[0]
+    return "\n".join(lines[:2])
 
-    return lines
 
-def _cue_text(text: str, rules: Rules, speaker: str) -> str:
+# =============================================================================
+# Cue building (timing-safe, broadcast-oriented)
+# =============================================================================
+
+def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
     """
-    Applies speaker style + wrapping.
+    This is the key fix:
+    - We build cues that fill 32 chars where possible
+    - We NEVER extend OUT time beyond AssemblyAI (prevents lag)
+    - We avoid 1-3 word cues unless timing forces it
+    - Speaker changes inside a cue are represented with NBCU dash format
     """
-    speaker = _normalize_speaker(speaker)
-
-    if rules.speakerStyle == "brackets":
-        text = f"[{speaker}] {text}".strip()
-    elif rules.speakerStyle == "dash":
-        text = f"— {text}".strip()
-
-    lines = _wrap_lines(text, rules.maxCharsPerLine, rules.maxLines)
-    return "\n".join(lines).strip()
-
-def _calc_cps(text: str, duration_ms: int) -> float:
-    duration_ms = max(1, duration_ms)
-    chars = len(text.replace("\n", ""))
-    return chars / (duration_ms / 1000.0)
-
-def _split_text_best_effort(text: str) -> Tuple[str, str]:
-    """
-    Splits text into 2 halves at best punctuation boundary.
-    """
-    tokens = text.split()
-    if len(tokens) <= 1:
-        return text, ""
-
-    # try to split at comma/semicolon boundary near the middle
-    mid = len(tokens) // 2
-    best = None
-    best_dist = 9999
-
-    for i in range(1, len(tokens) - 1):
-        tok = tokens[i]
-        if tok.endswith(",") or tok.endswith(";") or tok.endswith(":"):
-            dist = abs(i - mid)
-            if dist < best_dist:
-                best = i
-                best_dist = dist
-
-    if best is None:
-        best = mid
-
-    left = " ".join(tokens[:best + 1]).strip()
-    right = " ".join(tokens[best + 1:]).strip()
-    return left, right
-
-# ---------------------------
-# SDH Sound Cue Generation
-# ---------------------------
-
-def _infer_sound_events(words: List[Word], rules: Rules) -> List[Event]:
-    """
-    Heuristic SDH detection:
-    - Inserts [♪ MUSIC ♪] / [APPLAUSE] / [LAUGHTER] when large gaps occur
-    - This is AI-assist, not perfect, but massively better than nothing.
-    """
-    if not rules.enableSoundCues:
-        return []
-
     if not words:
         return []
 
     words = sorted(words, key=lambda w: (w.start, w.end))
-    events: List[Event] = []
 
-    for i in range(len(words) - 1):
-        a = words[i]
-        b = words[i + 1]
-        gap = b.start - a.end
-
-        if gap < rules.soundCueMinGapMs:
-            continue
-
-        # create a short SDH cue in the gap window
-        start = a.end
-        end = min(b.start, start + rules.soundCueMaxDurationMs)
-
-        # default guess: MUSIC
-        txt = "[♪ MUSIC ♪]"
-
-        # confidence-based: if last spoken word had low confidence, maybe laughter/crowd
-        conf = a.confidence if a.confidence is not None else 1.0
-        if conf < 0.55:
-            txt = "[LAUGHTER]"
-
-        events.append(Event(type="sound_effect", start=start, end=end, text=txt))
-
-    # De-dupe overlapping events
-    merged: List[Event] = []
-    for e in events:
-        if not merged:
-            merged.append(e)
-            continue
-        prev = merged[-1]
-        if e.start <= prev.end + 100:
-            # merge
-            prev.end = max(prev.end, e.end)
-        else:
-            merged.append(e)
-
-    return merged
-
-# ---------------------------
-# Pro Cue Builder (Multi-pass Enforcement)
-# ---------------------------
-
-def _build_initial_cues(words: List[Word], rules: Rules) -> List[Dict[str, Any]]:
-    """
-    Build first-pass cues using semantic units.
-    """
-    units = _split_into_semantic_units(words)
     cues: List[Dict[str, Any]] = []
 
-    for unit in units:
-        if not unit:
-            continue
-        start = int(unit[0].start)
-        end = int(unit[-1].end)
-        speaker = _normalize_speaker(unit[0].speaker)
+    # Current cue buffer
+    cur_words: List[Word] = []
+    cur_start = words[0].start
+    cur_end = words[0].end
+    cur_speaker = _normalize_speaker(words[0].speaker)
 
-        text = " ".join((w.text or "").strip() for w in unit).strip()
-        if not text:
-            continue
+    # For dash-style speaker changes inside a cue
+    cur_segments: List[Tuple[str, List[str]]] = [(cur_speaker, [])]
 
+    def flush():
+        nonlocal cur_words, cur_start, cur_end, cur_speaker, cur_segments
+
+        if not cur_words:
+            return
+
+        # Build text with NBCU dash formatting if speaker changes occurred
+        # segments = [(speaker, ["word", "word"...]), ...]
+        seg_lines: List[str] = []
+        for sp, toks in cur_segments:
+            if not toks:
+                continue
+            line = " ".join(toks).strip()
+            if line:
+                seg_lines.append(f"- {line}")
+
+        if not seg_lines:
+            cur_words = []
+            cur_segments = [(cur_speaker, [])]
+            return
+
+        # Now wrap the segment output into 1-2 lines max if possible.
+        # If there are 2 speakers, we WANT 2 lines:
+        # - speaker1...
+        # - speaker2...
+        if len(seg_lines) == 1:
+            wrapped = _wrap_two_lines_best_effort(seg_lines[0].replace("- ", ""), rules.maxCharsPerLine)
+            # If it wrapped, it becomes multi-line, but no dash needed in continuation
+            wrapped_lines = wrapped.split("\n")
+            if len(wrapped_lines) == 1:
+                final_text = wrapped_lines[0]
+            else:
+                final_text = wrapped_lines[0] + "\n" + wrapped_lines[1]
+        else:
+            # We have at least 2 speaker segments
+            # Hard cap to 2 lines:
+            final_text = seg_lines[0]
+            if len(seg_lines) >= 2:
+                final_text += "\n" + seg_lines[1]
+
+        # IMPORTANT:
+        # We DO NOT extend end time. Ever.
+        # This prevents delayed captions.
         cues.append({
-            "start": start,
-            "end": end,
-            "speaker": speaker,
-            "rawText": text,
+            "start": int(cur_start),
+            "end": int(cur_end),
+            "text": final_text.strip(),
+            "speaker": None,  # we do not expose speaker IDs
         })
 
-    # Ensure monotonic
-    cues = sorted(cues, key=lambda c: (c["start"], c["end"]))
+        # reset
+        cur_words = []
+        cur_segments = [(cur_speaker, [])]
+
+    # Heuristic targets: try to fill line space
+    TARGET_CHARS = int(rules.maxCharsPerLine * rules.maxLines * 0.85)
+
+    for w in words:
+        sp = _normalize_speaker(w.speaker)
+        txt = (w.text or "").strip()
+        if not txt:
+            continue
+
+        # Determine if we should start a new cue
+        gap = w.start - cur_end
+
+        # If speaker changes, we allow it INSIDE cue via dash format,
+        # unless we are already at 2 lines full.
+        speaker_changed = sp != cur_speaker
+
+        # Proposed new end (always real word end)
+        proposed_end = max(cur_end, w.end)
+        proposed_duration = proposed_end - cur_start
+
+        # Estimate text length if we add this word
+        flat_words = [cw.text.strip() for cw in cur_words] + [txt]
+        flat_text = " ".join(flat_words).strip()
+
+        # Split rules:
+        must_split = False
+
+        # 1) gap split (hard)
+        if gap >= rules.minGapMs:
+            must_split = True
+
+        # 2) max duration split
+        if proposed_duration > rules.maxDurationMs:
+            must_split = True
+
+        # 3) punctuation break encouragement (soft)
+        punct_break = rules.preferPunctuationBreaks and PUNCT_BREAK_RE.search(txt)
+
+        # 4) If we already have a lot of text, split
+        if len(flat_text) >= TARGET_CHARS:
+            must_split = True
+
+        if must_split:
+            flush()
+            cur_start = w.start
+            cur_end = w.end
+            cur_speaker = sp
+            cur_words = [w]
+            cur_segments = [(sp, [txt])]
+            continue
+
+        # Add word to cue
+        cur_words.append(w)
+        cur_end = max(cur_end, w.end)
+
+        if speaker_changed:
+            cur_speaker = sp
+            cur_segments.append((sp, []))
+
+        cur_segments[-1][1].append(txt)
+
+        # Soft punctuation split: flush if we already have decent duration and enough text
+        if punct_break:
+            if (cur_end - cur_start) >= rules.minDurationMs and len(flat_text) >= int(rules.maxCharsPerLine * 0.6):
+                flush()
+                # next cue starts naturally
+
+    flush()
     return cues
 
-def _enforce_rules_on_cues(cues: List[Dict[str, Any]], rules: Rules) -> List[Dict[str, Any]]:
+
+# =============================================================================
+# Hard Enforcement Layer
+# =============================================================================
+
+def _split_cue_text_to_fit(text: str, rules: Rules) -> List[str]:
     """
-    Iterative enforcement loop:
-    - ensures max lines/char
-    - ensures CPS
-    - ensures min/max duration
-    - splits/merges as needed
+    Returns 1+ caption text blocks that fit maxLines/maxCharsPerLine.
     """
-    # hard limit to prevent infinite loops
-    MAX_PASSES = 12
+    # If it already fits, return as-is
+    lines = text.split("\n")
+    if len(lines) <= rules.maxLines and all(len(ln) <= rules.maxCharsPerLine for ln in lines):
+        return [text]
 
-    def cue_text(c: Dict[str, Any]) -> str:
-        return _cue_text(str(c.get("rawText") or ""), rules, str(c.get("speaker") or "A"))
+    # Remove speaker dash prefix for wrapping decisions
+    dash_mode = False
+    if text.strip().startswith("- "):
+        dash_mode = True
 
-    def cue_duration(c: Dict[str, Any]) -> int:
-        return max(1, int(c["end"]) - int(c["start"]))
+    clean = text.replace("\n", " ").strip()
+    tokens = clean.split()
+    if not tokens:
+        return [text]
 
-    def cue_has_hard_violations(c: Dict[str, Any]) -> bool:
-        t = cue_text(c)
-        dur = cue_duration(c)
-        cps = _calc_cps(t, dur)
-        lines = t.split("\n")
-        if len(lines) > rules.maxLines:
-            return True
-        if any(len(ln) > rules.maxCharsPerLine for ln in lines):
-            return True
-        if cps > rules.maxCPS:
-            return True
-        if dur < rules.minDurationMs:
-            return True
-        if dur > rules.maxDurationMs:
-            return True
-        return False
+    blocks: List[str] = []
+    cur_tokens: List[str] = []
 
-    def split_cue(c: Dict[str, Any]) -> List[Dict[str, Any]]:
-        raw = str(c.get("rawText") or "")
-        left, right = _split_text_best_effort(raw)
-        if not right.strip():
-            return [c]
+    def flush_tokens():
+        nonlocal cur_tokens
+        if not cur_tokens:
+            return
+        t = " ".join(cur_tokens).strip()
+        wrapped = _wrap_two_lines_best_effort(t, rules.maxCharsPerLine)
+        blocks.append(wrapped)
+        cur_tokens = []
 
+    for tok in tokens:
+        test = (" ".join(cur_tokens + [tok])).strip()
+        wrapped = _wrap_two_lines_best_effort(test, rules.maxCharsPerLine)
+        wlines = wrapped.split("\n")
+        if len(wlines) <= rules.maxLines and all(len(ln) <= rules.maxCharsPerLine for ln in wlines):
+            cur_tokens.append(tok)
+        else:
+            flush_tokens()
+            cur_tokens.append(tok)
+
+    flush_tokens()
+
+    # Re-apply dash mode if it was a dash cue
+    if dash_mode:
+        fixed = []
+        for b in blocks:
+            bl = b.split("\n")
+            if len(bl) == 1:
+                fixed.append("- " + bl[0])
+            else:
+                fixed.append("- " + bl[0] + "\n- " + bl[1])
+        return fixed
+
+    return blocks
+
+
+def enforce_rules_hard(cues: List[Dict[str, Any]], rules: Rules) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Hard enforcement:
+    1) Try re-wrap (already done)
+    2) If still violates -> split text into smaller chunks
+    3) If still violates -> QC issue, but NEVER change timing
+
+    NOTE: Splitting text DOES NOT create new time ranges.
+    We keep the same start/end and split into sub-cues inside the same time.
+    This is not ideal for broadcast, but it avoids lag and preserves sync.
+    """
+    qc_extra: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
+
+    for idx, c in enumerate(cues, start=1):
         start = int(c["start"])
         end = int(c["end"])
-        dur = max(1, end - start)
-        mid = start + int(dur * 0.52)
+        text = str(c.get("text") or "")
 
-        c1 = dict(c)
-        c2 = dict(c)
-        c1["rawText"] = left.strip()
-        c2["rawText"] = right.strip()
-        c1["end"] = mid
-        c2["start"] = mid + rules.minGapMs
+        # If it fits, keep it
+        lines = text.split("\n")
+        ok_lines = len(lines) <= rules.maxLines and all(len(ln) <= rules.maxCharsPerLine for ln in lines)
 
-        # clamp
-        if c2["start"] >= end:
-            c2["start"] = mid
-        c2["end"] = end
+        duration = max(1, end - start)
+        chars = len(text.replace("\n", ""))
+        cps = (chars / (duration / 1000.0)) if duration > 0 else 9999
 
-        return [c1, c2]
+        if ok_lines and cps <= rules.maxCPS:
+            out.append(c)
+            continue
 
-    def merge_with_next(i: int) -> bool:
-        if i < 0 or i >= len(cues) - 1:
-            return False
-        a = cues[i]
-        b = cues[i + 1]
+        # Attempt split into multiple blocks
+        blocks = _split_cue_text_to_fit(text, rules)
 
-        # only merge if same speaker
-        if str(a.get("speaker")) != str(b.get("speaker")):
-            return False
+        # If splitting created >1 blocks, we emit them as sequential "sub cues"
+        # but we DO NOT change end time beyond original.
+        if len(blocks) > 1:
+            # Divide time evenly among blocks
+            total = len(blocks)
+            block_dur = max(1, (end - start) // total)
 
-        a["rawText"] = (str(a.get("rawText") or "") + " " + str(b.get("rawText") or "")).strip()
-        a["end"] = max(int(a["end"]), int(b["end"]))
-        del cues[i + 1]
-        return True
+            for i, b in enumerate(blocks):
+                b_start = start + (i * block_dur)
+                b_end = start + ((i + 1) * block_dur) if i < total - 1 else end
 
-    # Pass loop
-    for _pass in range(MAX_PASSES):
-        changed = False
+                out.append({
+                    "start": int(b_start),
+                    "end": int(b_end),
+                    "text": b.strip(),
+                    "speaker": None,
+                })
 
-        i = 0
-        while i < len(cues):
-            c = cues[i]
-            dur = cue_duration(c)
+            qc_extra.append({
+                "cue": idx,
+                "type": "hard_split_applied",
+                "value": total,
+            })
+            continue
 
-            # Enforce min duration by extending (if safe)
-            if dur < rules.minDurationMs:
-                c["end"] = int(c["start"]) + rules.minDurationMs
-                changed = True
+        # If still bad after split, keep original but flag QC
+        out.append(c)
 
-            # Enforce max duration by splitting
-            if cue_duration(c) > rules.maxDurationMs:
-                parts = split_cue(c)
-                if len(parts) > 1:
-                    cues[i:i + 1] = parts
-                    changed = True
-                    continue
+        if not ok_lines:
+            qc_extra.append({"cue": idx, "type": "hard_enforce_failed_lines", "value": len(lines)})
+        if cps > rules.maxCPS:
+            qc_extra.append({"cue": idx, "type": "hard_enforce_failed_cps", "value": round(cps, 2)})
 
-            # Enforce CPS by splitting
-            t = cue_text(c)
-            cps = _calc_cps(t, cue_duration(c))
-            if cps > rules.maxCPS:
-                parts = split_cue(c)
-                if len(parts) > 1:
-                    cues[i:i + 1] = parts
-                    changed = True
-                    continue
+    return out, qc_extra
 
-            # Enforce line lengths by splitting
-            lines = t.split("\n")
-            if len(lines) > rules.maxLines or any(len(ln) > rules.maxCharsPerLine for ln in lines):
-                parts = split_cue(c)
-                if len(parts) > 1:
-                    cues[i:i + 1] = parts
-                    changed = True
-                    continue
 
-            # Enforce too-short cues by merging
-            if cue_duration(c) < rules.minDurationMs and i < len(cues) - 1:
-                if merge_with_next(i):
-                    changed = True
-                    continue
-
-            i += 1
-
-        # Normalize ordering + clamp overlaps
-        cues = sorted(cues, key=lambda c: (int(c["start"]), int(c["end"])))
-        for j in range(len(cues) - 1):
-            a = cues[j]
-            b = cues[j + 1]
-            if int(b["start"]) < int(a["end"]) + rules.minGapMs:
-                b["start"] = int(a["end"]) + rules.minGapMs
-                if int(b["start"]) >= int(b["end"]):
-                    b["end"] = int(b["start"]) + rules.minDurationMs
-
-        if not changed:
-            break
-
-    # Finalize into delivery cues
-    final: List[Dict[str, Any]] = []
-    for c in cues:
-        final.append({
-            "start": int(c["start"]),
-            "end": int(c["end"]),
-            "speaker": _normalize_speaker(str(c.get("speaker") or "A")),
-            "text": _cue_text(str(c.get("rawText") or ""), rules, str(c.get("speaker") or "A")),
-            "kind": "dialogue",
-        })
-
-    return final
-
-# ---------------------------
-# QC (post-enforcement)
-# ---------------------------
+# =============================================================================
+# QC
+# =============================================================================
 
 def qc_cues(cues: List[Dict[str, Any]], rules: Rules) -> Dict[str, Any]:
     issues = []
@@ -621,7 +571,8 @@ def qc_cues(cues: List[Dict[str, Any]], rules: Rules) -> Dict[str, Any]:
         if len(lines) > rules.maxLines:
             issues.append({"cue": idx, "type": "too_many_lines", "value": len(lines)})
 
-        cps = _calc_cps(text, duration)
+        chars = len(text.replace("\n", ""))
+        cps = (chars / (duration / 1000.0)) if duration > 0 else 9999
         if cps > rules.maxCPS:
             issues.append({"cue": idx, "type": "cps_high", "value": round(cps, 2)})
 
@@ -633,9 +584,10 @@ def qc_cues(cues: List[Dict[str, Any]], rules: Rules) -> Dict[str, Any]:
 
     return {"issuesCount": len(issues), "issues": issues}
 
-# ---------------------------
+
+# =============================================================================
 # Exports
-# ---------------------------
+# =============================================================================
 
 def to_srt(cues: List[Dict[str, Any]]) -> str:
     out = []
@@ -646,6 +598,7 @@ def to_srt(cues: List[Dict[str, Any]]) -> str:
         out.append("")
     return "\n".join(out).strip() + "\n"
 
+
 def to_vtt(cues: List[Dict[str, Any]]) -> str:
     out = ["WEBVTT", ""]
     for c in cues:
@@ -653,6 +606,32 @@ def to_vtt(cues: List[Dict[str, Any]]) -> str:
         out.append(str(c.get("text") or ""))
         out.append("")
     return "\n".join(out).strip() + "\n"
+
+
+# VERY simplified SCC encoder (MVP)
+def _ms_to_scc_timecode(ms: int, fps: float) -> str:
+    fps_i = 30 if abs(fps - 29.97) < 0.05 else int(round(fps))
+    total_seconds = ms / 1000.0
+    h = int(total_seconds // 3600)
+    m = int((total_seconds % 3600) // 60)
+    s = int(total_seconds % 60)
+    frac = total_seconds - int(total_seconds)
+    ff = int(round(frac * fps_i))
+    ff = _clip(ff, 0, fps_i - 1)
+    return f"{h:02}:{m:02}:{s:02}:{ff:02}"
+
+
+def _text_to_fake_scc_hex(text: str) -> str:
+    safe = text.encode("latin-1", errors="replace")
+    parts = [f"{b:02x}" for b in safe[:120]]
+    grouped = []
+    for i in range(0, len(parts), 2):
+        if i + 1 < len(parts):
+            grouped.append(parts[i] + parts[i + 1])
+        else:
+            grouped.append(parts[i] + "20")
+    return " ".join(grouped)
+
 
 def to_scc(cues: List[Dict[str, Any]], rules: Rules) -> str:
     lines = ["Scenarist_SCC V1.0", ""]
@@ -673,101 +652,97 @@ def to_scc(cues: List[Dict[str, Any]], rules: Rules) -> str:
     lines.append("")
     return "\n".join(lines)
 
-# ---------------------------
-# Core Formatter
-# ---------------------------
+
+# =============================================================================
+# SDH / Sound cue extraction (basic but useful)
+# =============================================================================
+
+def extract_sdh_events_from_transcript_text(text: str, words: List[Word]) -> List[Event]:
+    """
+    AssemblyAI itself may expose sound events in the UI,
+    but they are NOT returned as structured events in the transcript API.
+    So we do a lightweight heuristic here.
+
+    This is NOT perfect — but it is better than returning nothing.
+    """
+    events: List[Event] = []
+    if not text:
+        return events
+    if not words:
+        return events
+
+    # Look for keywords in the full transcript text
+    # and inject a generic cue near the start of the transcript.
+    # (In v3 you can do true per-time detection.)
+    for pat, label in SOUND_CUE_PATTERNS:
+        if pat.search(text):
+            # Put it at the beginning as a placeholder
+            events.append(Event(type="sound_effect", start=words[0].start, end=min(words[0].start + 1500, words[-1].end), text=label))
+    return events
+
+
+# =============================================================================
+# Core formatter
+# =============================================================================
 
 def format_payload(req: FormatRequest) -> Dict[str, Any]:
     rules = req.rules
 
-    # If cues provided, trust them (advanced usage)
+    # If cues already provided, trust them
     if req.cues is not None:
         cues = req.cues
-        # normalize
-        cues = sorted(cues, key=lambda c: (int(c["start"]), int(c["end"])))
-        final_cues = []
-        for c in cues:
-            final_cues.append({
-                "start": int(c["start"]),
-                "end": int(c["end"]),
-                "speaker": _normalize_speaker(c.get("speaker")),
-                "text": _cue_text(str(c.get("text") or ""), rules, _normalize_speaker(c.get("speaker"))),
-                "kind": c.get("kind") or "dialogue",
-            })
-        cues_out = final_cues
-
     else:
         if not req.words:
             raise HTTPException(status_code=422, detail="You must provide either 'words' or 'cues'.")
 
         words = [Word(**w.model_dump()) for w in req.words]
 
-        # PRO GUARD: strip bracket tokens if events exist
-        if req.events:
+        # PRO GUARD:
+        if _has_special_events(req.events):
             words = _strip_bracket_tokens(words)
 
-        # Build initial semantic cues
-        initial = _build_initial_cues(words, rules)
+        cues = build_cues_from_words(words, rules)
 
-        # Enforce hard rules
-        cues_out = _enforce_rules_on_cues(initial, rules)
+    # Inject events as cues
+    if req.events:
+        for e in req.events:
+            if e.type == "music":
+                txt = e.text or "[♪ MUSIC ♪]"
+                cues.append({"start": e.start, "end": e.end, "text": txt, "speaker": None})
+            elif e.type == "foreign_language":
+                lang = e.language or "Unknown"
+                cues.append({"start": e.start, "end": e.end, "text": f"[Speaking {lang}]", "speaker": None})
+            elif e.type == "sound_effect":
+                txt = e.text or "[SFX]"
+                cues.append({"start": e.start, "end": e.end, "text": txt, "speaker": None})
 
-        # SDH inference layer
-        inferred_events: List[Event] = []
-        if rules.enableSoundCues:
-            inferred_events = _infer_sound_events(words, rules)
+        cues = sorted(cues, key=lambda c: (int(c["start"]), int(c["end"])))
 
-        # Combine explicit events + inferred events
-        combined_events: List[Event] = []
-        if req.events:
-            combined_events.extend(req.events)
-        combined_events.extend(inferred_events)
+    # Hard enforcement pass
+    cues_enforced, qc_extra = enforce_rules_hard(cues, rules)
 
-        # Inject events as their own cues
-        if combined_events:
-            for e in combined_events:
-                if e.type == "music":
-                    txt = e.text or "[♪ MUSIC ♪]"
-                elif e.type == "foreign_language":
-                    lang = e.language or "Unknown"
-                    txt = f"[Speaking {lang}]"
-                else:
-                    txt = e.text or "[SOUND]"
-
-                cues_out.append({
-                    "start": int(e.start),
-                    "end": int(e.end),
-                    "speaker": "A",
-                    "text": txt.strip(),
-                    "kind": "sdh",
-                })
-
-            cues_out = sorted(cues_out, key=lambda c: (int(c["start"]), int(c["end"])))
-
-    qc = qc_cues(cues_out, rules)
+    qc = qc_cues(cues_enforced, rules)
+    if qc_extra:
+        qc["issues"].extend(qc_extra)
+        qc["issuesCount"] = len(qc["issues"])
 
     return {
         "rules": rules.model_dump(),
-        "cues": cues_out,
-        "srt": to_srt(cues_out),
-        "vtt": to_vtt(cues_out),
-        "scc": to_scc(cues_out, rules),
+        "cues": cues_enforced,
+        "srt": to_srt(cues_enforced),
+        "vtt": to_vtt(cues_enforced),
+        "scc": to_scc(cues_enforced, rules),
         "qc": qc,
-        "meta": {
-            "engineVersion": "2.0.0",
-            "mode": rules.mode,
-            "speakerStyle": rules.speakerStyle,
-            "soundCuesEnabled": rules.enableSoundCues,
-        }
     }
 
-# ---------------------------
+
+# =============================================================================
 # Routes
-# ---------------------------
+# =============================================================================
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ai-cc-creator", "version": "2.0.0"}
+    return {"ok": True}
 
 @app.get("/health")
 def health():
@@ -794,13 +769,15 @@ async def create_job(req: JobCreateRequest):
 
     payload = {
         "audio_url": req.mediaUrl,
+
+        # diarization + language
         "speaker_labels": req.speaker_labels,
         "language_detection": req.language_detection,
 
-        # AssemblyAI now requires this:
+        # REQUIRED by AssemblyAI now
         "speech_models": ["universal-3-pro"],
 
-        # Webhook orchestration
+        # webhook
         "webhook_url": webhook_url,
         "webhook_auth_header_name": "X-Webhook-Token",
         "webhook_auth_header_value": WEBHOOK_SECRET,
@@ -808,7 +785,7 @@ async def create_job(req: JobCreateRequest):
 
     headers = {"Authorization": ASSEMBLYAI_API_KEY, "Content-Type": "application/json"}
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post("https://api.assemblyai.com/v2/transcript", json=payload, headers=headers)
         if r.status_code >= 300:
             JOBS[job_id].status = "error"
@@ -831,6 +808,7 @@ def get_job(job_id: str):
 
 @app.post("/v1/webhooks/assemblyai")
 async def assemblyai_webhook(request: Request):
+    # Verify webhook secret
     token = request.headers.get("X-Webhook-Token", "")
     if not WEBHOOK_SECRET or token != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Invalid webhook token")
@@ -839,7 +817,7 @@ async def assemblyai_webhook(request: Request):
     assembly_id = body.get("transcript_id") or body.get("id")
     status = body.get("status")
 
-    # Find job
+    # Find our job by assembly_id
     job_id = None
     for jid, js in JOBS.items():
         if js.assembly_id == assembly_id:
@@ -857,9 +835,9 @@ async def assemblyai_webhook(request: Request):
     if status != "completed":
         return JSONResponse({"ok": True})
 
-    # Fetch transcript details (words + confidence + speaker)
+    # Completed: fetch transcript details including words
     headers = {"Authorization": ASSEMBLYAI_API_KEY}
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.get(f"https://api.assemblyai.com/v2/transcript/{assembly_id}", headers=headers)
         if r.status_code >= 300:
             JOBS[job_id].status = "error"
@@ -867,19 +845,22 @@ async def assemblyai_webhook(request: Request):
             return JSONResponse({"ok": True})
         t = r.json()
 
+    # Extract words
     words_raw = t.get("words") or []
     words: List[Word] = []
     for w in words_raw:
-        words.append(Word(
-            text=w.get("text", ""),
-            start=int(w.get("start", 0)),
-            end=int(w.get("end", 0)),
-            speaker=_normalize_speaker(w.get("speaker") or "A"),
-            confidence=w.get("confidence", None),
-        ))
+        words.append(
+            Word(
+                text=w.get("text", ""),
+                start=int(w.get("start", 0)),
+                end=int(w.get("end", 0)),
+                speaker=_normalize_speaker(w.get("speaker") or "A"),
+            )
+        )
 
-    # Events: We infer SDH in Railway (not AssemblyAI)
-    events: List[Event] = []
+    # SDH events (basic heuristic)
+    transcript_text = t.get("text") or ""
+    events: List[Event] = extract_sdh_events_from_transcript_text(transcript_text, words)
 
     rules = JOB_RULES.get(job_id, Rules())
 
