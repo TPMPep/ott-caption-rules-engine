@@ -18,6 +18,9 @@ if not PUBLIC_BASE_URL:
     # Fallback: this is only used to build webhook URLs
     PUBLIC_BASE_URL = "http://localhost:8000"
 
+# Force AssemblyAI model (required by their API per your error)
+ASSEMBLY_SPEECH_MODELS = ["universal-3-pro"]  # alternatives: ["universal-2"]
+
 # ---------------------------
 # Models
 # ---------------------------
@@ -94,6 +97,9 @@ class JobStatus(BaseModel):
 # ---------------------------
 
 JOBS: Dict[str, JobStatus] = {}
+
+# Store job settings (rules + any future options) keyed by job_id
+JOB_SETTINGS: Dict[str, Dict[str, Any]] = {}
 
 
 # ---------------------------
@@ -242,7 +248,6 @@ def build_cues_from_words(words: List[Word], rules: Rules) -> List[Dict[str, Any
             # if we already have something substantial, flush
             if (cur_end - cur_start) >= rules.minDurationMs:
                 flush()
-                # next cue will start at next word (handled naturally)
                 if cur_words:
                     cur_words = []
 
@@ -275,8 +280,7 @@ def wrap_text(text: str, max_chars: int, max_lines: int, prefer_punct: bool) -> 
             push_line(cur)
             cur = w
             if len(lines) >= max_lines:
-                # we have too many lines; keep stuffing into last line
-                # (QC will flag if it violates)
+                # too many lines; keep stuffing into last line
                 lines[-1] = (lines[-1] + " " + cur).strip()
                 cur = ""
 
@@ -338,7 +342,7 @@ def to_srt(cues: List[Dict[str, Any]]) -> str:
         out.append(str(i))
         out.append(f"{_ms_to_srt_time(int(c['start']))} --> {_ms_to_srt_time(int(c['end']))}")
         out.append(str(c["text"]))
-        out.append("")  # blank line
+        out.append("")
     return "\n".join(out).strip() + "\n"
 
 def to_vtt(cues: List[Dict[str, Any]]) -> str:
@@ -354,8 +358,6 @@ def to_vtt(cues: List[Dict[str, Any]]) -> str:
 # - Writes header + pops text into caption packets.
 # - Good enough for “test playback sanity”, not final broadcast certification.
 def _ms_to_scc_timecode(ms: int, fps: float) -> str:
-    # Convert ms into HH:MM:SS:FF at fps (29.97 treated as 30 for frame count in this MVP)
-    # NOTE: Drop-frame math is more complex; this MVP is for NBCU test exception start at 00.
     fps_i = 30 if abs(fps - 29.97) < 0.05 else int(round(fps))
     total_seconds = ms / 1000.0
     h = int(total_seconds // 3600)
@@ -376,27 +378,21 @@ def to_scc(cues: List[Dict[str, Any]], rules: Rules) -> str:
             start_ms = 0
         tc = _ms_to_scc_timecode(start_ms, rules.sccFrameRate)
 
-        # This is not full EIA-608 packing. It's a placeholder that many tools will still ingest,
-        # but NOT guaranteed “spec perfect”.
         text = str(c["text"]).replace("\n", " ")
-        # crude ASCII-ish hex mapping placeholder:
         hex_payload = "94ae 94ae 9420 9420 9470 9470 " + _text_to_fake_scc_hex(text) + " 942c 942c 942f 942f"
         lines.append(f"{tc}\t{hex_payload}")
         lines.append("")
 
-    # Add a final “clear” packet
-    lines.append(_ms_to_scc_timecode(max(0, (cues[-1]["end"] if cues else 0)), rules.sccFrameRate) + "\t942c 942c")
+    end_ms = int(cues[-1]["end"]) if cues else 0
+    lines.append(_ms_to_scc_timecode(max(0, end_ms), rules.sccFrameRate) + "\t942c 942c")
     lines.append("")
     return "\n".join(lines)
 
 def _text_to_fake_scc_hex(text: str) -> str:
-    # Fake-ish mapper: for demo output only.
-    # Real SCC requires proper 608 encoding tables.
     safe = text.encode("latin-1", errors="replace")
     parts = []
     for b in safe[:120]:
         parts.append(f"{b:02x}")
-    # group into pairs
     grouped = []
     for i in range(0, len(parts), 2):
         if i + 1 < len(parts):
@@ -420,7 +416,8 @@ def format_payload(req: FormatRequest) -> Dict[str, Any]:
         if not req.words:
             raise HTTPException(status_code=422, detail="You must provide either 'words' or 'cues'.")
 
-        words = [Word(**w.model_dump()) for w in req.words]  # normalize
+        # Normalize pydantic objects to Word objects (already Words, but keep stable)
+        words = [Word(**w.model_dump()) for w in req.words]
 
         # PRO GUARD:
         # If events includes music/foreign_language, strip bracket tokens from words before cue building.
@@ -429,7 +426,7 @@ def format_payload(req: FormatRequest) -> Dict[str, Any]:
 
         cues = build_cues_from_words(words, rules)
 
-    # If events exist, inject them as their own cues (NBCU requires language ID + music cues)
+    # If events exist, inject them as their own cues
     if req.events:
         for e in req.events:
             if e.type == "music":
@@ -483,17 +480,26 @@ async def create_job(req: JobCreateRequest):
     job_id = str(uuid.uuid4())
     JOBS[job_id] = JobStatus(id=job_id, status="queued", assembly_id=None)
 
+    # Persist settings for webhook completion step
+    JOB_SETTINGS[job_id] = {
+        "rules": req.rules.model_dump(),
+        "speaker_labels": bool(req.speaker_labels),
+        "language_detection": bool(req.language_detection),
+    }
+
     webhook_url = f"{PUBLIC_BASE_URL}/v1/webhooks/assemblyai"
 
     payload = {
         "audio_url": req.mediaUrl,
         "speaker_labels": req.speaker_labels,
         "language_detection": req.language_detection,
+
+        # REQUIRED by AssemblyAI (fixes your 400)
+        "speech_models": ASSEMBLY_SPEECH_MODELS,
+
         "webhook_url": webhook_url,
         "webhook_auth_header_name": "X-Webhook-Token",
         "webhook_auth_header_value": WEBHOOK_SECRET,
-        # Ask AssemblyAI to give words back:
-        # (words are included in the GET transcript response) :contentReference[oaicite:2]{index=2}
     }
 
     headers = {"Authorization": ASSEMBLYAI_API_KEY, "Content-Type": "application/json"}
@@ -572,18 +578,13 @@ async def assemblyai_webhook(request: Request):
             speaker=_normalize_speaker(w.get("speaker") or "A"),
         ))
 
-    # Build events (optional for now; you can enhance later):
-    # NBCU asks for:
-    # - [Speaking <language>]
-    # - music cues
-    # For now: leave events empty unless you inject them from upstream.
+    # Build events (optional for now; you can enhance later)
     events: List[Event] = []
 
-    # Run formatter
-    # NOTE: rules are not in the webhook, so we keep whatever was last requested.
-    # For MVP we’ll store rules at job creation time in result if needed.
-    # Here we use defaults unless you extend job store.
-    rules = Rules()
+    # Use the SAME rules user submitted for this job (fall back to defaults if missing)
+    settings = JOB_SETTINGS.get(job_id, {})
+    rules_dict = settings.get("rules")
+    rules = Rules(**rules_dict) if isinstance(rules_dict, dict) else Rules()
 
     result = format_payload(FormatRequest(words=words, events=events, rules=rules))
 
