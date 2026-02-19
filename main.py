@@ -35,22 +35,29 @@ if not ASSEMBLYAI_API_KEY:
 
 app = FastAPI(title="AI CC Creator API", version="Broadcast-Full")
 
-# ------------------------------------------------------------
-# CORS
-# - Supports both the live Base44 domain + Base44 preview domains
-# - IMPORTANT: Do NOT add a global @app.options(...) catch-all route,
-#   or you can break CORSMiddleware preflight handling.
-# ------------------------------------------------------------
+# --- CORS (MUST be configured BEFORE endpoints) ---
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
+
+# If ALLOWED_ORIGINS is empty, allow all (prevents "Failed to fetch" while debugging)
+allow_origins = (
+    ["*"]
+    if not allowed_origins_env
+    else [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+)
+
+# Base44 preview/production domains can vary, so regex helps a lot.
+# This does NOT open you up to random sites unless you set ALLOWED_ORIGINS="*".
+allow_origin_regex = r"^https:\/\/.*\.base44\.app$"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://ai-caption-creator.base44.app",
-    ],
-    allow_origin_regex=r"^https://.*\.base44\.app$",
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
+    max_age=86400,
 )
 
 # ============================================================
@@ -1159,7 +1166,7 @@ async def all_exception_handler(request: Request, exc: Exception):
 def create_job(req: CreateJobRequest):
 
     title = req.title or "Untitled"
-    rules = req.rules or {}
+     rules = get_rules(req.rules)
 
     transcript_id = aa_create_transcript(
         req.mediaUrl,
