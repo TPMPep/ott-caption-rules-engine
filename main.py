@@ -1364,3 +1364,8 @@ async def assemblyai_webhook(request: Request):
             conn.commit()
 
     return {"ok": True}
+
+@app.post("/debug-test")
+def debug_test():
+    return {"ok": True}
+
