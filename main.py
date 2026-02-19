@@ -1165,9 +1165,9 @@ async def all_exception_handler(request: Request, exc: Exception):
 @app.post("/v1/jobs", response_model=JobResponse)
 def create_job(req: CreateJobRequest):
 
-    title = req.title or "Untitled"
-     rules = get_rules(req.rules)
-
+    title = (req.title or "Untitled").strip()
+    rules = get_rules(req.rules)
+    rules_json = json.dumps(rules)
     transcript_id = aa_create_transcript(
         req.mediaUrl,
         speaker_labels=bool(req.speaker_labels),
@@ -1175,7 +1175,6 @@ def create_job(req: CreateJobRequest):
 
     created = now_iso()
     title = req.title or "Untitled"
-    rules_json = json.dumps(get_rules(req.rules))
 
     with db() as conn:
         conn.execute("""
