@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from fastapi.responses import Response, JSONResponse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
@@ -1136,6 +1137,16 @@ def health():
 def cors_test():
     return {"ok": True}
 
+@app.options("/{path:path}")
+def options_catch_all(path: str):
+    return Response(status_code=204)
+
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {str(exc)}"},
+    )
 # ------------------------------------------------------------
 # CREATE JOB
 # ------------------------------------------------------------
