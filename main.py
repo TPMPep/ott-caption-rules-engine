@@ -35,13 +35,22 @@ if not ASSEMBLYAI_API_KEY:
 
 app = FastAPI(title="AI CC Creator API", version="Broadcast-Full")
 
+# ------------------------------------------------------------
+# CORS
+# - Supports both the live Base44 domain + Base44 preview domains
+# - IMPORTANT: Do NOT add a global @app.options(...) catch-all route,
+#   or you can break CORSMiddleware preflight handling.
+# ------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://ai-caption-creator.base44.app"],
+    allow_origins=[
+        "https://ai-caption-creator.base44.app",
+    ],
     allow_origin_regex=r"^https://.*\.base44\.app$",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ============================================================
