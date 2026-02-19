@@ -82,17 +82,12 @@ init_db()
 # ============================================================
 
 class CreateJobRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
     title: Optional[str] = None
     mediaUrl: str
-
-    # Dynamic caption rules from Base44 UI
-    rules: Optional[Dict[str, Any]] = None
-
     speaker_labels: Optional[bool] = True
     language_detection: Optional[bool] = True
-
+    allow_http: Optional[bool] = False
+    rules: Optional[Dict[str, Any]] = None
 
 class JobResponse(BaseModel):
     id: str
@@ -1147,6 +1142,9 @@ def cors_test():
 
 @app.post("/v1/jobs", response_model=JobResponse)
 def create_job(req: CreateJobRequest):
+
+    title = req.title or "Untitled"
+    rules = req.rules or {}
 
     transcript_id = aa_create_transcript(
         req.mediaUrl,
