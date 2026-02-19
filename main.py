@@ -37,9 +37,8 @@ app = FastAPI(title="AI CC Creator API", version="Broadcast-Full")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://ai-caption-creator.base44.app",
-    ],
+    allow_origins=["https://ai-caption-creator.base44.app"],
+    allow_origin_regex=r"^https://.*\.base44\.app$",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1136,10 +1135,6 @@ def health():
 @app.get("/cors-test")
 def cors_test():
     return {"ok": True}
-
-@app.options("/{path:path}")
-def options_catch_all(path: str):
-    return Response(status_code=204)
 
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
