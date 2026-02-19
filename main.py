@@ -1,8 +1,6 @@
 import os
 import re
 import json
-import time
-import uuid
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,17 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # ============================================================
 # Config
 # ============================================================
 
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
-if not ASSEMBLYAI_API_KEY:
-    # Don't crash on import; just fail on job creation calls.
-    pass
-
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").strip()
 BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()  # optional; set to your Railway public URL
 DB_PATH = os.getenv("SQLITE_PATH", "jobs.db")
@@ -36,7 +30,7 @@ POLL_HINT_SECONDS = int(os.getenv("POLL_HINT_SECONDS", "3"))  # Base44 polling i
 # FastAPI setup
 # ============================================================
 
-app = FastAPI(title="AI CC Creator API", version="1.0")
+app = FastAPI(title="AI CC Creator API", version="1.1")
 
 origins = ["*"] if ALLOWED_ORIGINS == "*" else [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
@@ -87,7 +81,13 @@ init_db()
 # ============================================================
 
 class CreateJobRequest(BaseModel):
-    title: str
+    """
+    Base44 may send additional fields (speaker_labels, rules, etc.).
+    We ignore extras so we never break when the frontend payload evolves.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    title: Optional[str] = None
     mediaUrl: str
 
 class JobResponse(BaseModel):
@@ -114,9 +114,6 @@ def aa_headers() -> Dict[str, str]:
     }
 
 def aa_create_transcript(audio_url: str) -> str:
-    """
-    Creates transcript and returns transcript_id.
-    """
     if not ASSEMBLYAI_API_KEY:
         raise HTTPException(status_code=500, detail="ASSEMBLYAI_API_KEY is not configured")
 
@@ -124,17 +121,17 @@ def aa_create_transcript(audio_url: str) -> str:
     if BASE_URL:
         webhook_url = f"{BASE_URL.rstrip('/')}/v1/webhooks/assemblyai"
 
-    payload = {
+    payload: Dict[str, Any] = {
         "audio_url": audio_url,
         "speaker_labels": True,
         "dual_channel": False,
-        # prompt helps SDH tokens appear in transcript text
         "prompt": (
             "Transcribe dialogue accurately. Also include SDH-style non-speech sound cues in ALL CAPS "
             "inside brackets as standalone tokens, e.g. [♪ MUSIC ♪], [APPLAUSE], [LAUGHTER], [DOOR SLAMS]. "
             "Do not paraphrase sound cues; keep them short and standard."
         ),
     }
+
     if webhook_url:
         payload["webhook_url"] = webhook_url
         payload["webhook_auth_header_name"] = "x-webhook-token"
@@ -163,12 +160,8 @@ def aa_get_srt(transcript_id: str) -> str:
     return r.text
 
 def aa_get_words(transcript_id: str) -> List[Dict[str, Any]]:
-    """
-    Returns word list with timings + speaker labels if available.
-    """
     r = requests.get(f"{AA_BASE}/transcript/{transcript_id}/words", headers=aa_headers(), timeout=60)
     if r.status_code >= 400:
-        # Not fatal; we can still produce SRT-based output without speakers/cues.
         return []
     data = r.json()
     if isinstance(data, dict) and "words" in data and isinstance(data["words"], list):
@@ -189,7 +182,7 @@ def srt_time_to_seconds(t: str) -> float:
 
 def seconds_to_srt_time(x: float) -> str:
     if x < 0:
-        x = 0
+        x = 0.0
     hh = int(x // 3600)
     x -= hh * 3600
     mm = int(x // 60)
@@ -223,7 +216,7 @@ def parse_srt(srt_text: str) -> List[Dict[str, Any]]:
     return cues
 
 def cues_to_srt(cues: List[Dict[str, Any]]) -> str:
-    out = []
+    out: List[str] = []
     for i, c in enumerate(cues, 1):
         out.append(str(i))
         out.append(f"{seconds_to_srt_time(c['start'])} --> {seconds_to_srt_time(c['end'])}")
@@ -244,7 +237,7 @@ def cues_to_vtt(cues: List[Dict[str, Any]]) -> str:
             ss += 1
         return f"{hh:02d}:{mm:02d}:{ss:02d}.{ms:03d}"
 
-    out = ["WEBVTT", ""]
+    out: List[str] = ["WEBVTT", ""]
     for c in cues:
         out.append(f"{vtt_time(c['start'])} --> {vtt_time(c['end'])}")
         out.append(c["text"].rstrip())
@@ -282,7 +275,6 @@ def wrap_to_lines(text: str, max_chars: int, max_lines: int) -> str:
                 flush()
                 cur = w
 
-        # If we've reached the final allowed line, pack remaining words into it
         if len(lines) == max_lines - 1:
             remaining = [cur] + words[idx + 1:]
             final = remaining[0]
@@ -304,10 +296,9 @@ def cps_for_cue(text: str, start: float, end: float) -> float:
     return chars / dur
 
 # ============================================================
-# Speaker + SDH overlay logic
+# SDH alignment
 # ============================================================
 
-SOUND_CUE_PAT = re.compile(r"\[(.*?)\]")
 MUSIC_NOTE_PAT = re.compile(r"^\s*[♪♫].*[♪♫]\s*$")
 
 def standardize_sound_cue(token: str) -> str:
@@ -359,11 +350,9 @@ def align_sound_cues_to_words(transcript_text: str, words: List[Dict[str, Any]])
     for tok in tokens:
         if not tok:
             continue
+
         if tok.startswith("[") and tok.endswith("]"):
-            if w_idx < len(words):
-                ts = float(words[w_idx].get("start", 0)) / 1000.0
-            else:
-                ts = last_end
+            ts = float(words[w_idx].get("start", 0)) / 1000.0 if w_idx < len(words) else last_end
             cues.append((ts, standardize_sound_cue(tok)))
             continue
 
@@ -393,12 +382,16 @@ def align_sound_cues_to_words(transcript_text: str, words: List[Dict[str, Any]])
 
     return deduped
 
+# ============================================================
+# Word window + speaker logic
+# ============================================================
+
 def words_in_window(words: List[Dict[str, Any]], start: float, end: float) -> List[Dict[str, Any]]:
     if not words:
         return []
     s_ms = int(start * 1000)
     e_ms = int(end * 1000)
-    out = []
+    out: List[Dict[str, Any]] = []
     for w in words:
         ws = int(w.get("start", 0))
         we = int(w.get("end", 0))
@@ -409,13 +402,10 @@ def words_in_window(words: List[Dict[str, Any]], start: float, end: float) -> Li
         out.append(w)
     return out
 
-# ✅ FIX #1: stricter dash logic (avoid “dash on everything” due to stray speaker noise)
 def apply_nbcu_dash_if_two_speakers(cue_text: str, cue_words: List[Dict[str, Any]]) -> str:
     """
-    NBCU style:
-    - No speaker names.
-    - ONLY use dashes when two people speak in the same caption instance.
-    - Must be "meaningful": avoid triggering from a single mislabeled word.
+    Only dash-format if two *meaningful* speaker runs exist in this cue.
+    Prevents dash spam from single mislabeled words.
     """
     if not cue_words:
         return cue_text
@@ -443,15 +433,89 @@ def apply_nbcu_dash_if_two_speakers(cue_text: str, cue_words: List[Dict[str, Any
     if cur_spk is not None and cur_words:
         speaker_runs.append((cur_spk, cur_words))
 
-    # Require 2+ words per speaker run to be considered real
     meaningful = [r for r in speaker_runs if len(r[1]) >= 2]
     if len(meaningful) < 2:
         return cue_text
 
     line1 = wrap_to_lines(" ".join(meaningful[0][1]), MAX_CHARS_PER_LINE, 1)
     line2 = wrap_to_lines(" ".join(meaningful[1][1]), MAX_CHARS_PER_LINE, 1)
-
     return f"- {line1}\n- {line2}"
+
+def split_cue_by_speaker_runs(
+    cue_start: float,
+    cue_end: float,
+    cue_words: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    If speaker changes inside the cue, split into multiple cues using word timings.
+    This prevents “lingering” when a single SRT window spans multiple speakers.
+    """
+    if not cue_words:
+        return []
+
+    # Detect sequence of speakers (compressed)
+    speaker_seq: List[Any] = []
+    for w in cue_words:
+        spk = w.get("speaker")
+        if spk is None:
+            continue
+        if not speaker_seq or speaker_seq[-1] != spk:
+            speaker_seq.append(spk)
+
+    if len(speaker_seq) < 2:
+        return []
+
+    runs: List[Tuple[float, float, List[str]]] = []
+    cur_spk = None
+    run_words: List[str] = []
+    run_start: Optional[float] = None
+    last_word_end: Optional[float] = None
+
+    for w in cue_words:
+        spk = w.get("speaker")
+        txt = str(w.get("text", "")).strip()
+        if not txt:
+            continue
+
+        w_start = float(w.get("start", 0)) / 1000.0
+        w_end = float(w.get("end", 0)) / 1000.0
+        last_word_end = w_end
+
+        if cur_spk is None:
+            cur_spk = spk
+            run_words = [txt]
+            run_start = w_start
+        elif spk == cur_spk:
+            run_words.append(txt)
+        else:
+            if run_start is not None:
+                runs.append((run_start, w_end, run_words))
+            cur_spk = spk
+            run_words = [txt]
+            run_start = w_start
+
+    if run_words and run_start is not None:
+        runs.append((run_start, last_word_end or cue_end, run_words))
+
+    out_cues: List[Dict[str, Any]] = []
+    for rs, re_, rw in runs:
+        rs = max(rs, cue_start)
+        re_ = min(re_, cue_end)
+        if re_ <= rs:
+            continue
+        text_block = wrap_to_lines(" ".join(rw), MAX_CHARS_PER_LINE, MAX_LINES)
+        cps = cps_for_cue(text_block, rs, re_)
+        issues = [{"rule": "cps_high", "value": round(cps, 2)}] if cps > MAX_CPS else []
+        out_cues.append({
+            "start": rs,
+            "end": re_,
+            "text": text_block,
+            "cps": round(cps, 2),
+            "issues": issues,
+            "type": "dialogue",
+        })
+
+    return out_cues
 
 def insert_sound_cue_captions(
     cues: List[Dict[str, Any]],
@@ -460,8 +524,7 @@ def insert_sound_cue_captions(
     if not sound_events:
         return cues
 
-    cues_sorted = sorted(cues, key=lambda c: (c["start"], c["end"]))
-    out: List[Dict[str, Any]] = list(cues_sorted)
+    out: List[Dict[str, Any]] = sorted(cues, key=lambda c: (c["start"], c["end"]))
 
     for ts, sdh in sound_events:
         insert_i = 0
@@ -493,7 +556,7 @@ def insert_sound_cue_captions(
             cleaned.append(c)
             continue
         p = cleaned[-1]
-        if c["text"] == p["text"] and abs(c["start"] - p["start"]) < 0.2:
+        if c.get("type") == p.get("type") and c["text"] == p["text"] and abs(c["start"] - p["start"]) < 0.2:
             continue
         cleaned.append(c)
 
@@ -520,83 +583,27 @@ def build_pro_captions_from_assembly(transcript_id: str) -> Dict[str, Any]:
     for c in cues:
         start = float(c["start"])
         end = float(c["end"])
-        txt = c["text"].strip()
+        txt = (c.get("text") or "").strip()
 
         txt = txt.replace("\r", "").strip()
         txt = re.sub(r"[ \t]+", " ", txt.replace("\n", " ")).strip()
 
         cw = words_in_window(words, start, end)
 
-        # ✅ FIX #2: Split cue if speaker changes inside the same SRT window
-        # (prevents “lingering” when A speaks then B later but both stay on screen)
-        speaker_sequence = []
-        for w in cw:
-            spk = w.get("speaker")
-            if spk is not None and (not speaker_sequence or speaker_sequence[-1] != spk):
-                speaker_sequence.append(spk)
-
-        if len(speaker_sequence) >= 2 and cw:
-            runs: List[Tuple[float, float, List[str]]] = []
-            cur_spk = None
-            run_words: List[str] = []
-            run_start = None
-
-            for w in cw:
-                spk = w.get("speaker")
-                wtxt = str(w.get("text", "")).strip()
-                if not wtxt:
-                    continue
-
-                w_start = float(w.get("start", 0)) / 1000.0
-                w_end = float(w.get("end", 0)) / 1000.0
-
-                if cur_spk is None:
-                    cur_spk = spk
-                    run_words = [wtxt]
-                    run_start = w_start
-                elif spk == cur_spk:
-                    run_words.append(wtxt)
-                else:
-                    if run_start is not None:
-                        runs.append((run_start, w_end, run_words))
-                    cur_spk = spk
-                    run_words = [wtxt]
-                    run_start = w_start
-
-            if run_words and run_start is not None:
-                last_end = float(cw[-1].get("end", 0)) / 1000.0
-                runs.append((run_start, last_end, run_words))
-
-            for rs, re_, rw in runs:
-                rs = max(rs, start)
-                re_ = min(re_, end)
-                if re_ <= rs:
-                    continue
-
-                text_block = wrap_to_lines(" ".join(rw), MAX_CHARS_PER_LINE, MAX_LINES)
-                cps = cps_for_cue(text_block, rs, re_)
-                issues = []
-                if cps > MAX_CPS:
-                    issues.append({"rule": "cps_high", "value": round(cps, 2)})
-
-                pro_cues.append({
-                    "start": rs,
-                    "end": re_,
-                    "text": text_block,
-                    "cps": round(cps, 2),
-                    "issues": issues,
-                    "type": "dialogue",
-                })
+        # Split by speaker change when present (prevents lingering captions)
+        split = split_cue_by_speaker_runs(start, end, cw)
+        if split:
+            pro_cues.extend(split)
             continue
 
-        # Default path: keep Assembly SRT timing, wrap lines, maybe dash if truly 2 speakers
+        # Otherwise, keep SRT timing + wrap + maybe dash format
         wrapped = wrap_to_lines(txt, MAX_CHARS_PER_LINE, MAX_LINES)
         wrapped = apply_nbcu_dash_if_two_speakers(wrapped, cw)
 
         # Enforce max chars/line again after dash insertion
         if wrapped.startswith("- "):
             parts = wrapped.split("\n")
-            fixed_parts = []
+            fixed_parts: List[str] = []
             for p in parts:
                 if p.startswith("- "):
                     content = p[2:].strip()
@@ -607,9 +614,7 @@ def build_pro_captions_from_assembly(transcript_id: str) -> Dict[str, Any]:
             wrapped = "\n".join(fixed_parts[:MAX_LINES])
 
         cps = cps_for_cue(wrapped, start, end)
-        issues = []
-        if cps > MAX_CPS:
-            issues.append({"rule": "cps_high", "value": round(cps, 2)})
+        issues = [{"rule": "cps_high", "value": round(cps, 2)}] if cps > MAX_CPS else []
 
         pro_cues.append({
             "start": start,
@@ -620,8 +625,10 @@ def build_pro_captions_from_assembly(transcript_id: str) -> Dict[str, Any]:
             "type": "dialogue",
         })
 
+    # Insert SDH cues (best effort)
     pro_cues = insert_sound_cue_captions(pro_cues, sound_events)
 
+    # Produce exports
     srt_out = cues_to_srt(pro_cues)
     vtt_out = cues_to_vtt(pro_cues)
 
@@ -654,6 +661,8 @@ def create_job(req: CreateJobRequest) -> JobResponse:
     transcript_id = aa_create_transcript(req.mediaUrl)
 
     created = now_iso()
+    title = (req.title or "").strip() or "Untitled"
+
     with db() as conn:
         conn.execute(
             """
@@ -665,7 +674,7 @@ def create_job(req: CreateJobRequest) -> JobResponse:
                 transcript_id,  # IMPORTANT: job id == Assembly transcript id
                 created,
                 created,
-                req.title,
+                title,
                 req.mediaUrl,
                 "processing",
                 None,
@@ -681,7 +690,7 @@ def create_job(req: CreateJobRequest) -> JobResponse:
         id=transcript_id,
         createdAt=created,
         updatedAt=created,
-        title=req.title,
+        title=title,
         mediaUrl=req.mediaUrl,
         status="processing",
         pollHintSeconds=POLL_HINT_SECONDS,
@@ -695,9 +704,7 @@ def get_job(job_id: str) -> JobResponse:
         if not row:
             raise HTTPException(status_code=404, detail="Job not found")
 
-    exports = None
-    if row["status"] == "completed":
-        exports = {"srt": True, "vtt": True, "json": True}
+    exports = {"srt": True, "vtt": True, "json": True} if row["status"] == "completed" else None
 
     return JobResponse(
         id=row["id"],
@@ -716,7 +723,7 @@ def export_srt(job_id: str) -> str:
     with db() as conn:
         row = conn.execute("SELECT srt, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Job not found")
+            raise HTTPException(status(status_code=404, detail="Job not found"))
         if row["status"] != "completed" or not row["srt"]:
             raise HTTPException(status_code=409, detail="Job not completed")
         return row["srt"]
@@ -813,7 +820,7 @@ async def assemblyai_webhook(request: Request) -> Dict[str, Any]:
                 )
                 conn.commit()
 
-    elif status == "error" or status == "failed":
+    elif status in ("error", "failed"):
         err = payload.get("error") or "AssemblyAI transcript failed"
         with db() as conn:
             conn.execute(
@@ -834,8 +841,7 @@ async def assemblyai_webhook(request: Request) -> Dict[str, Any]:
 
 # ============================================================
 # Notes:
-# - We DO NOT merge SRT cues (merging caused timing drift).
-# - We ONLY add '-' when two meaningful speaker runs exist inside the same cue window.
-# - We split cues by speaker change inside a window to prevent lingering captions.
-# - SDH cues are inserted as standalone captions using transcript text alignment.
+# - SRT timings are the base segmentation, but we split if speaker changes inside a window.
+# - Dashes are only inserted for meaningful multi-speaker runs (prevents dash spam).
+# - SDH cues are inserted as standalone captions using transcript-text alignment to word timings.
 # ============================================================
