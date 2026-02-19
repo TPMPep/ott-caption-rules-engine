@@ -34,14 +34,12 @@ if not ASSEMBLYAI_API_KEY:
 
 app = FastAPI(title="AI CC Creator API", version="Broadcast-Full")
 
-origins = ["*"] if ALLOWED_ORIGINS == "*" else [
-    o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=[
+        "https://ai-caption-creator.base44.app",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1139,7 +1137,9 @@ def build_pro_captions(transcript_id: str, request_rules: Dict[str, Any]) -> Dic
 @app.get("/health")
 def health():
     return {"ok": True, "timestamp": now_iso()}
-
+@app.get("/cors-test")
+def cors_test():
+    return {"ok": True}
 
 # ------------------------------------------------------------
 # CREATE JOB
