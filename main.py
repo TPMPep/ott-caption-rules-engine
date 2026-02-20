@@ -1273,89 +1273,156 @@ def create_job(req: CreateJobRequest):
 
 @app.get("/v1/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str):
-
+    # We try our local DB first. If the record is missing (common after a restart
+    # because SQLite on Railway is ephemeral), fall back to AssemblyAI using the
+    # transcript id (job_id) and re-hydrate the local record.
     with db() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, created_at, updated_at, title, media_url, status, error, rules_json, result_json, srt, vtt "
+            "FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
 
     if not row:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    # --------------------------------------------------------
-    # Lazy completion: if webhook didn't arrive, we can still
-    # finalize by checking AssemblyAI status when the UI polls.
-    # This prevents "stuck in QUEUE/processing forever".
-    # --------------------------------------------------------
-    if row["status"] == "processing":
+        # Fallback: look up directly in AssemblyAI
         try:
             t = aa_get_transcript(job_id)
-            aa_status = t.get("status")
-            if aa_status == "completed":
-                rules = json.loads(row["rules_json"] or "{}")
-                built = build_pro_captions(job_id, rules)
-                updated = now_iso()
-                with db() as conn:
-                    conn.execute("""
-                    UPDATE jobs
-                    SET status=?, updated_at=?, result_json=?, srt=?, vtt=?, error=?
-                    WHERE id=?
-                    """, (
-                        "completed",
-                        updated,
-                        json.dumps(built["result_json"]),
-                        built["srt"],
-                        built["vtt"],
-                        None,
-                        job_id,
-                    ))
-                    conn.commit()
-                # re-read row so response reflects completion
-                with db() as conn:
-                    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        except HTTPException as e:
+            # If AssemblyAI doesn't know this id, return 404 to the client.
+            if e.status_code == 502:
+                # aa_get_transcript wraps upstream errors as 502; pass through.
+                raise
+            raise
 
-            elif aa_status in ("error", "failed"):
-                updated = now_iso()
-                err = t.get("error") or "AssemblyAI transcript failed"
-                with db() as conn:
-                    conn.execute(
-                        "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
-                        ("error", err, updated, job_id),
-                    )
-                    conn.commit()
-                with db() as conn:
-                    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        # AssemblyAI returns statuses like: queued, processing, completed, error
+        status = (t.get("status") or "processing").lower()
+        error_msg = None
+        if status == "error":
+            error_msg = t.get("error") or "AssemblyAI error"
 
-        except Exception as e:
-            # Don't crash the polling endpoint; just surface error.
-            updated = now_iso()
+        created = now_iso()
+        updated = created
+        media_url = t.get("audio_url")
+        title = None
+
+        # Create a minimal local record so the UI can poll reliably.
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO jobs
+                (id, created_at, updated_at, title, media_url, status, error,
+                 rules_json, result_json, srt, vtt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    created,
+                    updated,
+                    title,
+                    media_url,
+                    status,
+                    error_msg,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+
+        # If it's already completed, pull SRT/VTT now and update the record.
+        if status == "completed":
+            srt = aa_get_srt(job_id)
+            vtt = srt_to_vtt(srt)
             with db() as conn:
                 conn.execute(
-                    "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
-                    ("error", f"Lazy finalize failed: {type(e).__name__}: {str(e)}", updated, job_id),
+                    "UPDATE jobs SET updated_at=?, status=?, error=?, srt=?, vtt=? WHERE id=?",
+                    (now_iso(), "completed", None, srt, vtt, job_id),
                 )
                 conn.commit()
+            return JobResponse(
+                id=job_id,
+                createdAt=created,
+                updatedAt=now_iso(),
+                title=title,
+                mediaUrl=media_url,
+                status="completed",
+                error=None,
+                exports={"srt": True, "vtt": True},
+            )
+
+        return JobResponse(
+            id=job_id,
+            createdAt=created,
+            updatedAt=updated,
+            title=title,
+            mediaUrl=media_url,
+            status=status,
+            error=error_msg,
+        )
+
+    # Normal path: record exists in our DB
+    (
+        _id,
+        created_at,
+        updated_at,
+        title,
+        media_url,
+        status,
+        error,
+        rules_json,
+        result_json,
+        srt,
+        vtt,
+    ) = row
+
+    status = (status or "processing").lower()
+
+    # If still processing, check AssemblyAI and update when completed/error.
+    if status in ("queued", "processing"):
+        t = aa_get_transcript(job_id)
+        aa_status = (t.get("status") or "").lower()
+
+        if aa_status == "completed":
+            srt = aa_get_srt(job_id)
+            vtt = srt_to_vtt(srt)
+            updated_at = now_iso()
+
             with db() as conn:
-                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                conn.execute(
+                    "UPDATE jobs SET updated_at=?, status=?, error=?, srt=?, vtt=? WHERE id=?",
+                    (updated_at, "completed", None, srt, vtt, job_id),
+                )
+                conn.commit()
+
+            status = "completed"
+            error = None
+
+        elif aa_status == "error":
+            updated_at = now_iso()
+            error = t.get("error") or "AssemblyAI error"
+            with db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET updated_at=?, status=?, error=? WHERE id=?",
+                    (updated_at, "error", error, job_id),
+                )
+                conn.commit()
+            status = "error"
 
     exports = None
-    if row["status"] == "completed":
-        exports = {"srt": True, "vtt": True, "json": True}
+    if status == "completed":
+        exports = {"srt": bool(srt), "vtt": bool(vtt)}
 
     return JobResponse(
-        id=row["id"],
-        createdAt=row["created_at"],
-        updatedAt=row["updated_at"],
-        title=row["title"],
-        mediaUrl=row["media_url"],
-        status=row["status"],
-        error=row["error"],
+        id=_id,
+        createdAt=created_at,
+        updatedAt=updated_at,
+        title=title,
+        mediaUrl=media_url,
+        status=status,
+        error=error,
         exports=exports,
     )
-
-
-# ------------------------------------------------------------
-# EXPORT SRT
-# ------------------------------------------------------------
-
 @app.get("/v1/jobs/{job_id}/export/srt")
 def export_srt(job_id: str):
 
