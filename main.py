@@ -1280,6 +1280,62 @@ def get_job(job_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # --------------------------------------------------------
+    # Lazy completion: if webhook didn't arrive, we can still
+    # finalize by checking AssemblyAI status when the UI polls.
+    # This prevents "stuck in QUEUE/processing forever".
+    # --------------------------------------------------------
+    if row["status"] == "processing":
+        try:
+            t = aa_get_transcript(job_id)
+            aa_status = t.get("status")
+            if aa_status == "completed":
+                rules = json.loads(row["rules_json"] or "{}")
+                built = build_pro_captions(job_id, rules)
+                updated = now_iso()
+                with db() as conn:
+                    conn.execute("""
+                    UPDATE jobs
+                    SET status=?, updated_at=?, result_json=?, srt=?, vtt=?, error=?
+                    WHERE id=?
+                    """, (
+                        "completed",
+                        updated,
+                        json.dumps(built["result_json"]),
+                        built["srt"],
+                        built["vtt"],
+                        None,
+                        job_id,
+                    ))
+                    conn.commit()
+                # re-read row so response reflects completion
+                with db() as conn:
+                    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
+            elif aa_status in ("error", "failed"):
+                updated = now_iso()
+                err = t.get("error") or "AssemblyAI transcript failed"
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
+                        ("error", err, updated, job_id),
+                    )
+                    conn.commit()
+                with db() as conn:
+                    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
+        except Exception as e:
+            # Don't crash the polling endpoint; just surface error.
+            updated = now_iso()
+            with db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status=?, error=?, updated_at=? WHERE id=?",
+                    ("error", f"Lazy finalize failed: {type(e).__name__}: {str(e)}", updated, job_id),
+                )
+                conn.commit()
+            with db() as conn:
+                row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
     exports = None
     if row["status"] == "completed":
         exports = {"srt": True, "vtt": True, "json": True}
