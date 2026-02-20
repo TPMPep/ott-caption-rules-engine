@@ -166,7 +166,6 @@ def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) 
         raise HTTPException(status_code=500, detail="ASSEMBLYAI_API_KEY is not configured")
 
     language_detection = bool(kwargs.get("language_detection", True))
-    allow_http = bool(kwargs.get("allow_http", False))
     webhook_url = kwargs.get("webhook_url") or ""
     webhook_secret = kwargs.get("webhook_secret") or ""
     speech_models = kwargs.get("speech_models") or ["universal-3-pro"] # required by AssemblyAI now
@@ -175,7 +174,6 @@ def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) 
         "audio_url": audio_url,
         "speaker_labels": bool(speaker_labels),
         "language_detection": language_detection,
-        "allow_http": allow_http,
         "speech_models": speech_models,
         "prompt": (
             "Transcribe dialogue accurately. Also include SDH-style non-speech sound cues in ALL CAPS "
