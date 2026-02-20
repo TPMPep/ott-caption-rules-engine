@@ -135,13 +135,12 @@ class JobResponse(BaseModel):
     id: str
     createdAt: str
     updatedAt: str
-    title: Optional[str]
-    mediaUrl: Optional[str]
+    title: Optional[str] = None
+    mediaUrl: Optional[str] = None
     status: str
     error: Optional[str] = None
     pollHintSeconds: int = POLL_HINT_SECONDS
     exports: Optional[Dict[str, Any]] = None
-
 
 # ============================================================
 # ASSEMBLYAI CLIENT
@@ -155,36 +154,58 @@ def aa_headers():
         "content-type": "application/json",
     }
 
-def aa_create_transcript(audio_url: str, speaker_labels: bool) -> str:
-    payload = {
-        "audio_url": audio_url,
-        "speech_models": ["universal-3-pro", "universal-2"],
-        "speaker_labels": speaker_labels,
-        "dual_channel": False,
-        "prompt": (
-            "Transcribe dialogue accurately. "
-            "Include SDH non-speech cues in ALL CAPS inside brackets "
-            "like [APPLAUSE], [LAUGHTER], [♪ MUSIC ♪]."
-        ),
+def aa_create_transcript(
+    media_url: str,
+    *,
+    speaker_labels: bool = True,
+    language_detection: bool = True,
+    webhook_url: str | None = None,
+    webhook_secret: str | None = None,
+    speech_models: list[str] | None = None,
+) -> str:
+    """
+    Creates an AssemblyAI transcript and returns the transcript_id.
+
+    NOTE:
+    - AssemblyAI now expects `speech_models` to be a non-empty list containing
+      one or more of: "universal-3-pro", "universal-2".
+    """
+    api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ASSEMBLYAI_API_KEY is not set")
+
+    if not speech_models:
+        speech_models = ["universal-2"]  # safe default
+
+    payload: dict[str, Any] = {
+        "audio_url": media_url,
+        "speaker_labels": bool(speaker_labels),
+        "language_detection": bool(language_detection),
+        "speech_models": speech_models,
     }
 
-    if BASE_URL:
-        payload["webhook_url"] = f"{BASE_URL.rstrip('/')}/v1/webhooks/assemblyai"
+    # Optional webhook support (only include if provided)
+    if webhook_url:
+        payload["webhook_url"] = webhook_url
+    if webhook_secret:
+        payload["webhook_auth_header_name"] = "X-Webhook-Secret"
+        payload["webhook_auth_header_value"] = webhook_secret
 
-    r = requests.post(
-        f"{AA_BASE}/transcript",
-        headers=aa_headers(),
-        json=payload,
-        timeout=60,
-    )
+    headers = {
+        "authorization": api_key,
+        "content-type": "application/json",
+    }
 
+    r = requests.post("https://api.assemblyai.com/v2/transcript", json=payload, headers=headers, timeout=60)
     if r.status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=f"AssemblyAI create transcript failed: {r.text}"
-        )
+        raise RuntimeError(f"AssemblyAI create transcript failed: {r.status_code} {r.text}")
 
-    return r.json()["id"]
+    data = r.json()
+    transcript_id = data.get("id")
+    if not transcript_id:
+        raise RuntimeError(f"AssemblyAI response missing transcript id: {data}")
+
+    return transcript_id
 
 def aa_get_transcript(transcript_id: str):
     r = requests.get(
@@ -1193,39 +1214,42 @@ async def all_exception_handler(request: Request, exc: Exception):
 
 @app.post("/v1/jobs", response_model=JobResponse)
 def create_job(req: CreateJobRequest):
-
     title = (req.title or "Untitled").strip()
-    rules = get_rules(req.rules)
+
+    rules = get_rules(req.rules)  # rules come from Base44 UI (dynamic)
     rules_json = json.dumps(rules)
 
     transcript_id = aa_create_transcript(
         req.mediaUrl,
         speaker_labels=bool(req.speaker_labels),
-        language_detection=bool(getattr(req, "language_detection", True)),
-        allow_http=bool(getattr(req, "allow_http", False)),
+        language_detection=bool(req.language_detection),
+        # if you later wire webhook fields, add them here
     )
 
     created = now_iso()
 
     with db() as conn:
-        conn.execute("""
-        INSERT OR REPLACE INTO jobs
-        (id, created_at, updated_at, title, media_url, status, error,
-         rules_json, result_json, srt, vtt)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            transcript_id,
-            created,
-            created,
-            title,
-            req.mediaUrl,
-            "processing",
-            None,
-            rules_json,
-            None,
-            None,
-            None
-        ))
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO jobs
+            (id, created_at, updated_at, title, media_url, status, error,
+             rules_json, result_json, srt, vtt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transcript_id,
+                created,
+                created,
+                title,
+                req.mediaUrl,
+                "processing",
+                None,         # error column (db) is null at creation
+                rules_json,
+                None,
+                None,
+                None,
+            ),
+        )
         conn.commit()
 
     return JobResponse(
@@ -1235,7 +1259,7 @@ def create_job(req: CreateJobRequest):
         title=title,
         mediaUrl=req.mediaUrl,
         status="processing",
-        error=None,  # important: avoids validation errors if model still expects it
+        error=None,  # IMPORTANT: include this so response_model validation never fails
     )
 
 # ------------------------------------------------------------
