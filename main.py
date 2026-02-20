@@ -145,100 +145,53 @@ class JobResponse(BaseModel):
 # ============================================================
 # ASSEMBLYAI CLIENT
 # ============================================================
-
-AA_BASE = "https://api.assemblyai.com/v2"
-
-def aa_headers():
-    return {
-        "authorization": ASSEMBLYAI_API_KEY,
-        "content-type": "application/json",
-    }
-
-def aa_create_transcript(
-    media_url: str,
-    *,
-    speaker_labels: bool = True,
-    language_detection: bool = True,
-    webhook_url: str | None = None,
-    webhook_secret: str | None = None,
-    speech_models: list[str] | None = None,
-) -> str:
+def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) -> str:
     """
-    Creates an AssemblyAI transcript and returns the transcript_id.
+    Creates an AssemblyAI transcript and returns transcript_id.
 
-    NOTE:
-    - AssemblyAI now expects `speech_models` to be a non-empty list containing
-      one or more of: "universal-3-pro", "universal-2".
+    Accepts extra kwargs (language_detection, allow_http, webhook_url, webhook_secret, speech_models)
+    so the API won't crash if the frontend sends new fields.
     """
     api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("ASSEMBLYAI_API_KEY is not set")
+        raise HTTPException(status_code=500, detail="ASSEMBLYAI_API_KEY is not configured")
 
-    if not speech_models:
-        speech_models = ["universal-2"]  # safe default
+    language_detection = bool(kwargs.get("language_detection", True))
+    allow_http = bool(kwargs.get("allow_http", False))
+    webhook_url = kwargs.get("webhook_url") or ""
+    webhook_secret = kwargs.get("webhook_secret") or ""
+    speech_models = kwargs.get("speech_models") or ["universal-2"]  # required by AssemblyAI now
 
-    payload: dict[str, Any] = {
-        "audio_url": media_url,
+    payload: Dict[str, Any] = {
+        "audio_url": audio_url,
         "speaker_labels": bool(speaker_labels),
-        "language_detection": bool(language_detection),
+        "language_detection": language_detection,
+        "allow_http": allow_http,
         "speech_models": speech_models,
+        "prompt": (
+            "Transcribe dialogue accurately. Also include SDH-style non-speech sound cues in ALL CAPS "
+            "inside brackets as standalone tokens, e.g. [♪ MUSIC ♪], [APPLAUSE], [LAUGHTER], [DOOR SLAMS]. "
+            "Do not paraphrase sound cues; keep them short and standard."
+        ),
     }
 
-    # Optional webhook support (only include if provided)
+    # Optional webhook support
     if webhook_url:
         payload["webhook_url"] = webhook_url
-    if webhook_secret:
-        payload["webhook_auth_header_name"] = "X-Webhook-Secret"
-        payload["webhook_auth_header_value"] = webhook_secret
+        if webhook_secret:
+            payload["webhook_auth_header_name"] = "x-webhook-token"
+            payload["webhook_auth_header_value"] = webhook_secret
 
-    headers = {
-        "authorization": api_key,
-        "content-type": "application/json",
-    }
-
-    r = requests.post("https://api.assemblyai.com/v2/transcript", json=payload, headers=headers, timeout=60)
+    r = requests.post(f"{AA_BASE}/transcript", headers=aa_headers(), json=payload, timeout=60)
     if r.status_code >= 400:
-        raise RuntimeError(f"AssemblyAI create transcript failed: {r.status_code} {r.text}")
+        raise HTTPException(status_code=502, detail=f"AssemblyAI create transcript failed: {r.status_code} {r.text}")
 
-    data = r.json()
-    transcript_id = data.get("id")
+    transcript_id = r.json().get("id")
     if not transcript_id:
-        raise RuntimeError(f"AssemblyAI response missing transcript id: {data}")
+        raise HTTPException(status_code=502, detail="AssemblyAI create transcript failed: missing transcript id")
 
     return transcript_id
 
-def aa_get_transcript(transcript_id: str):
-    r = requests.get(
-        f"{AA_BASE}/transcript/{transcript_id}",
-        headers=aa_headers(),
-        timeout=60,
-    )
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=r.text)
-    return r.json()
-
-def aa_get_srt(transcript_id: str):
-    r = requests.get(
-        f"{AA_BASE}/transcript/{transcript_id}/srt",
-        headers=aa_headers(),
-        timeout=60,
-    )
-    if r.status_code >= 400:
-        raise HTTPException(status_code=502, detail=r.text)
-    return r.text
-
-def aa_get_words(transcript_id: str):
-    r = requests.get(
-        f"{AA_BASE}/transcript/{transcript_id}/words",
-        headers=aa_headers(),
-        timeout=60,
-    )
-    if r.status_code >= 400:
-        return []
-    data = r.json()
-    if isinstance(data, dict):
-        return data.get("words", [])
-    return data
 # ============================================================
 # TIME UTILITIES
 # ============================================================
@@ -1223,6 +1176,7 @@ def create_job(req: CreateJobRequest):
         req.mediaUrl,
         speaker_labels=bool(req.speaker_labels),
         language_detection=bool(req.language_detection),
+        allow_http=bool(getattr(req, "allow_http", False)),
         # if you later wire webhook fields, add them here
     )
 
