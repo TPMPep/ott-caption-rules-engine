@@ -168,7 +168,13 @@ def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) 
     language_detection = bool(kwargs.get("language_detection", True))
     webhook_url = kwargs.get("webhook_url") or ""
     webhook_secret = kwargs.get("webhook_secret") or ""
-    speech_models = kwargs.get("speech_models") or ["universal-3-pro"] # required by AssemblyAI now
+    speech_models = kwargs.get("speech_models") or ["universal-3-pro", "universal-2"] # required by AssemblyAI now
+    if "universal-3-pro" in speech_models:
+    payload["prompt"] = (
+        "Transcribe dialogue accurately. Also include SDH-style non-speech sound cues in ALL CAPS "
+        "inside brackets as standalone tokens, e.g. [♪ MUSIC ♪], [APPLAUSE], [LAUGHTER], [DOOR SLAMS]. "
+        "Do not paraphrase sound cues; keep them short and standard."
+    )
 
     payload: Dict[str, Any] = {
         "audio_url": audio_url,
@@ -1183,7 +1189,6 @@ def create_job(req: CreateJobRequest):
         req.mediaUrl,
         speaker_labels=bool(req.speaker_labels),
         language_detection=bool(req.language_detection),
-        allow_http=bool(getattr(req, "allow_http", False)),
         # if you later wire webhook fields, add them here
     )
 
