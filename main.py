@@ -169,7 +169,7 @@ def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) 
     allow_http = bool(kwargs.get("allow_http", False))
     webhook_url = kwargs.get("webhook_url") or ""
     webhook_secret = kwargs.get("webhook_secret") or ""
-    speech_models = kwargs.get("speech_models") or ["universal-2"]  # required by AssemblyAI now
+    speech_models = kwargs.get("speech_models") or ["universal-3-pro"] # required by AssemblyAI now
 
     payload: Dict[str, Any] = {
         "audio_url": audio_url,
