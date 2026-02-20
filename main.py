@@ -1266,7 +1266,7 @@ def create_job(req: CreateJobRequest):
                 created,
                 title,
                 req.mediaUrl,
-                "processing",
+                "queued",
                 None,         # error column (db) is null at creation
                 rules_json,
                 None,
@@ -1282,7 +1282,7 @@ def create_job(req: CreateJobRequest):
         updatedAt=created,
         title=title,
         mediaUrl=req.mediaUrl,
-        status="processing",
+        status="queued",
         error=None,  # IMPORTANT: include this so response_model validation never fails
     )
 
@@ -1333,8 +1333,14 @@ def get_job(job_id: str):
 
     # Normalize AssemblyAI status -> our API status
     # AssemblyAI: queued | processing | completed | error
-    if live_status in ("queued", "processing"):
+    #
+    # IMPORTANT: Do NOT collapse "processing" into "queued".
+    # The UI uses these to show real progress, and collapsing can make it look "stuck".
+    if live_status == "queued":
         status = "queued"
+        error = None
+    elif live_status == "processing":
+        status = "processing"
         error = None
     elif live_status == "completed":
         status = "completed"
