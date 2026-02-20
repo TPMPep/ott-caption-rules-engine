@@ -27,7 +27,8 @@ DB_PATH = os.getenv("SQLITE_PATH", "jobs.db")
 POLL_HINT_SECONDS = int(os.getenv("POLL_HINT_SECONDS", "3"))
 
 if not ASSEMBLYAI_API_KEY:
-    raise RuntimeError("ASSEMBLYAI_API_KEY not configured")
+    # Don't crash on import; fail on job creation calls.
+    pass
 
 # ============================================================
 # FASTAPI SETUP
@@ -145,6 +146,14 @@ class JobResponse(BaseModel):
 # ============================================================
 # ASSEMBLYAI CLIENT
 # ============================================================
+AA_BASE = "https://api.assemblyai.com/v2"
+
+def aa_headers() -> Dict[str, str]:
+    return {
+        "authorization": ASSEMBLYAI_API_KEY,
+        "content-type": "application/json",
+    }
+
 def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) -> str:
     """
     Creates an AssemblyAI transcript and returns transcript_id.
