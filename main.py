@@ -60,6 +60,32 @@ app.add_middleware(
     max_age=86400,
 )
 
+# Keep a sanitized list for manual CORS headers (useful on 500s/crashes)
+_ALLOWED_ORIGINS_LIST = [o for o in allow_origins if o != "*"]
+_ALLOWED_ORIGIN_REGEX = re.compile(allow_origin_regex) if allow_origin_regex else None
+
+def _maybe_add_cors_headers(response: Response, request: Request) -> Response:
+    """Ensure CORS headers are present even on error responses."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return response
+    ok = False
+    if "*" in allow_origins:
+        ok = True
+    elif origin in _ALLOWED_ORIGINS_LIST:
+        ok = True
+    elif _ALLOWED_ORIGIN_REGEX and _ALLOWED_ORIGIN_REGEX.match(origin):
+        ok = True
+    if ok:
+        response.headers["Access-Control-Allow-Origin"] = "*" if "*" in allow_origins else origin
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get(
+            "access-control-request-headers", "*"
+        )
+    return response
+
+
 # ============================================================
 # DATABASE
 # ============================================================
@@ -1154,10 +1180,13 @@ def cors_test():
 
 @app.exception_handler(Exception)
 async def all_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
+    # Make sure the browser ALWAYS gets a readable JSON error + CORS headers
+    resp = JSONResponse(
         status_code=500,
         content={"detail": f"{type(exc).__name__}: {str(exc)}"},
     )
+    return _maybe_add_cors_headers(resp, request)
+
 # ------------------------------------------------------------
 # CREATE JOB
 # ------------------------------------------------------------
