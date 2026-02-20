@@ -138,7 +138,7 @@ class JobResponse(BaseModel):
     title: Optional[str]
     mediaUrl: Optional[str]
     status: str
-    error: Optional[str]
+    error: Optional[str] = None
     pollHintSeconds: int = POLL_HINT_SECONDS
     exports: Optional[Dict[str, Any]] = None
 
@@ -1197,13 +1197,15 @@ def create_job(req: CreateJobRequest):
     title = (req.title or "Untitled").strip()
     rules = get_rules(req.rules)
     rules_json = json.dumps(rules)
+
     transcript_id = aa_create_transcript(
         req.mediaUrl,
         speaker_labels=bool(req.speaker_labels),
+        language_detection=bool(getattr(req, "language_detection", True)),
+        allow_http=bool(getattr(req, "allow_http", False)),
     )
 
     created = now_iso()
-    title = req.title or "Untitled"
 
     with db() as conn:
         conn.execute("""
@@ -1233,8 +1235,8 @@ def create_job(req: CreateJobRequest):
         title=title,
         mediaUrl=req.mediaUrl,
         status="processing",
+        error=None,  # important: avoids validation errors if model still expects it
     )
-
 
 # ------------------------------------------------------------
 # JOB STATUS
