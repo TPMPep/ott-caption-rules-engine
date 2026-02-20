@@ -36,6 +36,7 @@ if not ASSEMBLYAI_API_KEY:
 
 app = FastAPI(title="AI CC Creator API", version="Broadcast-Full")
 
+
 # --- CORS (MUST be configured BEFORE endpoints) ---
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
 
@@ -46,9 +47,9 @@ allow_origins = (
     else [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
 )
 
-# Base44 preview/production domains can vary, so regex helps a lot.
+# Base44 preview/production domains can vary (.base44.app and consoleapp/base44.com), so regex helps a lot.
 # This does NOT open you up to random sites unless you set ALLOWED_ORIGINS="*".
-allow_origin_regex = r"^https:\/\/.*\.base44\.app$"
+allow_origin_regex = r"^https://.*\.(base44\.app|base44\.com)$"
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,6 +61,24 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=86400,
 )
+
+
+@app.on_event("startup")
+async def _startup():
+    # Print CORS config to logs (Railway) for fast debugging
+    print("CORS allow_origins:", allow_origins)
+    print("CORS allow_origin_regex:", allow_origin_regex)
+
+
+
+# --- Explicit preflight fallback ---
+# CORSMiddleware should handle preflight automatically, but some reverse-proxy / platform
+# configurations can return a 405/404 on OPTIONS before the middleware attaches headers.
+# This catch-all ensures OPTIONS always returns a 200 from the app.
+@app.options("/{full_path:path}")
+def _options_preflight(full_path: str, request: Request):
+    return Response(status_code=200)
+
 
 # Keep a sanitized list for manual CORS headers (useful on 500s/crashes)
 _ALLOWED_ORIGINS_LIST = [o for o in allow_origins if o != "*"]
