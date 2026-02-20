@@ -158,37 +158,47 @@ def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) 
     """
     Creates an AssemblyAI transcript and returns transcript_id.
 
-    Accepts extra kwargs (language_detection, allow_http, webhook_url, webhook_secret, speech_models)
-    so the API won't crash if the frontend sends new fields.
+    Accepts extra kwargs so the API won't crash if the frontend sends new fields.
+    Supported kwargs:
+      - language_detection: bool
+      - webhook_url: str
+      - webhook_secret: str
+      - speech_models: List[str]
     """
     api_key = os.getenv("ASSEMBLYAI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(status_code=500, detail="ASSEMBLYAI_API_KEY is not configured")
 
     language_detection = bool(kwargs.get("language_detection", True))
-    webhook_url = kwargs.get("webhook_url") or ""
-    webhook_secret = kwargs.get("webhook_secret") or ""
-    speech_models = kwargs.get("speech_models") or ["universal-3-pro", "universal-2"] # required by AssemblyAI now
-    if "universal-3-pro" in speech_models:
-    payload["prompt"] = (
-        "Transcribe dialogue accurately. Also include SDH-style non-speech sound cues in ALL CAPS "
-        "inside brackets as standalone tokens, e.g. [♪ MUSIC ♪], [APPLAUSE], [LAUGHTER], [DOOR SLAMS]. "
-        "Do not paraphrase sound cues; keep them short and standard."
-    )
+    webhook_url = (kwargs.get("webhook_url") or "").strip()
+    webhook_secret = (kwargs.get("webhook_secret") or "").strip()
+
+    # Auto-wire webhook from env if not explicitly provided
+    if not webhook_url and BASE_URL:
+        webhook_url = f"{BASE_URL.rstrip('/')}/v1/webhooks/assemblyai"
+    if not webhook_secret:
+        webhook_secret = os.getenv("ASSEMBLYAI_WEBHOOK_TOKEN", "").strip()
+
+    # AssemblyAI currently requires speech_models to be a non-empty list.
+    # We default to universal-3-pro so we can use the "prompt" feature, and include universal-2 as a fallback.
+    speech_models = kwargs.get("speech_models") or ["universal-3-pro", "universal-2"]
 
     payload: Dict[str, Any] = {
         "audio_url": audio_url,
         "speaker_labels": bool(speaker_labels),
         "language_detection": language_detection,
         "speech_models": speech_models,
-        "prompt": (
+    }
+
+    # Only attach prompt when universal-3-pro is selected (universal-2 rejects prompt).
+    if "universal-3-pro" in speech_models:
+        payload["prompt"] = (
             "Transcribe dialogue accurately. Also include SDH-style non-speech sound cues in ALL CAPS "
             "inside brackets as standalone tokens, e.g. [♪ MUSIC ♪], [APPLAUSE], [LAUGHTER], [DOOR SLAMS]. "
             "Do not paraphrase sound cues; keep them short and standard."
-        ),
-    }
+        )
 
-    # Optional webhook support
+    # Optional webhook support (used to mark jobs complete automatically)
     if webhook_url:
         payload["webhook_url"] = webhook_url
         if webhook_secret:
@@ -205,6 +215,35 @@ def aa_create_transcript(audio_url: str, speaker_labels: bool = True, **kwargs) 
 
     return transcript_id
 
+
+def aa_get_transcript(transcript_id: str) -> Dict[str, Any]:
+    r = requests.get(f"{AA_BASE}/transcript/{transcript_id}", headers=aa_headers(), timeout=60)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"AssemblyAI get transcript failed: {r.status_code} {r.text}")
+    return r.json()
+
+
+def aa_get_srt(transcript_id: str) -> str:
+    r = requests.get(f"{AA_BASE}/transcript/{transcript_id}/srt", headers=aa_headers(), timeout=60)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"AssemblyAI get SRT failed: {r.status_code} {r.text}")
+    return r.text
+
+
+def aa_get_words(transcript_id: str) -> List[Dict[str, Any]]:
+    """
+    Returns word list with timings + speaker labels if available.
+    """
+    r = requests.get(f"{AA_BASE}/transcript/{transcript_id}/words", headers=aa_headers(), timeout=60)
+    if r.status_code >= 400:
+        # Not fatal; we can still produce SRT-based output without speakers/cues.
+        return []
+    data = r.json()
+    if isinstance(data, dict) and isinstance(data.get("words"), list):
+        return data["words"]
+    if isinstance(data, list):
+        return data
+    return []
 # ============================================================
 # TIME UTILITIES
 # ============================================================
