@@ -1273,148 +1273,130 @@ def create_job(req: CreateJobRequest):
 
 @app.get("/v1/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str):
-    # We try our local DB first. If the record is missing (common after a restart
-    # because SQLite on Railway is ephemeral), fall back to AssemblyAI using the
-    # transcript id (job_id) and re-hydrate the local record.
+    """Return job state and (when ready) exports.
+
+    IMPORTANT: We treat AssemblyAI as source-of-truth for the live transcript status.
+    The local DB is a cache so the UI can poll cheaply, but we will refresh from
+    AssemblyAI on every request while the job isn't completed/failed.
+    """
+    now = now_iso()
+
+    # 1) Load cached row (if any)
+    row = None
     with db() as conn:
-        row = conn.execute(
-            "SELECT id, created_at, updated_at, title, media_url, status, error, rules_json, result_json, srt, vtt "
-            "FROM jobs WHERE id=?",
-            (job_id,),
-        ).fetchone()
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
 
     if not row:
-        # Fallback: look up directly in AssemblyAI
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    status = (row["status"] or "queued").lower()
+    title = row["title"] or "Untitled"
+    created_at = row["created_at"] or now
+    updated_at = row["updated_at"] or row["created_at"] or now
+    media_url = row["media_url"]
+    error = row["error"]
+
+    # 2) If not terminal, refresh from AssemblyAI
+    # Terminal statuses for our API
+    terminal = {"completed", "failed", "error"}
+
+    live = None
+    live_status = None
+    if status not in terminal:
         try:
-            t = aa_get_transcript(job_id)
-        except HTTPException as e:
-            # If AssemblyAI doesn't know this id, return 404 to the client.
-            if e.status_code == 502:
-                # aa_get_transcript wraps upstream errors as 502; pass through.
-                raise
-            raise
+            live = aa_get_transcript(job_id)
+            live_status = (live.get("status") or "").lower() or None
+        except Exception as e:
+            # Don't break polling on transient AssemblyAI hiccups; keep cached state.
+            # (You can see the error in Railway logs.)
+            print(f"[get_job] AssemblyAI refresh failed for {job_id}: {e}")
+            live_status = None
 
-        # AssemblyAI returns statuses like: queued, processing, completed, error
-        status = (t.get("status") or "processing").lower()
-        error_msg = None
-        if status == "error":
-            error_msg = t.get("error") or "AssemblyAI error"
+    # Normalize AssemblyAI status -> our API status
+    # AssemblyAI: queued | processing | completed | error
+    if live_status in ("queued", "processing"):
+        status = "queued"
+        error = None
+    elif live_status == "completed":
+        status = "completed"
+        error = None
+    elif live_status == "error":
+        status = "failed"
+        error = live.get("error") if isinstance(live, dict) else "AssemblyAI error"
 
-        created = now_iso()
-        updated = created
-        media_url = t.get("audio_url")
-        title = None
-
-        # Create a minimal local record so the UI can poll reliably.
-        with db() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO jobs
-                (id, created_at, updated_at, title, media_url, status, error,
-                 rules_json, result_json, srt, vtt)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    created,
-                    updated,
-                    title,
-                    media_url,
-                    status,
-                    error_msg,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-            )
-            conn.commit()
-
-        # If it's already completed, pull SRT/VTT now and update the record.
-        if status == "completed":
-            srt = aa_get_srt(job_id)
-            vtt = srt_to_vtt(srt)
-            with db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET updated_at=?, status=?, error=?, srt=?, vtt=? WHERE id=?",
-                    (now_iso(), "completed", None, srt, vtt, job_id),
-                )
-                conn.commit()
-            return JobResponse(
-                id=job_id,
-                createdAt=created,
-                updatedAt=now_iso(),
-                title=title,
-                mediaUrl=media_url,
-                status="completed",
-                error=None,
-                exports={"srt": True, "vtt": True},
-            )
-
-        return JobResponse(
-            id=job_id,
-            createdAt=created,
-            updatedAt=updated,
-            title=title,
-            mediaUrl=media_url,
-            status=status,
-            error=error_msg,
-        )
-
-    # Normal path: record exists in our DB
-    (
-        _id,
-        created_at,
-        updated_at,
-        title,
-        media_url,
-        status,
-        error,
-        rules_json,
-        result_json,
-        srt,
-        vtt,
-    ) = row
-
-    status = (status or "processing").lower()
-
-    # If still processing, check AssemblyAI and update when completed/error.
-    if status in ("queued", "processing"):
-        t = aa_get_transcript(job_id)
-        aa_status = (t.get("status") or "").lower()
-
-        if aa_status == "completed":
-            srt = aa_get_srt(job_id)
-            vtt = srt_to_vtt(srt)
-            updated_at = now_iso()
-
-            with db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET updated_at=?, status=?, error=?, srt=?, vtt=? WHERE id=?",
-                    (updated_at, "completed", None, srt, vtt, job_id),
-                )
-                conn.commit()
-
-            status = "completed"
-            error = None
-
-        elif aa_status == "error":
-            updated_at = now_iso()
-            error = t.get("error") or "AssemblyAI error"
-            with db() as conn:
-                conn.execute(
-                    "UPDATE jobs SET updated_at=?, status=?, error=? WHERE id=?",
-                    (updated_at, "error", error, job_id),
-                )
-                conn.commit()
-            status = "error"
-
+    # 3) If completed and we haven't generated exports yet, generate + persist them
     exports = None
+
+    def _srt_to_vtt(srt_text: str) -> str:
+        # Minimal SRT -> WebVTT conversion good enough for browser players.
+        # - Add WEBVTT header
+        # - Replace comma milliseconds with dot
+        lines = srt_text.replace("\r\n", "\n").split("\n")
+        out = ["WEBVTT", ""]
+        for line in lines:
+            if "-->" in line:
+                out.append(line.replace(",", "."))
+            else:
+                out.append(line)
+        return "\n".join(out).strip() + "\n"
+
     if status == "completed":
-        exports = {"srt": bool(srt), "vtt": bool(vtt)}
+        # If we already have exports cached, just return them.
+        if row["srt"] and row["vtt"] and row["result_json"]:
+            exports = {
+                "srt": row["srt"],
+                "vtt": row["vtt"],
+                "result": json.loads(row["result_json"]) if row["result_json"] else None,
+            }
+        else:
+            # Build exports from AssemblyAI + our rule post-processing
+            srt_text = aa_get_srt(job_id)
+            words = aa_get_words(job_id)
+
+            # Re-load rules (stored at create time)
+            rules = {}
+            try:
+                rules = json.loads(row["rules_json"] or "{}")
+            except Exception:
+                rules = {}
+
+            vtt_text = _srt_to_vtt(srt_text)
+
+            result_obj = {
+                "id": job_id,
+                "status": "completed",
+                "words": words,
+                "rules": rules,
+            }
+
+            # Persist
+            with db() as conn:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, error = ?, updated_at = ?, srt = ?, vtt = ?, result_json = ?
+                    WHERE id = ?
+                    """,
+                    ("completed", None, now, srt_text, vtt_text, json.dumps(result_obj), job_id),
+                )
+                conn.commit()
+
+            exports = {"srt": srt_text, "vtt": vtt_text, "result": result_obj}# 4) Persist status changes if needed
+    if live_status is not None:
+        # Save the refreshed status / error even if not completed, so polling is stable
+        new_status_db = status
+        new_error_db = error
+        if row["status"] != new_status_db or row["error"] != new_error_db:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = ?, error = ?, updated_at = ? WHERE id = ?",
+                    (new_status_db, new_error_db, now, job_id),
+                )
+                conn.commit()
+            updated_at = now
 
     return JobResponse(
-        id=_id,
+        id=job_id,
         createdAt=created_at,
         updatedAt=updated_at,
         title=title,
@@ -1423,146 +1405,3 @@ def get_job(job_id: str):
         error=error,
         exports=exports,
     )
-@app.get("/v1/jobs/{job_id}/export/srt")
-def export_srt(job_id: str):
-
-    with db() as conn:
-        row = conn.execute("SELECT srt, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if row["status"] != "completed" or not row["srt"]:
-        raise HTTPException(status_code=409, detail="Job not completed")
-
-    return row["srt"]
-
-
-# ------------------------------------------------------------
-# EXPORT VTT
-# ------------------------------------------------------------
-
-@app.get("/v1/jobs/{job_id}/export/vtt")
-def export_vtt(job_id: str):
-
-    with db() as conn:
-        row = conn.execute("SELECT vtt, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if row["status"] != "completed" or not row["vtt"]:
-        raise HTTPException(status_code=409, detail="Job not completed")
-
-    return row["vtt"]
-
-
-# ------------------------------------------------------------
-# EXPORT JSON
-# ------------------------------------------------------------
-
-@app.get("/v1/jobs/{job_id}/export/json")
-def export_json(job_id: str):
-
-    with db() as conn:
-        row = conn.execute("SELECT result_json, status FROM jobs WHERE id = ?", (job_id,)).fetchone()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if row["status"] != "completed" or not row["result_json"]:
-        raise HTTPException(status_code=409, detail="Job not completed")
-
-    return json.loads(row["result_json"])
-
-
-# ------------------------------------------------------------
-# WEBHOOK HANDLER
-# ------------------------------------------------------------
-
-@app.post("/v1/webhooks/assemblyai")
-async def assemblyai_webhook(request: Request):
-
-    payload = await request.json()
-
-    transcript_id = payload.get("transcript_id") or payload.get("id")
-    status = payload.get("status")
-    updated = now_iso()
-
-    if not transcript_id:
-        return {"ok": True}
-
-    with db() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (transcript_id,)).fetchone()
-
-    if not row:
-        return {"ok": True}
-
-    rules = json.loads(row["rules_json"] or "{}")
-
-    if status == "completed":
-
-        try:
-            built = build_pro_captions(transcript_id, rules)
-
-            with db() as conn:
-                conn.execute("""
-                UPDATE jobs
-                SET status=?, updated_at=?, result_json=?, srt=?, vtt=?
-                WHERE id=?
-                """, (
-                    "completed",
-                    updated,
-                    json.dumps(built["result_json"]),
-                    built["srt"],
-                    built["vtt"],
-                    transcript_id,
-                ))
-                conn.commit()
-
-        except Exception as e:
-            with db() as conn:
-                conn.execute("""
-                UPDATE jobs
-                SET status=?, error=?, updated_at=?
-                WHERE id=?
-                """, (
-                    "error",
-                    str(e),
-                    updated,
-                    transcript_id
-                ))
-                conn.commit()
-
-    elif status in ("error", "failed"):
-        with db() as conn:
-            conn.execute("""
-            UPDATE jobs
-            SET status=?, error=?, updated_at=?
-            WHERE id=?
-            """, (
-                "error",
-                payload.get("error", "AssemblyAI failure"),
-                updated,
-                transcript_id
-            ))
-            conn.commit()
-
-    else:
-        with db() as conn:
-            conn.execute("""
-            UPDATE jobs
-            SET status=?, updated_at=?
-            WHERE id=?
-            """, (
-                "processing",
-                updated,
-                transcript_id
-            ))
-            conn.commit()
-
-    return {"ok": True}
-
-@app.post("/debug-test")
-def debug_test():
-    return {"ok": True}
