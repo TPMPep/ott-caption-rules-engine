@@ -7,6 +7,7 @@ import os
 import re
 import json
 import sqlite3
+from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -120,6 +121,7 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY,
+            transcript_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             title TEXT,
@@ -130,14 +132,24 @@ def init_db():
             result_json TEXT,
             srt TEXT,
             vtt TEXT
-        )
-        """)
+        )""")
         conn.commit()
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 init_db()
+
+def ensure_migrations():
+    """Lightweight SQLite migration for transcript_id column."""
+    with db() as conn:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+        if "transcript_id" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN transcript_id TEXT")
+            conn.commit()
+
+ensure_migrations()
+
 
 # ============================================================
 # REQUEST / RESPONSE MODELS
@@ -1250,17 +1262,20 @@ def create_job(req: CreateJobRequest):
         # if you later wire webhook fields, add them here
     )
 
+    job_id = str(uuid4())
+
     created = now_iso()
 
     with db() as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO jobs
-            (id, created_at, updated_at, title, media_url, status, error,
+            (id, transcript_id, created_at, updated_at, title, media_url, status, error,
              rules_json, result_json, srt, vtt)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                job_id,
                 transcript_id,
                 created,
                 created,
@@ -1277,7 +1292,7 @@ def create_job(req: CreateJobRequest):
         conn.commit()
 
     return JobResponse(
-        id=transcript_id,
+        id=job_id,
         createdAt=created,
         updatedAt=created,
         title=title,
@@ -1313,6 +1328,7 @@ def get_job(job_id: str):
     created_at = row["created_at"] or now
     updated_at = row["updated_at"] or row["created_at"] or now
     media_url = row["media_url"]
+    transcript_id = row["transcript_id"] or job_id
     error = row["error"]
 
     # 2) If not terminal, refresh from AssemblyAI
@@ -1323,7 +1339,7 @@ def get_job(job_id: str):
     live_status = None
     if status not in terminal:
         try:
-            live = aa_get_transcript(job_id)
+            live = aa_get_transcript(transcript_id)
             live_status = (live.get("status") or "").lower() or None
         except Exception as e:
             # Don't break polling on transient AssemblyAI hiccups; keep cached state.
@@ -1375,8 +1391,8 @@ def get_job(job_id: str):
             }
         else:
             # Build exports from AssemblyAI + our rule post-processing
-            srt_text = aa_get_srt(job_id)
-            words = aa_get_words(job_id)
+            srt_text = aa_get_srt(transcript_id)
+            words = aa_get_words(transcript_id)
 
             # Re-load rules (stored at create time)
             rules = {}
@@ -1389,6 +1405,7 @@ def get_job(job_id: str):
 
             result_obj = {
                 "id": job_id,
+                "transcriptId": transcript_id,
                 "status": "completed",
                 "words": words,
                 "rules": rules,
