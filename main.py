@@ -59,13 +59,26 @@ def health():
 
 # ✅ PROXY ENDPOINT (for Base44 <video> CORS)
 @app.get("/v1/proxy")
-def proxy(url: str):
+def proxy(url: str, request: Request):
     """
-    Streams a remote media URL through this backend to avoid browser CORS issues.
-    NOTE: This is a basic proxy (no Range support). It should play, but scrubbing may be limited.
+    Streams a remote media URL through this backend to avoid browser CORS issues,
+    WITH Range support so the video player can seek by timecode.
     """
-    upstream = requests.get(url, stream=True, allow_redirects=True, timeout=60)
-    upstream.raise_for_status()
+    range_header = request.headers.get("range")
+    headers_upstream = {}
+    if range_header:
+        headers_upstream["Range"] = range_header
+
+    upstream = requests.get(
+        url,
+        stream=True,
+        allow_redirects=True,
+        timeout=60,
+        headers=headers_upstream
+    )
+    # Do not raise_for_status() here; 206 is valid
+    if upstream.status_code not in (200, 206):
+        upstream.raise_for_status()
 
     content_type = upstream.headers.get("content-type", "application/octet-stream")
 
@@ -74,13 +87,23 @@ def proxy(url: str):
             if chunk:
                 yield chunk
 
-    headers = {
+    resp_headers = {
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
         "Cache-Control": "public, max-age=3600",
     }
 
-    return StreamingResponse(iterfile(), media_type=content_type, headers=headers)
+    # Pass through important range headers if present
+    for h in ["content-length", "content-range", "accept-ranges"]:
+        if h in upstream.headers:
+            resp_headers[h.title()] = upstream.headers[h]
 
+    return StreamingResponse(
+        iterfile(),
+        status_code=upstream.status_code,
+        media_type=content_type,
+        headers=resp_headers
+    )
 
 @app.post("/v1/jobs")
 def create_job(payload: CreateJobPayload):
@@ -172,6 +195,17 @@ async def assembly_webhook(request: Request):
         rules = JOBS[job_id]["payload"].get("rules", {})
         captions, meta = build_captions_from_assembly(transcript, rules)
 
+        # Convert captions to a cue list for the UI
+        cues = []
+        for c in captions:
+            cues.append({
+                "startMs": int(c.start_ms),
+                "endMs": int(c.end_ms),
+                "speaker": c.speaker,
+                "lines": c.lines,
+                "text": "\n".join(c.lines),
+            })
+
         # Exports
         vtt = captions_to_vtt(captions)
         srt = captions_to_srt(captions)
@@ -179,7 +213,7 @@ async def assembly_webhook(request: Request):
 
         qc = run_qc(captions, rules)
 
-        # ✅ Store exports AND result so Base44 shows buttons + cue table
+        # ✅ Store exports AND ALSO mirror inside result so Base44 shows the buttons
         JOBS[job_id]["exports"] = {
             "vtt": vtt,
             "srt": srt,
@@ -189,8 +223,12 @@ async def assembly_webhook(request: Request):
         JOBS[job_id]["result"] = {
             "meta": {"engine": "assemblyai", "appVersion": APP_VERSION, **meta},
             "qc": qc,
-            # Base44 is already rendering cues from your formatter/export path,
-            # but we keep result present so UI enables downloads.
+            "cues": cues,
+
+            # Mirror exports into result (this is the Base44 unlock)
+            "vtt": vtt,
+            "srt": srt,
+            "scc": scc,
         }
 
         JOBS[job_id]["status"] = "completed"
