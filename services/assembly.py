@@ -20,7 +20,7 @@ def submit_transcription(
 
         # ✅ Required by AssemblyAI (per your error)
         # Use the newest recommended model:
-        "speech_model": "universal-3-pro",
+        "speech_models": ["universal-3-pro"],
 
         "speaker_labels": bool(speaker_labels),
         "punctuate": True,
