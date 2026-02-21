@@ -63,6 +63,28 @@ def create_job(payload: CreateJobPayload):
         "error": None,
     }
 
+@app.get("/v1/proxy")
+def proxy(url: str):
+    """
+    Streams a remote media URL through this backend to avoid browser CORS issues.
+    """
+    r = requests.get(url, stream=True, allow_redirects=True, timeout=60)
+    r.raise_for_status()
+
+    content_type = r.headers.get("content-type", "application/octet-stream")
+
+    def iterfile():
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                yield chunk
+
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=3600",
+    }
+
+    return StreamingResponse(iterfile(), media_type=content_type, headers=headers)
+    
     # Submit to AssemblyAI asynchronously (webhook-driven when possible)
     try:
         webhook_url = None
