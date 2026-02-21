@@ -54,19 +54,27 @@ def build_captions_from_assembly(transcript: Dict[str, Any], rules: Dict[str, An
 
 def _captions_from_utterances(utterances: List[Dict[str, Any]], r: Dict[str, Any]) -> List[Caption]:
     captions: List[Caption] = []
+
     for utt in utterances:
         speaker = str(utt.get("speaker")) if utt.get("speaker") is not None else None
-        start_ms = int(utt.get("start", 0))
-        end_ms = int(utt.get("end", 0))
-        text = (utt.get("text") or "").strip()
-        if not text:
+        wlist = utt.get("words") or []
+        if not wlist:
             continue
 
-        # Segment utterance into caption-sized chunks
-        pieces = _segment_text_with_timing(text, start_ms, end_ms, r)
-        for p_start, p_end, p_text in pieces:
-            lines = _wrap_to_lines(p_text, r)
-            captions.append(Caption(p_start, p_end, lines, speaker=speaker))
+        # Build segments directly from word timings
+        segments = _segment_words_into_captions(wlist, r)
+
+        for seg_words in segments:
+            start_ms = int(seg_words[0]["start"])
+            end_ms = int(seg_words[-1]["end"])
+
+            text = " ".join([str(w.get("text", "")).strip() for w in seg_words]).strip()
+            if not text:
+                continue
+
+            lines = _wrap_to_lines(text, r)
+            captions.append(Caption(start_ms, end_ms, lines, speaker=speaker))
+
     return _post_process_speakers(captions, r)
 
 def _captions_from_words(words: List[Dict[str, Any]], r: Dict[str, Any]) -> List[Caption]:
@@ -108,6 +116,90 @@ def _captions_from_words(words: List[Dict[str, Any]], r: Dict[str, Any]) -> List
     # Now enforce timing + CPS + max duration by splitting captions that are too dense
     captions = _enforce_density_and_duration(captions, r)
     return captions
+
+def _segment_words_into_captions(words: List[Dict[str, Any]], r: Dict[str, Any]) -> List[List[Dict[str, Any]]]:
+    """
+    Groups word objects into caption segments using:
+      - pause breaks
+      - punctuation
+      - max duration
+      - reading speed (CPS)
+    Returns: list of lists of word dicts
+    """
+    if not words:
+        return []
+
+    max_ms = int(r["maxCaptionMs"])
+    min_ms = int(r["minCaptionMs"])
+    pause_break = int(r["pauseBreakMs"])
+    max_cps = float(r["maxCPS"])
+
+    segments: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+
+    def seg_text_len(ws: List[Dict[str, Any]]) -> int:
+        # Approximate displayed text length (spaces included)
+        t = " ".join([str(w.get("text", "")).strip() for w in ws]).strip()
+        return len(t)
+
+    def seg_duration(ws: List[Dict[str, Any]]) -> int:
+        return int(ws[-1]["end"]) - int(ws[0]["start"])
+
+    def should_break(prev_w: Dict[str, Any], w: Dict[str, Any], cur_ws: List[Dict[str, Any]]) -> bool:
+        # pause break
+        gap = int(w["start"]) - int(prev_w["end"])
+        if gap >= pause_break:
+            return True
+
+        # punctuation break
+        prev_text = str(prev_w.get("text", ""))
+        if prev_text.endswith((".", "!", "?", "…")):
+            return True
+
+        # max duration hard break
+        if cur_ws and (int(w["end"]) - int(cur_ws[0]["start"]) > max_ms):
+            return True
+
+        # CPS break (too dense for the time)
+        if cur_ws:
+            dur = max(1, int(w["end"]) - int(cur_ws[0]["start"]))
+            allowed = int((dur / 1000.0) * max_cps)
+            if seg_text_len(cur_ws + [w]) > max(allowed, 64):
+                return True
+
+        return False
+
+    for i, w in enumerate(words):
+        if not cur:
+            cur = [w]
+            continue
+
+        prev = cur[-1]
+        if should_break(prev, w, cur):
+            segments.append(cur)
+            cur = [w]
+        else:
+            cur.append(w)
+
+    if cur:
+        segments.append(cur)
+
+    # Enforce min duration by extending to include next words if possible
+    final: List[List[Dict[str, Any]]] = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if seg_duration(seg) < min_ms and i + 1 < len(segments):
+            # merge with next segment if it won't explode max duration too badly
+            merged = seg + segments[i + 1]
+            if seg_duration(merged) <= max_ms + 500:  # small tolerance
+                final.append(merged)
+                i += 2
+                continue
+        final.append(seg)
+        i += 1
+
+    return final
 
 def _segment_text_with_timing(text: str, start_ms: int, end_ms: int, r: Dict[str, Any]):
     # Basic clause segmentation by punctuation; then enforce duration and CPS.
