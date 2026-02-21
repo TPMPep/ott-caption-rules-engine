@@ -43,7 +43,13 @@ class CreateJobPayload(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": APP_VERSION}
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "hasAssemblyKey": bool(ASSEMBLYAI_API_KEY),
+        "assemblyKeyLength": len(ASSEMBLYAI_API_KEY or ""),
+        "hasPublicBaseUrl": bool(PUBLIC_BASE_URL)
+    }
 
 @app.post("/v1/jobs")
 def create_job(payload: CreateJobPayload):
