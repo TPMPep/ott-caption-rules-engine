@@ -355,26 +355,49 @@ def _wrap_to_lines(text: str, r: Dict[str, Any]) -> List[str]:
     return lines
 
 def _post_process_speakers(caps: List[Caption], r: Dict[str, Any]) -> List[Caption]:
-    # If two different speakers occur in the same time window, convert to dashed two-line style.
-    # (Simple heuristic: if adjacent captions overlap or are very close and speakers differ)
+    """
+    Handles speaker transitions:
+    1) If two adjacent captions overlap / are very close and speakers differ,
+       merge into a dashed two-line caption.
+    2) If speakers differ but not overlapping, prefix dash on the new speaker caption.
+    """
     out: List[Caption] = []
     i = 0
+
     while i < len(caps):
         c = caps[i]
-        if i+1 < len(caps):
-            n = caps[i+1]
+
+        # Look ahead to next caption
+        if i + 1 < len(caps):
+            n = caps[i + 1]
             close = abs(n.start_ms - c.end_ms) <= 120
+
+            # CASE 1: overlapping / very close → merge into dashed block
             if close and c.speaker and n.speaker and c.speaker != n.speaker:
-                # Merge into one dashed caption block if timing overlaps/adjacent and both fit
                 merged_start = c.start_ms
                 merged_end = n.end_ms
+
                 l1 = " ".join(c.lines).replace("\n", " ")
                 l2 = " ".join(n.lines).replace("\n", " ")
+
                 if r.get("dashSecondSpeakerLine", True):
-                    l2 = f"- {l2}" if not l2.startswith("-") else l2
-                out.append(Caption(merged_start, merged_end, _wrap_to_lines(f"{l1} {l2}".replace("  "," "), r)))
+                    if not l2.lstrip().startswith("-"):
+                        l2 = f"- {l2}"
+
+                merged_lines = _wrap_to_lines(f"{l1} {l2}".replace("  ", " "), r)
+
+                out.append(Caption(merged_start, merged_end, merged_lines))
                 i += 2
                 continue
+
+        # CASE 2: normal transition (different speaker, not merged)
+        if out:
+            prev = out[-1]
+            if prev.speaker and c.speaker and prev.speaker != c.speaker:
+                if c.lines and not c.lines[0].lstrip().startswith("-"):
+                    c.lines[0] = "- " + c.lines[0]
+
         out.append(c)
         i += 1
+
     return out
