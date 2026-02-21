@@ -9,15 +9,20 @@ def submit_transcription(api_key: str, media_url: str, speaker_labels: bool, lan
         "content-type": "application/json"
     }
 
-    payload = {
-        "audio_url": media_url,
-        "speaker_labels": bool(speaker_labels),
-        "punctuate": True,
-        "format_text": True,
-        "disfluencies": False,
-        "filter_profanity": False,
-        "language_detection": bool(language_detection),
-    }
+payload = {
+    "audio_url": media_url,
+
+    # ✅ Required by AssemblyAI (per your error)
+    # Use the newest recommended model:
+    "speech_model": "universal-3-pro",
+
+    "speaker_labels": bool(speaker_labels),
+    "punctuate": True,
+    "format_text": True,
+    "disfluencies": False,
+    "filter_profanity": False,
+    "language_detection": bool(language_detection),
+}
 
     if webhook_url:
         payload["webhook_url"] = webhook_url
