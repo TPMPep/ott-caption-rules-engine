@@ -15,32 +15,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/generate")
 async def generate(
     backbone_srt: UploadFile = File(...),
     timestamps_json: UploadFile = File(...),
-    protected_phrases: Optional[str] = Form(None),   # JSON array string
-    output_formats: Optional[str] = Form(None),      # JSON array string: ["srt","vtt","scc"]
+    protected_phrases: Optional[str] = Form(None),
+    output_formats: Optional[str] = Form(None),
 ):
     try:
         srt_text = (await backbone_srt.read()).decode("utf-8", errors="replace")
         ts_text = (await timestamps_json.read()).decode("utf-8", errors="replace")
         ts_data = json.loads(ts_text)
 
-        prot = json.loads(protected_phrases) if protected_phrases else []
+        protected = json.loads(protected_phrases) if protected_phrases else []
         formats = json.loads(output_formats) if output_formats else ["srt"]
 
         result = process_caption_job(
             backbone_srt_text=srt_text,
             timestamps=ts_data,
-            protected_phrases=prot,
+            protected_phrases=protected,
             output_formats=formats,
         )
         return result
+
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     except Exception as e:
