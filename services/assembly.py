@@ -33,7 +33,7 @@ def submit_transcription_job(
     """
     payload: Dict[str, Any] = {
         "audio_url": media_url,
-        "speech_model": "universal-2",
+        "speech_models": ["universal-3-pro"]
         "speaker_labels": speaker_labels,
         "format_text": True,
     }
