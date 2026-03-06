@@ -1,64 +1,29 @@
-import requests
+import re
 
-ASSEMBLY_BASE = "https://api.assemblyai.com/v2"
+SOUND_TOKEN_RE = re.compile(r"^\[[A-Z0-9 ,.'\-]+\]$")
 
+def normalize_tokens(ts):
+    """
+    Accept either:
+      - list[{"text","start","end","speaker"}]
+      - {"words":[...]}
+    Normalizes to: {"text","start_ms","end_ms","speaker"}
+    """
+    if isinstance(ts, dict) and "words" in ts:
+        items = ts["words"]
+    elif isinstance(ts, list):
+        items = ts
+    else:
+        raise ValueError("Unsupported timestamps JSON format. Expect list or dict with 'words'.")
 
-def submit_transcription(
-    api_key: str,
-    media_url: str,
-    speaker_labels: bool,
-    language_detection: bool,
-    webhook_url: str | None,
-):
-    headers = {
-        "authorization": api_key,
-        "content-type": "application/json",
-    }
+    out = []
+    for w in items:
+        text = (w.get("text") or w.get("word") or "").strip()
+        start = int(w.get("start_ms", w.get("start", 0)))
+        end = int(w.get("end_ms", w.get("end", start)))
+        speaker = w.get("speaker")  # may be None
+        out.append({"text": text, "start_ms": start, "end_ms": end, "speaker": speaker})
+    return out
 
-    payload = {
-        "audio_url": media_url,
-
-        # ✅ Required by AssemblyAI (per your error)
-        # Use the newest recommended model:
-        "speech_models": ["universal-3-pro"],   
-        "speaker_labels": bool(speaker_labels),
-        "punctuate": True,
-        "format_text": True,
-        "disfluencies": False,
-        "filter_profanity": False,
-        "language_detection": bool(language_detection),
-    }
-
-    if webhook_url:
-        payload["webhook_url"] = webhook_url
-
-    r = requests.post(
-        f"{ASSEMBLY_BASE}/transcript",
-        headers=headers,
-        json=payload,
-        timeout=60,
-    )
-
-    # Show the full AssemblyAI error body
-    if not r.ok:
-        raise RuntimeError(f"AssemblyAI {r.status_code}: {r.text}")
-
-    data = r.json()
-    return data["id"]
-
-
-def fetch_transcript(api_key: str, transcript_id: str):
-    headers = {
-        "authorization": api_key,
-    }
-
-    r = requests.get(
-        f"{ASSEMBLY_BASE}/transcript/{transcript_id}",
-        headers=headers,
-        timeout=60,
-    )
-
-    if not r.ok:
-        raise RuntimeError(f"AssemblyAI fetch {r.status_code}: {r.text}")
-
-    return r.json()
+def is_sound_token(text: str) -> bool:
+    return bool(SOUND_TOKEN_RE.match(text.strip()))
