@@ -4,3 +4,5 @@ requests==2.32.3
 python-dotenv==1.0.1
 pydantic==2.9.2
 pycaption==2.2.15
+python-multipart==0.0.9
+openai>=1.0.0
