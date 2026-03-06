@@ -107,7 +107,7 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
             backbone_srt_text=backbone_srt_text,
             timestamps=timestamps_json,
             protected_phrases=[],
-            output_formats=["srt", "vtt", "scc"],
+            output_formats=["srt"],
         )
 
         print(f"[{job_id}] Caption job completed successfully")
