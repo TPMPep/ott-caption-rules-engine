@@ -1,4 +1,5 @@
 import os
+import re
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -9,6 +10,8 @@ ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2"
 
 POLL_INTERVAL_SECONDS = 3
 POLL_TIMEOUT_SECONDS = 60 * 15  # 15 minutes
+
+BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 
 
 def _headers() -> Dict[str, str]:
@@ -27,9 +30,6 @@ def submit_transcription_job(
 ) -> str:
     """
     Submit a transcription request to AssemblyAI.
-
-    Returns:
-        transcript_id
     """
     payload: Dict[str, Any] = {
         "audio_url": media_url,
@@ -40,15 +40,12 @@ def submit_transcription_job(
         "prompt": (
             "Transcribe speech with accurate punctuation and formatting. "
             "Preserve non-speech audio in tags to indicate when the audio occurred. "
-            "Include audio event markers for [music], [laughter], [applause], [noise], [pause], [inaudible], [cheering], and [sound effect] when clearly present. "
+            "Include audio event markers for [music], [laughter], [applause], [noise], "
+            "[pause], [inaudible], [cheering], and [sound effect] when clearly present. "
             "Preserve proper nouns and show titles accurately. "
             "If speech is in a language other than English, preserve it in the original language."
         ),
     }
-
-    # Leave language unset so AssemblyAI can auto-detect
-    if language_detection:
-        pass
 
     response = requests.post(
         f"{ASSEMBLYAI_BASE_URL}/transcript",
@@ -73,9 +70,6 @@ def submit_transcription_job(
 def wait_for_transcription_result(transcript_id: str) -> Dict[str, Any]:
     """
     Poll AssemblyAI until transcript is completed or failed.
-
-    Returns:
-        Full transcript JSON
     """
     elapsed = 0
 
@@ -114,27 +108,24 @@ def build_caption_inputs_from_assembly_result(
     assembly_result: Dict[str, Any]
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Convert AssemblyAI transcript result into the two internal inputs expected
-    by the caption formatter:
-
+    Build:
     1) backbone_srt_text
-    2) timestamps_json (list of tokens)
+    2) timestamps_json (spoken words + injected sound tags)
     """
     transcript_id = assembly_result.get("id")
     if not transcript_id:
         raise ValueError("AssemblyAI result missing transcript id")
 
     backbone_srt_text = fetch_srt(transcript_id)
-    timestamps_json = build_word_timestamps_from_result(assembly_result)
 
-    return backbone_srt_text, timestamps_json
+    spoken_tokens = build_word_timestamps_from_result(assembly_result)
+    sound_tokens = extract_sound_tokens_from_srt(backbone_srt_text)
+
+    merged_tokens = merge_and_dedup_tokens(spoken_tokens, sound_tokens)
+    return backbone_srt_text, merged_tokens
 
 
 def fetch_srt(transcript_id: str) -> str:
-    """
-    Fetch SRT captions from AssemblyAI.
-    This becomes the canonical timing backbone.
-    """
     response = requests.get(
         f"{ASSEMBLYAI_BASE_URL}/transcript/{transcript_id}/srt",
         headers={"authorization": ASSEMBLYAI_API_KEY},
@@ -151,17 +142,7 @@ def fetch_srt(transcript_id: str) -> str:
 
 def build_word_timestamps_from_result(assembly_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Build normalized word-level timestamps list from AssemblyAI result.
-
-    Output format:
-    [
-      {
-        "text": "Hello",
-        "start_ms": 1000,
-        "end_ms": 1200,
-        "speaker": "A"
-      }
-    ]
+    Build normalized spoken-word tokens from AssemblyAI.
     """
     words = assembly_result.get("words") or []
     utterances = assembly_result.get("utterances") or []
@@ -223,14 +204,123 @@ def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict
     return tokens
 
 
+def extract_sound_tokens_from_srt(srt_text: str) -> List[Dict[str, Any]]:
+    """
+    Parse bracketed sound/event tags from the AssemblyAI SRT and convert them into tokens.
+
+    Example:
+    [LAUGHTER]
+    [APPLAUSE] [MUSIC] [NOISE]
+
+    We create one token per tag, using the cue's timing.
+    """
+    tokens: List[Dict[str, Any]] = []
+    cues = parse_srt_blocks(srt_text)
+
+    for cue in cues:
+        text = " ".join(cue["lines"]).strip()
+        if not text:
+            continue
+
+        tags = BRACKET_TAG_RE.findall(text)
+        if not tags:
+            continue
+
+        # distribute tags across cue duration if there are multiple
+        start_ms = cue["start_ms"]
+        end_ms = cue["end_ms"]
+        total_dur = max(1, end_ms - start_ms)
+        per_tag = max(1, total_dur // max(1, len(tags)))
+
+        for idx, tag in enumerate(tags):
+            tag_start = start_ms + (idx * per_tag)
+            tag_end = min(end_ms, tag_start + per_tag)
+
+            tokens.append(
+                {
+                    "text": tag.strip().upper(),
+                    "start_ms": tag_start,
+                    "end_ms": max(tag_start + 1, tag_end),
+                    "speaker": None,
+                }
+            )
+
+    return tokens
+
+
+def parse_srt_blocks(srt_text: str) -> List[Dict[str, Any]]:
+    """
+    Minimal SRT parser just for extracting cue times + text.
+    """
+    blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
+    cues: List[Dict[str, Any]] = []
+
+    for block in blocks:
+        lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+
+        try:
+            int(lines[0])
+            timing = lines[1]
+            text_lines = lines[2:]
+        except ValueError:
+            timing = lines[0]
+            text_lines = lines[1:]
+
+        if "-->" not in timing:
+            continue
+
+        start_tc, end_tc = [part.strip() for part in timing.split("-->")]
+        start_ms = tc_to_ms(start_tc)
+        end_ms = tc_to_ms(end_tc)
+
+        cues.append(
+            {
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "lines": text_lines,
+            }
+        )
+
+    return cues
+
+
+def tc_to_ms(tc: str) -> int:
+    m = re.match(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})", tc.strip())
+    if not m:
+        raise ValueError(f"Invalid SRT timecode: {tc}")
+    hh, mm, ss, ms = map(int, m.groups())
+    return ((hh * 60 + mm) * 60 + ss) * 1000 + ms
+
+
+def merge_and_dedup_tokens(
+    spoken_tokens: List[Dict[str, Any]],
+    sound_tokens: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Merge spoken and sound tokens, sorted by time.
+    Dedup exact repeats.
+    """
+    merged = spoken_tokens + sound_tokens
+    merged.sort(key=lambda x: (x["start_ms"], x["end_ms"], x["text"]))
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+
+    for tok in merged:
+        key = (tok["text"], tok["start_ms"], tok["end_ms"], tok.get("speaker"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(tok)
+
+    return deduped
+
+
 def normalize_tokens(ts: Any) -> List[Dict[str, Any]]:
     """
     Backward-compatible normalizer.
-
-    Accept either:
-      - list[{"text","start","end","speaker"}]
-      - list[{"text","start_ms","end_ms","speaker"}]
-      - {"words":[...]}
     """
     if isinstance(ts, dict) and "words" in ts:
         items = ts["words"]
