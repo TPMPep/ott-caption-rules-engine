@@ -33,13 +33,12 @@ def submit_transcription_job(
     """
     payload: Dict[str, Any] = {
         "audio_url": media_url,
-        "speech_models": ["universal-3-pro"]
+        "speech_models": ["universal-3-pro"],
         "speaker_labels": speaker_labels,
         "format_text": True,
     }
 
-    # If language_detection is True, we simply let AssemblyAI auto-detect
-    # by not forcing a language_code.
+    # Leave language unset so AssemblyAI can auto-detect
     if language_detection:
         pass
 
@@ -112,10 +111,6 @@ def build_caption_inputs_from_assembly_result(
 
     1) backbone_srt_text
     2) timestamps_json (list of tokens)
-
-    We prefer:
-    - SRT from AssemblyAI if available
-    - utterances / words for speaker reconstruction
     """
     transcript_id = assembly_result.get("id")
     if not transcript_id:
@@ -157,11 +152,8 @@ def build_word_timestamps_from_result(assembly_result: Dict[str, Any]) -> List[D
         "start_ms": 1000,
         "end_ms": 1200,
         "speaker": "A"
-      },
-      ...
+      }
     ]
-
-    We try to preserve speaker labels from utterances if available.
     """
     words = assembly_result.get("words") or []
     utterances = assembly_result.get("utterances") or []
@@ -173,10 +165,6 @@ def build_word_timestamps_from_result(assembly_result: Dict[str, Any]) -> List[D
 
 
 def _build_tokens_from_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Build normalized tokens from AssemblyAI words list only.
-    Speaker may be missing if diarization wasn't included in word objects.
-    """
     tokens: List[Dict[str, Any]] = []
 
     for word in words:
@@ -201,10 +189,6 @@ def _build_tokens_from_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Build normalized tokens from utterances.
-    This is preferred when speaker diarization is available.
-    """
     tokens: List[Dict[str, Any]] = []
 
     for utterance in utterances:
@@ -231,10 +215,6 @@ def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict
     return tokens
 
 
-# -------------------------------------------------------------------
-# Optional helper if you still use the older formatter pipeline pieces
-# -------------------------------------------------------------------
-
 def normalize_tokens(ts: Any) -> List[Dict[str, Any]]:
     """
     Backward-compatible normalizer.
@@ -243,8 +223,6 @@ def normalize_tokens(ts: Any) -> List[Dict[str, Any]]:
       - list[{"text","start","end","speaker"}]
       - list[{"text","start_ms","end_ms","speaker"}]
       - {"words":[...]}
-    Normalize to:
-      {"text","start_ms","end_ms","speaker"}
     """
     if isinstance(ts, dict) and "words" in ts:
         items = ts["words"]
@@ -274,13 +252,6 @@ def normalize_tokens(ts: Any) -> List[Dict[str, Any]]:
 
 
 def is_sound_token(text: str) -> bool:
-    """
-    Detect bracketed sound/event tokens.
-    Example:
-      [LAUGHTER]
-      [APPLAUSE]
-      [MUSIC]
-    """
     if not text:
         return False
     text = text.strip()
