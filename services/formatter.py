@@ -16,6 +16,10 @@ SOUND_MERGE_GAP_MS = 700
 
 PROTECTED_DEFAULTS = [
     "Watch What Happens Live",
+    "Andy Cohen",
+    "Below Deck Mediterranean",
+    "Aesha Scott",
+    "Kathy Skinner",
 ]
 
 FUNCTION_WORDS = {
@@ -23,6 +27,8 @@ FUNCTION_WORDS = {
     "with", "from", "in", "on", "at", "for", "that",
     "this", "these", "those", "is", "are", "was", "were",
 }
+
+BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 
 
 def process_caption_job(
@@ -36,6 +42,7 @@ def process_caption_job(
 
     Core rules:
     - AssemblyAI SRT remains the dialogue timing backbone
+    - Dialogue text comes from SRT text, not token reconstruction
     - Sound cues never push dialogue later
     - Nonessential music/noise is filtered aggressively
     - Background music under 5 seconds is suppressed
@@ -54,8 +61,8 @@ def process_caption_job(
     tokens.sort(key=lambda w: (w["start_ms"], w["end_ms"]))
     print(f"[FORMATTER] Tokens: {len(tokens)}")
 
-    print("[FORMATTER] Building dialogue cues from backbone")
-    dialogue_cues = build_dialogue_cues(backbone, tokens)
+    print("[FORMATTER] Building dialogue cues from SRT text")
+    dialogue_cues = build_dialogue_cues_from_srt(backbone, tokens)
     print(f"[FORMATTER] Dialogue cues: {len(dialogue_cues)}")
 
     print("[FORMATTER] Building sound events from tokens")
@@ -111,15 +118,31 @@ def process_caption_job(
     }
 
 
-def build_dialogue_cues(backbone: List[Dict[str, Any]], tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_dialogue_cues_from_srt(
+    backbone: List[Dict[str, Any]],
+    tokens: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """
-    Build dialogue cues from the AssemblyAI SRT backbone, but reconstruct dialogue
-    text from spoken tokens only. Sound tags are excluded from dialogue text.
+    Build dialogue cues from the AssemblyAI SRT backbone, but strip out inline sound tags.
+    Speaker runs still come from tokens, but dialogue text trusts the SRT.
     """
     cues: List[Dict[str, Any]] = []
 
     for cue in backbone:
+        raw_text = " ".join(cue.get("lines", [])).strip()
+        dialogue_text = strip_sound_tags(raw_text)
+        dialogue_text = clean_dialogue_text(dialogue_text)
+
         runs = build_speaker_runs_for_cue(cue, tokens)
+
+        # If we have no runs, keep whole cue as one speaker A block
+        if not runs:
+            runs = [{"speaker": "A", "text": dialogue_text}]
+        elif len(runs) == 1:
+            runs = [{"speaker": runs[0]["speaker"], "text": dialogue_text}]
+        else:
+            runs = align_runs_to_text(runs, dialogue_text)
+
         cues.append(
             {
                 "idx": cue.get("idx", 0),
@@ -130,11 +153,20 @@ def build_dialogue_cues(backbone: List[Dict[str, Any]], tokens: List[Dict[str, A
                 "meta": {
                     "runs": runs,
                     "two_speaker": False,
+                    "raw_text": raw_text,
+                    "dialogue_text": dialogue_text,
                 },
             }
         )
 
     return cues
+
+
+def strip_sound_tags(text: str) -> str:
+    if not text:
+        return ""
+    text = BRACKET_TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -166,11 +198,66 @@ def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]
     return runs
 
 
+def align_runs_to_text(runs: List[Dict[str, Any]], full_text: str) -> List[Dict[str, Any]]:
+    """
+    Preserve multi-speaker structure, but force total content to match the SRT dialogue text.
+    """
+    if not full_text:
+        return runs
+
+    if len(runs) <= 1:
+        return [{"speaker": runs[0]["speaker"] if runs else "A", "text": full_text}]
+
+    total_chars = sum(max(1, len(r.get("text", ""))) for r in runs)
+    assigned: List[Dict[str, Any]] = []
+    cursor = 0
+
+    for i, run in enumerate(runs):
+        if i == len(runs) - 1:
+            piece = full_text[cursor:].strip()
+        else:
+            share = max(1, int(len(full_text) * (max(1, len(run.get("text", ""))) / total_chars)))
+            cut = find_nearest_space(full_text, cursor + share)
+            piece = full_text[cursor:cut].strip()
+            cursor = cut
+
+        assigned.append({"speaker": run["speaker"], "text": piece})
+
+    cleaned: List[Dict[str, Any]] = []
+    for r in assigned:
+        if not r["text"]:
+            continue
+        cleaned.append(r)
+
+    if not cleaned:
+        return [{"speaker": "A", "text": full_text}]
+
+    return cleaned
+
+
+def find_nearest_space(text: str, target: int) -> int:
+    target = max(0, min(len(text), target))
+    if target >= len(text):
+        return len(text)
+    if text[target].isspace():
+        return target
+
+    left = target
+    right = target
+    while left > 0 or right < len(text):
+        if left > 0:
+            left -= 1
+            if text[left].isspace():
+                return left
+        if right < len(text):
+            if text[right].isspace():
+                return right
+            right += 1
+
+    return target
+
+
 def build_sound_events(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Convert sound-tag tokens into normalized sound events.
-    These are not yet placed on the final timeline.
-    """
     raw_events: List[Dict[str, Any]] = []
 
     for token in tokens:
@@ -199,14 +286,6 @@ def build_sound_events(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def normalize_sound_label(text: str) -> str:
-    """
-    Normalize incoming sound tags.
-
-    Policy:
-    - suppress generic [NOISE] / [SOUND]
-    - prefer audience reaction cues over generic noise/music combos
-    - background music becomes [♪]
-    """
     label = text.strip().upper()
 
     if not label.startswith("[") or not label.endswith("]"):
@@ -222,7 +301,7 @@ def normalize_sound_label(text: str) -> str:
         if p not in deduped:
             deduped.append(p)
 
-    if deduped == ["NOISE"] or deduped == ["SOUND"]:
+    if deduped == ["NOISE"] or deduped == ["SOUND"] or deduped == ["SOUND EFFECT"]:
         return ""
 
     if "NOISE" in deduped and any(x in deduped for x in ["APPLAUSE", "LAUGHTER", "CHEERING", "MUSIC"]):
@@ -242,9 +321,6 @@ def normalize_sound_label(text: str) -> str:
 
 
 def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Merge repeated/nearby sound events to avoid micro-spam.
-    """
     if not events:
         return []
 
@@ -262,7 +338,6 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             prev["end_ms"] = max(prev["end_ms"], ev["end_ms"])
             continue
 
-        # combine simultaneous cues
         if ev["start_ms"] - prev["end_ms"] <= 150 and abs(ev["start_ms"] - prev["start_ms"]) <= 500:
             combined = combine_sound_labels(prev["label"], ev["label"])
             prev["label"] = combined
@@ -275,14 +350,6 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Filter nonessential sound events.
-
-    Rules:
-    - background music under 5 seconds: drop
-    - repeated music after already shown: suppress
-    - keep audience reactions more readily
-    """
     filtered: List[Dict[str, Any]] = []
     last_music_end = -999999
 
@@ -290,9 +357,11 @@ def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         label = ev["label"]
         duration = ev["end_ms"] - ev["start_ms"]
 
+        # Nonessential background music under 5 seconds should not be captioned
         if label == "[♪]" and duration < MUSIC_MIN_DURATION_MS:
             continue
 
+        # Don't keep repeating music again and again
         if label == "[♪]" and ev["start_ms"] - last_music_end < 5000:
             continue
 
@@ -309,17 +378,13 @@ def place_sound_cues_in_gaps(
     dialogue_cues: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Critical policy:
-    Sound cues never push dialogue later.
-
-    A sound cue is only placed if it fits inside a real gap between dialogue cues.
-    If it overlaps dialogue, it is suppressed.
+    Sound cues only go into real gaps.
+    They never displace or delay dialogue.
     """
     if not sound_events:
         return []
 
     dialogue_sorted = sorted(dialogue_cues, key=lambda c: (c["start_ms"], c["end_ms"]))
-
     sound_cues: List[Dict[str, Any]] = []
 
     for ev in sound_events:
@@ -334,11 +399,6 @@ def fit_sound_into_dialogue_gap(
     ev: Dict[str, Any],
     dialogue_sorted: List[Dict[str, Any]],
 ) -> Dict[str, Any] | None:
-    """
-    If event overlaps dialogue, suppress it.
-    If it fits between dialogue cues, place it there.
-    """
-    label = ev["label"]
     desired_start = ev["start_ms"]
     desired_end = max(ev["end_ms"], desired_start + MIN_SOUND_MS)
 
@@ -349,11 +409,12 @@ def fit_sound_into_dialogue_gap(
         if cue["end_ms"] <= desired_start:
             prev_dialogue = cue
             continue
+
         if cue["start_ms"] >= desired_start:
             next_dialogue = cue
             break
 
-        # overlaps a dialogue cue -> suppress
+        # overlaps spoken dialogue -> suppress the sound cue
         if intervals_overlap(desired_start, desired_end, cue["start_ms"], cue["end_ms"]):
             return None
 
@@ -367,7 +428,6 @@ def fit_sound_into_dialogue_gap(
     end = min(desired_end, gap_end)
 
     if end - start < MIN_SOUND_MS:
-        # try to clamp within gap if enough space
         if gap_end - gap_start >= MIN_SOUND_MS:
             start = gap_start
             end = start + MIN_SOUND_MS
@@ -378,11 +438,11 @@ def fit_sound_into_dialogue_gap(
         "idx": 0,
         "start_ms": start,
         "end_ms": end,
-        "lines": [label[:MAX_CHARS]],
+        "lines": [ev["label"][:MAX_CHARS]],
         "type": "sound",
         "meta": {
-            "sound_label": label,
-            "sound_priority": sound_priority(label),
+            "sound_label": ev["label"],
+            "sound_priority": sound_priority(ev["label"]),
         },
     }
 
@@ -457,7 +517,7 @@ def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "end_ms": new_end,
                     "lines": [],
                     "type": "dialogue",
-                    "meta": {"runs": [run], "two_speaker": False},
+                    "meta": {"runs": [run], "two_speaker": False, "dialogue_text": run["text"]},
                 }
             )
             current_start = new_end
@@ -495,7 +555,9 @@ def format_cues(cues: List[Dict[str, Any]], protected_phrases: List[str], max_ro
             formatted.append(cue)
             continue
 
-        text = clean_dialogue_text(" ".join([r["text"] for r in runs]).strip())
+        text = cue["meta"].get("dialogue_text", "")
+        text = clean_dialogue_text(text)
+
         broken = heuristic_split(
             text=text,
             max_chars=MAX_CHARS,
@@ -530,7 +592,7 @@ def format_cues(cues: List[Dict[str, Any]], protected_phrases: List[str], max_ro
 
 
 def split_cue(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
-    text = " ".join(cue["lines"]).strip()
+    text = cue["meta"].get("dialogue_text", "").strip()
     if not text:
         return [cue]
 
@@ -546,20 +608,32 @@ def split_cue(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
     denominator = max(1, len(left_text) + len(right_text))
     split_time = cue["start_ms"] + int(total_duration * (len(left_text) / denominator))
 
+    first_speaker = cue["meta"].get("runs", [{"speaker": "A"}])[0]["speaker"]
+
     left_cue = {
         **cue,
         "start_ms": cue["start_ms"],
         "end_ms": split_time,
-        "lines": [left_text],
-        "meta": {"runs": [{"speaker": "A", "text": left_text}], "two_speaker": False},
+        "lines": [],
+        "meta": {
+            **cue["meta"],
+            "dialogue_text": left_text,
+            "runs": [{"speaker": first_speaker, "text": left_text}],
+            "two_speaker": False,
+        },
     }
 
     right_cue = {
         **cue,
         "start_ms": split_time,
         "end_ms": cue["end_ms"],
-        "lines": [right_text],
-        "meta": {"runs": [{"speaker": "A", "text": right_text}], "two_speaker": False},
+        "lines": [],
+        "meta": {
+            **cue["meta"],
+            "dialogue_text": right_text,
+            "runs": [{"speaker": first_speaker, "text": right_text}],
+            "two_speaker": False,
+        },
     }
 
     return [left_cue, right_cue]
