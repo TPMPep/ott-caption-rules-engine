@@ -14,14 +14,7 @@ MUSIC_MIN_DURATION_MS = 5000
 MIN_GAP_FOR_SOUND_MS = 400
 SOUND_MERGE_GAP_MS = 700
 
-PROTECTED_DEFAULTS = [
-    "Watch What Happens Live",
-    "Andy Cohen",
-    "Below Deck Mediterranean",
-    "Below Deck Med",
-    "Aesha Scott",
-    "Kathy Skinner",
-]
+PROTECTED_DEFAULTS: List[str] = []
 
 FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but",
@@ -31,6 +24,64 @@ FUNCTION_WORDS = {
 
 BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 
+def detect_protected_phrases_from_backbone(backbone: List[Dict[str, Any]]) -> List[str]:
+    """
+    Auto-detect likely proper nouns / titles from transcript text.
+
+    Heuristic:
+    - consecutive Capitalized words
+    - keep 2-6 word phrases
+    - ignore all-caps sound tags because those get stripped first
+    """
+    phrases: List[str] = []
+    seen = set()
+
+    for cue in backbone:
+        raw_text = " ".join(cue.get("lines", [])).strip()
+        text = strip_sound_tags(raw_text)
+
+        # Match sequences like:
+        # Andy Cohen
+        # Below Deck Med
+        # Watch What Happens Live
+        matches = re.findall(
+            r"\b(?:[A-Z][a-z]+|[A-Z]{2,})(?:\s+(?:[A-Z][a-z]+|[A-Z]{2,})){1,5}\b",
+            text,
+        )
+
+        for phrase in matches:
+            phrase = phrase.strip()
+
+            # skip obvious junk
+            words = phrase.split()
+            if len(words) < 2 or len(words) > 6:
+                continue
+
+            # skip phrases that are mostly function words
+            lowered = [w.lower() for w in words]
+            if sum(1 for w in lowered if w in FUNCTION_WORDS) >= len(words) - 1:
+                continue
+
+            if phrase not in seen:
+                seen.add(phrase)
+                phrases.append(phrase)
+
+    return phrases
+
+
+def build_runtime_protected_phrases(
+    backbone: List[Dict[str, Any]],
+    protected_phrases: List[str] | None = None,
+) -> List[str]:
+    """
+    Combine:
+    - any phrases explicitly passed in
+    - auto-detected proper nouns/titles from transcript text
+    """
+    explicit = protected_phrases or []
+    detected = detect_protected_phrases_from_backbone(backbone)
+    combined = list(dict.fromkeys(explicit + detected))
+    return combined
 
 def process_caption_job(
     backbone_srt_text: str,
@@ -38,13 +89,15 @@ def process_caption_job(
     protected_phrases: List[str] | None = None,
     output_formats: List[str] | None = None,
 ) -> Dict[str, Any]:
-    protected_phrases = list(dict.fromkeys((protected_phrases or []) + PROTECTED_DEFAULTS))
+    protected_phrases = protected_phrases or []
     output_formats = output_formats or ["srt"]
 
     print("[FORMATTER] Parsing backbone SRT")
     backbone = parse_srt(backbone_srt_text)
     cues_in = len(backbone)
     print(f"[FORMATTER] Backbone cues: {cues_in}")
+    protected_phrases = build_runtime_protected_phrases(backbone, protected_phrases)
+    print(f"[FORMATTER] Protected phrases detected: {len(protected_phrases)}")
 
     print("[FORMATTER] Normalizing timestamps")
     tokens = normalize_tokens(timestamps)
