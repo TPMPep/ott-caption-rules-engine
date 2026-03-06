@@ -57,6 +57,8 @@ def process_caption_job(
 
     print("[FORMATTER] Resolving overlaps")
     cues = resolve_overlaps(cues)
+    print("[FORMATTER] Overlaps resolved")
+    print("[FORMATTER] Exporting SRT")
 
     cues.sort(key=lambda c: (c["start_ms"], c["end_ms"]))
     for i, cue in enumerate(cues, start=1):
@@ -64,11 +66,13 @@ def process_caption_job(
 
     print("[FORMATTER] Exporting outputs")
     srt_out = export_srt(cues)
+    print("[FORMATTER] SRT export complete")
     vtt_out = export_vtt(cues) if "vtt" in output_formats else None
     scc_out = export_scc(cues) if "scc" in output_formats else None
 
     print("[FORMATTER] Running QC")
     qc = qc_report(cues_in, cues, protected_phrases)
+    print("[FORMATTER] QC complete")
 
     print("[FORMATTER] Formatter completed")
     return {
