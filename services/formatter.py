@@ -1,4 +1,3 @@
-import os
 import json
 from typing import Any, Dict, List
 
@@ -20,63 +19,58 @@ def process_caption_job(
     protected_phrases: List[str] | None = None,
     output_formats: List[str] | None = None,
 ) -> Dict[str, Any]:
-    """
-    Main production pipeline.
-
-    Order:
-    1) Parse AssemblyAI SRT backbone (canonical timing)
-    2) Normalize timestamps JSON
-    3) Build speaker runs per backbone cue
-    4) Extract and insert sound cues as standalone cues
-    5) Pre-split multi-speaker cues
-    6) Run AI line breaking
-    7) Retry failed splits
-    8) Apply readability rules
-    9) Resolve overlaps
-    10) Export final files
-    """
     protected_phrases = protected_phrases or []
     output_formats = output_formats or ["srt"]
 
+    print("[FORMATTER] Parsing backbone SRT")
     backbone = parse_srt(backbone_srt_text)
     cues_in = len(backbone)
+    print(f"[FORMATTER] Backbone cues: {cues_in}")
 
+    print("[FORMATTER] Normalizing timestamps")
     tokens = normalize_tokens(timestamps)
     tokens.sort(key=lambda w: (w["start_ms"], w["end_ms"]))
+    print(f"[FORMATTER] Tokens: {len(tokens)}")
 
-    # Build speaker runs aligned to backbone
+    print("[FORMATTER] Building speaker runs")
     for cue in backbone:
         cue["meta"]["runs"] = build_speaker_runs_for_cue(cue, tokens)
 
-    # Build standalone sound cues
+    print("[FORMATTER] Building sound cues")
     sound_cues = build_sound_cues(tokens)
+    print(f"[FORMATTER] Sound cues: {len(sound_cues)}")
 
-    # Merge timeline and guarantee no overlap
+    print("[FORMATTER] Merging timeline")
     cues = merge_timeline(backbone, sound_cues)
+    print(f"[FORMATTER] Timeline cues after merge: {len(cues)}")
 
-    # Handle multi-speaker before AI
+    print("[FORMATTER] Pre-splitting multi-speaker cues")
     cues = presplit_multispeaker(cues)
+    print(f"[FORMATTER] Timeline cues after pre-split: {len(cues)}")
 
-    # AI formatting + retry loop
+    print("[FORMATTER] Formatting cues with retry loops")
     cues = format_with_retry_loops(cues, protected_phrases)
+    print(f"[FORMATTER] Cues after formatting: {len(cues)}")
 
-    # Readability layer (this is the piece you asked about)
+    print("[FORMATTER] Applying readability rules")
     cues = apply_readability_rules(cues)
 
-    # Hard safety net
+    print("[FORMATTER] Resolving overlaps")
     cues = resolve_overlaps(cues)
 
-    # Reindex
     cues.sort(key=lambda c: (c["start_ms"], c["end_ms"]))
     for i, cue in enumerate(cues, start=1):
         cue["idx"] = i
 
+    print("[FORMATTER] Exporting outputs")
     srt_out = export_srt(cues)
     vtt_out = export_vtt(cues) if "vtt" in output_formats else None
     scc_out = export_scc(cues) if "scc" in output_formats else None
 
+    print("[FORMATTER] Running QC")
     qc = qc_report(cues_in, cues, protected_phrases)
 
+    print("[FORMATTER] Formatter completed")
     return {
         "srt": srt_out,
         "vtt": vtt_out,
@@ -86,10 +80,6 @@ def process_caption_job(
 
 
 def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Align word-level AssemblyAI tokens to a single backbone cue and group by speaker.
-    Excludes sound tokens from dialogue reconstruction.
-    """
     runs: List[Dict[str, Any]] = []
     current_run = None
 
@@ -122,11 +112,6 @@ def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]
 
 
 def build_sound_cues(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Extract bracketed sound tokens and convert them into standalone cues.
-    IMPORTANT: We do NOT trust their durations from AssemblyAI.
-    We clamp them to a readable duration.
-    """
     out: List[Dict[str, Any]] = []
 
     for token in tokens:
@@ -148,22 +133,12 @@ def build_sound_cues(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def merge_timeline(dialogue_cues: List[Dict[str, Any]], sound_cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Merge dialogue cues and sound cues into one timeline.
-    Then run overlap resolution.
-    """
     combined = dialogue_cues + sound_cues
     combined.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "sound" else 1))
     return resolve_overlaps(combined)
 
 
 def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    If a cue contains:
-    - 1 speaker -> leave it
-    - 2 speaker runs -> keep as one cue, later rendered as two dash lines
-    - >2 speaker runs -> split into multiple cues before AI
-    """
     out: List[Dict[str, Any]] = []
 
     for cue in cues:
@@ -182,7 +157,6 @@ def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             out.append(cue)
             continue
 
-        # More than 2 speaker runs: split cue
         total_duration = max(1, cue["end_ms"] - cue["start_ms"])
         lengths = [max(1, len(r["text"])) for r in runs]
         total_length = sum(lengths)
@@ -215,20 +189,12 @@ def format_with_retry_loops(
     protected_phrases: List[str],
     max_rounds: int = 3,
 ) -> List[Dict[str, Any]]:
-    """
-    AI line breaking with retry loops.
-
-    Hard rules:
-    - Max 2 lines
-    - Max 32 chars per line
-
-    If a cue fails validation:
-    - split cue
-    - re-run AI on child cues
-    """
     formatted: List[Dict[str, Any]] = []
 
-    for cue in cues:
+    for idx, cue in enumerate(cues):
+        if idx % 50 == 0:
+            print(f"[FORMATTER] Processing cue {idx + 1}/{len(cues)}")
+
         if cue["type"] == "sound":
             cue["lines"] = [cue["lines"][0][:MAX_CHARS]]
             formatted.append(cue)
@@ -238,14 +204,12 @@ def format_with_retry_loops(
         is_two_speaker = bool(cue["meta"].get("two_speaker")) and len(runs) == 2
 
         if is_two_speaker:
-            # one speaker per line, each line prefixed with dash
             lines: List[str] = []
             for run in runs:
-                broken = linebreak_ai(
+                broken = heuristic_split(
                     text=run["text"],
-                    protected_phrases=protected_phrases,
-                    max_lines=1,
                     max_chars=MAX_CHARS - 2,
+                    max_lines=1,
                 )
                 line = broken[0][: MAX_CHARS - 2] if broken else run["text"][: MAX_CHARS - 2]
                 lines.append(f"- {line}")
@@ -253,17 +217,14 @@ def format_with_retry_loops(
             formatted.append(cue)
             continue
 
-        # Single-speaker
         text = " ".join([r["text"] for r in runs]).strip()
-        broken = linebreak_ai(
+        broken = heuristic_split(
             text=text,
-            protected_phrases=protected_phrases,
-            max_lines=MAX_LINES,
             max_chars=MAX_CHARS,
+            max_lines=MAX_LINES,
         )
         cue["lines"] = broken[:MAX_LINES]
 
-        # HARD validation
         if violates_line_limits(cue["lines"], MAX_LINES, MAX_CHARS):
             if max_rounds <= 0:
                 cue["lines"] = [line[:MAX_CHARS] for line in cue["lines"][:MAX_LINES]]
@@ -274,14 +235,11 @@ def format_with_retry_loops(
                 formatted.extend(child_results)
             continue
 
-        # SOFT retry: function word endings
         if count_function_word_endings(cue["lines"]) > 0 and max_rounds > 0:
-            retry_broken = linebreak_ai(
+            retry_broken = heuristic_split(
                 text=text,
-                protected_phrases=protected_phrases,
-                max_lines=MAX_LINES,
                 max_chars=MAX_CHARS,
-                retry_hint="Avoid ending lines with function words. Choose a cleaner break.",
+                max_lines=MAX_LINES,
             )
             if retry_broken:
                 cue["lines"] = retry_broken[:MAX_LINES]
@@ -292,10 +250,6 @@ def format_with_retry_loops(
 
 
 def split_cue(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Deterministic split for a cue when validation fails.
-    Split text by midpoint and divide timing proportionally.
-    """
     text = " ".join(cue["lines"]).strip()
     if not text:
         return [cue]
@@ -337,72 +291,11 @@ def split_cue(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [left_cue, right_cue]
 
 
-def linebreak_ai(
-    text: str,
-    protected_phrases: List[str],
-    max_lines: int = 2,
-    max_chars: int = 32,
-    retry_hint: str | None = None,
-) -> List[str]:
-    """
-    Use OpenAI if available, otherwise fallback to deterministic heuristic.
-    """
+def heuristic_split(text: str, max_chars: int = 32, max_lines: int = 2) -> List[str]:
     text = (text or "").strip()
     if not text:
         return [""]
 
-    if not os.getenv("OPENAI_API_KEY"):
-        return heuristic_split(text, max_chars=max_chars, max_lines=max_lines)
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        system_prompt = (
-            "You are a professional broadcast closed-caption line breaker.\n"
-            f"Maximum {max_lines} lines.\n"
-            f"Maximum {max_chars} characters per line.\n"
-            "Do not split protected phrases or named entities.\n"
-            "Avoid ending a line with function words.\n"
-            "Prefer punctuation and phrase boundaries.\n"
-            'Return JSON only in the form: {"lines":["...","..."],"needs_split":false}\n'
-            'If impossible, return: {"lines":[],"needs_split":true}\n'
-        )
-
-        if retry_hint:
-            system_prompt += f"\nExtra instruction: {retry_hint}\n"
-
-        payload = {
-            "text": text,
-            "protected_phrases": protected_phrases or [],
-        }
-
-        response = client.responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
-            temperature=0.2,
-        )
-
-        parsed = json.loads(response.output_text.strip())
-        lines = parsed.get("lines") or []
-
-        if not lines:
-            return heuristic_split(text, max_chars=max_chars, max_lines=max_lines)
-
-        return [line[:max_chars] for line in lines[:max_lines]]
-
-    except Exception:
-        return heuristic_split(text, max_chars=max_chars, max_lines=max_lines)
-
-
-def heuristic_split(text: str, max_chars: int = 32, max_lines: int = 2) -> List[str]:
-    """
-    Fallback deterministic splitter if OpenAI is unavailable.
-    """
     words = text.split()
     if len(text) <= max_chars:
         return [text]
@@ -421,14 +314,13 @@ def heuristic_split(text: str, max_chars: int = 32, max_lines: int = 2) -> List[
     if best and max_lines == 2:
         return [best[1], best[2]]
 
-    return [text[:max_chars], text[max_chars : max_chars * 2]]
+    if max_lines == 1:
+        return [text[:max_chars]]
+
+    return [text[:max_chars], text[max_chars:max_chars * 2]]
 
 
 def resolve_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Hard safety net:
-    guarantee no overlapping cues in final timeline.
-    """
     cues.sort(key=lambda c: (c["start_ms"], c["end_ms"]))
 
     for i in range(len(cues) - 1):
