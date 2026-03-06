@@ -11,6 +11,7 @@ MAX_CHARS = 32
 MIN_DIALOGUE_MS = 800
 MIN_SOUND_MS = 1000
 SOUND_CLAMP_MS = 1400
+MUSIC_MIN_DURATION_MS = 5000
 
 PROTECTED_DEFAULTS = [
     "Watch What Happens Live",
@@ -110,10 +111,7 @@ def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]
         speaker = token.get("speaker") or "A"
 
         if current_run is None or current_run["speaker"] != speaker:
-            current_run = {
-                "speaker": speaker,
-                "text_parts": [],
-            }
+            current_run = {"speaker": speaker, "text_parts": []}
             runs.append(current_run)
 
         current_run["text_parts"].append(text)
@@ -126,9 +124,6 @@ def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]
 
 
 def build_sound_cues(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Build standalone sound cues and aggressively collapse duplicate micro-events.
-    """
     raw_events: List[Dict[str, Any]] = []
 
     for token in tokens:
@@ -143,21 +138,15 @@ def build_sound_cues(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         start = int(token["start_ms"])
         end = int(token["end_ms"] if token["end_ms"] > token["start_ms"] else token["start_ms"] + 1)
 
-        raw_events.append(
-            {
-                "label": label,
-                "start_ms": start,
-                "end_ms": end,
-            }
-        )
+        raw_events.append({"label": label, "start_ms": start, "end_ms": end})
 
-    # Merge same/nearby events so we don't get 0.04s spam
     merged = merge_sound_events(raw_events)
+    filtered = filter_sound_events(merged)
 
     out: List[Dict[str, Any]] = []
-    for ev in merged:
+    for ev in filtered:
         start = ev["start_ms"]
-        end = max(ev["end_ms"], start + SOUND_CLAMP_MS)
+        end = max(ev["end_ms"], start + MIN_SOUND_MS)
 
         out.append(
             {
@@ -166,7 +155,10 @@ def build_sound_cues(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "end_ms": end,
                 "lines": [ev["label"]],
                 "type": "sound",
-                "meta": {"sound_label": ev["label"]},
+                "meta": {
+                    "sound_label": ev["label"],
+                    "sound_priority": sound_priority(ev["label"]),
+                },
             }
         )
 
@@ -174,9 +166,6 @@ def build_sound_cues(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def normalize_sound_label(text: str) -> str:
-    """
-    Normalize AssemblyAI audio tags into cleaner CC/SDH cues.
-    """
     label = text.strip().upper()
 
     if not label.startswith("[") or not label.endswith("]"):
@@ -186,30 +175,31 @@ def normalize_sound_label(text: str) -> str:
     if not inner:
         return ""
 
-    # normalize separators / duplicates
     parts = [p.strip() for p in re.split(r"\s+AND\s+|,\s*", inner) if p.strip()]
     deduped: List[str] = []
     for p in parts:
         if p not in deduped:
             deduped.append(p)
 
-    # lightweight cleanup rules
-    if deduped == ["NOISE"]:
-        deduped = ["SOUND"]
-    if "NOISE" in deduped and "MUSIC" in deduped and len(deduped) > 1:
+    if deduped == ["NOISE"] or deduped == ["SOUND"]:
+        return ""
+
+    if "NOISE" in deduped and any(x in deduped for x in ["APPLAUSE", "LAUGHTER", "CHEERING", "MUSIC"]):
         deduped = [p for p in deduped if p != "NOISE"]
+
+    if "MUSIC" in deduped and any(x in deduped for x in ["APPLAUSE", "LAUGHTER", "CHEERING"]):
+        deduped = [p for p in deduped if p != "MUSIC"]
 
     cleaned = " AND ".join(deduped).strip()
     if not cleaned:
         return ""
 
+    if cleaned == "MUSIC":
+        return "[♪]"
     return f"[{cleaned}]"
 
 
 def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Merge identical/near-identical events that occur back-to-back or in a burst.
-    """
     if not events:
         return []
 
@@ -220,14 +210,13 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         prev = merged[-1]
 
         same_label = ev["label"] == prev["label"]
-        close_gap = ev["start_ms"] - prev["end_ms"] <= 500
+        close_gap = ev["start_ms"] - prev["end_ms"] <= 700
         overlap = ev["start_ms"] <= prev["end_ms"]
 
         if same_label and (close_gap or overlap):
             prev["end_ms"] = max(prev["end_ms"], ev["end_ms"])
             continue
 
-        # If different labels but essentially simultaneous, combine
         if ev["start_ms"] - prev["end_ms"] <= 150 and abs(ev["start_ms"] - prev["start_ms"]) <= 500:
             combined = combine_sound_labels(prev["label"], ev["label"])
             prev["label"] = combined
@@ -239,24 +228,63 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return merged
 
 
+def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    last_music_end = -999999
+
+    for ev in events:
+        label = ev["label"]
+        duration = ev["end_ms"] - ev["start_ms"]
+
+        if label == "[♪]" and duration < MUSIC_MIN_DURATION_MS:
+            continue
+
+        if label == "[♪]" and ev["start_ms"] - last_music_end < 5000:
+            continue
+
+        if label == "[♪]":
+            last_music_end = ev["end_ms"]
+
+        filtered.append(ev)
+
+    return filtered
+
+
+def sound_priority(label: str) -> int:
+    if label in ("[LAUGHTER]", "[APPLAUSE]", "[CHEERING]"):
+        return 3
+    if label == "[♪]":
+        return 1
+    return 2
+
+
 def combine_sound_labels(a: str, b: str) -> str:
-    a_inner = a.strip()[1:-1]
-    b_inner = b.strip()[1:-1]
+    if a == "[♪]" and b == "[♪]":
+        return "[♪]"
+
+    def split_label(lbl: str) -> List[str]:
+        inner = lbl.strip()[1:-1]
+        if not inner:
+            return []
+        if inner == "♪":
+            return ["♪"]
+        return [p.strip() for p in inner.split(" AND ") if p.strip()]
 
     parts: List[str] = []
-    for piece in [a_inner, b_inner]:
-        for p in piece.split(" AND "):
-            p = p.strip()
-            if p and p not in parts:
-                parts.append(p)
+    for piece in split_label(a) + split_label(b):
+        if piece and piece not in parts:
+            parts.append(piece)
+
+    if parts == ["♪"]:
+        return "[♪]"
 
     return f"[{' AND '.join(parts)}]"
 
 
 def merge_timeline(dialogue_cues: List[Dict[str, Any]], sound_cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     combined = dialogue_cues + sound_cues
-    combined.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "sound" else 1))
-    return resolve_overlaps(combined)
+    combined.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
+    return combined
 
 
 def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -294,15 +322,12 @@ def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     "end_ms": new_end,
                     "lines": [],
                     "type": "dialogue",
-                    "meta": {
-                        "runs": [run],
-                        "two_speaker": False,
-                    },
+                    "meta": {"runs": [run], "two_speaker": False},
                 }
             )
             current_start = new_end
 
-    return resolve_overlaps(out)
+    return out
 
 
 def format_with_retry_loops(
@@ -370,7 +395,7 @@ def format_with_retry_loops(
 
         formatted.append(cue)
 
-    return resolve_overlaps(formatted)
+    return formatted
 
 
 def split_cue(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -395,10 +420,7 @@ def split_cue(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
         "start_ms": cue["start_ms"],
         "end_ms": split_time,
         "lines": [left_text],
-        "meta": {
-            "runs": [{"speaker": "A", "text": left_text}],
-            "two_speaker": False,
-        },
+        "meta": {"runs": [{"speaker": "A", "text": left_text}], "two_speaker": False},
     }
 
     right_cue = {
@@ -406,10 +428,7 @@ def split_cue(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
         "start_ms": split_time,
         "end_ms": cue["end_ms"],
         "lines": [right_text],
-        "meta": {
-            "runs": [{"speaker": "A", "text": right_text}],
-            "two_speaker": False,
-        },
+        "meta": {"runs": [{"speaker": "A", "text": right_text}], "two_speaker": False},
     }
 
     return [left_cue, right_cue]
@@ -452,7 +471,6 @@ def heuristic_split(
     if best:
         return best[1]
 
-    # fallback hard split
     return [fit_single_line(text, max_chars, protected_phrases), text[max_chars:max_chars * 2].strip()]
 
 
@@ -460,36 +478,37 @@ def fit_single_line(text: str, max_chars: int, protected_phrases: List[str]) -> 
     if len(text) <= max_chars:
         return text
 
-    # avoid chopping through a protected phrase if possible
     trimmed = text[:max_chars].rstrip()
+
+    if len(trimmed) < len(text) and not text[len(trimmed)].isspace():
+        trimmed = " ".join(trimmed.split()[:-1]).strip() or trimmed[:max_chars]
+
     for phrase in protected_phrases:
-        if phrase in text and phrase.startswith(trimmed.split()[-1] if trimmed.split() else ""):
+        normalized = phrase.strip()
+        if not normalized:
+            continue
+        if normalized in text and normalized.replace(" ", "\n") in (trimmed + "\n" + text[len(trimmed):]):
             trimmed = " ".join(trimmed.split()[:-1]).strip()
+
     return trimmed[:max_chars].rstrip()
 
 
 def split_score(left: str, right: str, protected_phrases: List[str]) -> int:
     score = 0
-
-    # prefer balance
     score += abs(len(left) - len(right))
 
-    # prefer punctuation boundary
     if not re.search(r"[,\.\?!:;]$", left):
         score += 8
 
-    # penalize function-word line endings
     left_last = sanitize_last_word(left)
     if left_last in FUNCTION_WORDS:
         score += 15
 
-    # penalize splitting protected phrases
     combined = left + "\n" + right
     for phrase in protected_phrases:
         if phrase and phrase in combined.replace("\n", " ") and phrase.replace(" ", "\n") in combined:
             score += 100
 
-    # penalize tiny second line
     right_words = len(right.split())
     if right_words <= 2:
         score += 12
@@ -510,24 +529,43 @@ def clean_dialogue_text(text: str) -> str:
 
 
 def resolve_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cues.sort(key=lambda c: (c["start_ms"], c["end_ms"]))
+    cues.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
 
-    for i in range(len(cues) - 1):
-        current_cue = cues[i]
-        next_cue = cues[i + 1]
+    resolved: List[Dict[str, Any]] = []
 
-        if current_cue["end_ms"] > next_cue["start_ms"]:
-            # Prefer protecting dialogue timing; push sound cues first
-            if next_cue["type"] == "sound":
-                shift = current_cue["end_ms"] - next_cue["start_ms"]
-                next_cue["start_ms"] += shift
-                next_cue["end_ms"] = max(next_cue["end_ms"], next_cue["start_ms"] + MIN_SOUND_MS)
-            elif current_cue["type"] == "sound":
-                current_cue["end_ms"] = max(current_cue["start_ms"] + MIN_SOUND_MS, next_cue["start_ms"])
-            else:
-                shift = current_cue["end_ms"] - next_cue["start_ms"]
-                next_cue["start_ms"] += shift
-                if next_cue["end_ms"] <= next_cue["start_ms"]:
-                    next_cue["end_ms"] = next_cue["start_ms"] + 1
+    for cue in cues:
+        if not resolved:
+            resolved.append(cue)
+            continue
 
-    return cues
+        prev = resolved[-1]
+
+        if cue["type"] == "sound" and prev["type"] == "dialogue":
+            if cue["start_ms"] < prev["end_ms"]:
+                cue["start_ms"] = prev["end_ms"]
+            if cue["end_ms"] - cue["start_ms"] < MIN_SOUND_MS:
+                continue
+            resolved.append(cue)
+            continue
+
+        if cue["type"] == "dialogue" and prev["type"] == "sound":
+            if prev["end_ms"] > cue["start_ms"]:
+                if prev["meta"].get("sound_priority", 1) <= 1:
+                    prev["end_ms"] = min(prev["end_ms"], cue["start_ms"])
+                    if prev["end_ms"] - prev["start_ms"] < MIN_SOUND_MS:
+                        resolved.pop()
+                else:
+                    cue["start_ms"] = max(cue["start_ms"], prev["end_ms"])
+                    if cue["end_ms"] <= cue["start_ms"]:
+                        cue["end_ms"] = cue["start_ms"] + 1
+            resolved.append(cue)
+            continue
+
+        if prev["end_ms"] > cue["start_ms"]:
+            cue["start_ms"] = prev["end_ms"]
+            if cue["end_ms"] <= cue["start_ms"]:
+                cue["end_ms"] = cue["start_ms"] + 1
+
+        resolved.append(cue)
+
+    return resolved
