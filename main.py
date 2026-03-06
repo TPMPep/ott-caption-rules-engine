@@ -1,10 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, Dict, Any
 from datetime import datetime
 import uuid
-import asyncio
 import traceback
 
 from services.assembly import (
@@ -14,7 +13,7 @@ from services.assembly import (
 )
 from services.formatter import process_caption_job
 
-app = FastAPI(title="OTT Caption Rules Engine", version="3.0.0")
+app = FastAPI(title="OTT Caption Rules Engine", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,7 +24,6 @@ app.add_middleware(
 )
 
 # In-memory job store
-# Good enough for now. Later you can move to Redis/Postgres.
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 
@@ -61,58 +59,67 @@ def utc_now() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
 
-async def run_caption_job(job_id: str, payload: CreateJobRequest):
+def run_caption_job(job_id: str, payload: Dict[str, Any]):
     """
-    Full async pipeline:
-    1. Send media URL to AssemblyAI
-    2. Poll until transcription complete
+    Background job runner.
+
+    Flow:
+    1. Submit media URL to AssemblyAI
+    2. Poll AssemblyAI until complete
     3. Build backbone SRT + timestamps JSON
-    4. Run caption cleanup engine
-    5. Store result
+    4. Run caption formatter / cleanup
+    5. Store final result
     """
     try:
+        print(f"[{job_id}] Starting caption job")
+        print(f"[{job_id}] Input payload: {payload}")
+
         JOBS[job_id]["status"] = "transcribing"
         JOBS[job_id]["updated_at"] = utc_now()
 
-        # 1) Submit to AssemblyAI
-        transcript_id = await submit_transcription_job(
-            media_url=str(payload.mediaUrl),
-            speaker_labels=payload.speakerLabels,
-            language_detection=payload.languageDetection,
+        media_url = payload["mediaUrl"]
+        speaker_labels = payload.get("speakerLabels", True)
+        language_detection = payload.get("languageDetection", True)
+
+        print(f"[{job_id}] Submitting to AssemblyAI: {media_url}")
+        transcript_id = submit_transcription_job(
+            media_url=media_url,
+            speaker_labels=speaker_labels,
+            language_detection=language_detection,
         )
 
+        print(f"[{job_id}] AssemblyAI transcript id: {transcript_id}")
         JOBS[job_id]["assemblyai_transcript_id"] = transcript_id
         JOBS[job_id]["status"] = "processing"
         JOBS[job_id]["updated_at"] = utc_now()
 
-        # 2) Poll AssemblyAI
-        assembly_result = await wait_for_transcription_result(transcript_id)
+        print(f"[{job_id}] Waiting for AssemblyAI result...")
+        assembly_result = wait_for_transcription_result(transcript_id)
 
-        # 3) Convert AssemblyAI result into the two internal inputs
-        #    formatter expects:
-        #    - backbone_srt_text
-        #    - timestamps (word-level tokens)
+        print(f"[{job_id}] AssemblyAI transcription completed")
+        print(f"[{job_id}] Building formatter inputs from AssemblyAI result")
         backbone_srt_text, timestamps_json = build_caption_inputs_from_assembly_result(
             assembly_result
         )
 
-        # 4) Caption cleanup engine
-        protected_phrases = []  # add defaults if desired
-        output_formats = ["srt", "vtt", "scc"]
-
+        print(f"[{job_id}] Running caption formatter")
         caption_result = process_caption_job(
             backbone_srt_text=backbone_srt_text,
             timestamps=timestamps_json,
-            protected_phrases=protected_phrases,
-            output_formats=output_formats,
+            protected_phrases=[],
+            output_formats=["srt", "vtt", "scc"],
         )
 
+        print(f"[{job_id}] Caption job completed successfully")
         JOBS[job_id]["status"] = "completed"
         JOBS[job_id]["updated_at"] = utc_now()
         JOBS[job_id]["result"] = caption_result
         JOBS[job_id]["error"] = None
 
     except Exception as e:
+        print(f"[{job_id}] Caption job FAILED: {e}")
+        print(traceback.format_exc())
+
         JOBS[job_id]["status"] = "failed"
         JOBS[job_id]["updated_at"] = utc_now()
         JOBS[job_id]["result"] = None
@@ -136,13 +143,15 @@ def health():
 
 
 @app.post("/v1/jobs")
-async def create_job(payload: CreateJobRequest):
+def create_job(payload: CreateJobRequest, background_tasks: BackgroundTasks):
     """
-    Base44 job creation endpoint.
-    Accepts mediaUrl and caption config.
-    Returns a job id immediately, then processes in background.
+    Base44-compatible job creation endpoint.
+    Accepts JSON payload with mediaUrl and caption settings.
+    Processes in the background.
     """
     job_id = str(uuid.uuid4())
+
+    print(f"[{job_id}] Job created")
 
     JOBS[job_id] = {
         "id": job_id,
@@ -155,7 +164,8 @@ async def create_job(payload: CreateJobRequest):
         "error": None,
     }
 
-    asyncio.create_task(run_caption_job(job_id, payload))
+    background_tasks.add_task(run_caption_job, job_id, payload.model_dump())
+    print(f"[{job_id}] Background task dispatched")
 
     return {
         "id": job_id,
