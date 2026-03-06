@@ -36,6 +36,14 @@ def submit_transcription_job(
         "speech_models": ["universal-3-pro"],
         "speaker_labels": speaker_labels,
         "format_text": True,
+        "language_detection": language_detection,
+        "prompt": (
+            "Transcribe speech with accurate punctuation and formatting. "
+            "Preserve non-speech audio in tags to indicate when the audio occurred. "
+            "Include audio event markers for [music], [laughter], [applause], [noise], [pause], [inaudible], [cheering], and [sound effect] when clearly present. "
+            "Preserve proper nouns and show titles accurately. "
+            "If speech is in a language other than English, preserve it in the original language."
+        ),
     }
 
     # Leave language unset so AssemblyAI can auto-detect
