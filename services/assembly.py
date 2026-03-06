@@ -1,6 +1,6 @@
 import os
-import asyncio
-from typing import Any, Dict, List, Tuple, Optional
+import time
+from typing import Any, Dict, List, Tuple
 
 import requests
 
@@ -20,7 +20,7 @@ def _headers() -> Dict[str, str]:
     }
 
 
-async def submit_transcription_job(
+def submit_transcription_job(
     media_url: str,
     speaker_labels: bool = True,
     language_detection: bool = True,
@@ -35,14 +35,11 @@ async def submit_transcription_job(
         "audio_url": media_url,
         "speaker_labels": speaker_labels,
         "format_text": True,
-        # Ask for entities/content enrichment if available later
-        # but keep request lean for now.
     }
 
-    # AssemblyAI auto-detects language by default in many cases,
-    # but we keep this explicit behavior switch here for your UI.
+    # If language_detection is True, we simply let AssemblyAI auto-detect
+    # by not forcing a language_code.
     if language_detection:
-        # Leave language unset to allow auto detection
         pass
 
     response = requests.post(
@@ -65,7 +62,7 @@ async def submit_transcription_job(
     return transcript_id
 
 
-async def wait_for_transcription_result(transcript_id: str) -> Dict[str, Any]:
+def wait_for_transcription_result(transcript_id: str) -> Dict[str, Any]:
     """
     Poll AssemblyAI until transcript is completed or failed.
 
@@ -97,7 +94,7 @@ async def wait_for_transcription_result(transcript_id: str) -> Dict[str, Any]:
                 f"AssemblyAI transcription failed: {data.get('error', 'Unknown error')}"
             )
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        time.sleep(POLL_INTERVAL_SECONDS)
         elapsed += POLL_INTERVAL_SECONDS
 
     raise TimeoutError(
@@ -124,7 +121,6 @@ def build_caption_inputs_from_assembly_result(
         raise ValueError("AssemblyAI result missing transcript id")
 
     backbone_srt_text = fetch_srt(transcript_id)
-
     timestamps_json = build_word_timestamps_from_result(assembly_result)
 
     return backbone_srt_text, timestamps_json
