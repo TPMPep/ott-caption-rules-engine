@@ -13,7 +13,7 @@ from services.assembly import (
 )
 from services.formatter import process_caption_job
 
-app = FastAPI(title="OTT Caption Rules Engine", version="3.1.0")
+app = FastAPI(title="OTT Caption Rules Engine", version="3.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,7 +77,7 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
         JOBS[job_id]["status"] = "transcribing"
         JOBS[job_id]["updated_at"] = utc_now()
 
-        media_url = payload["mediaUrl"]
+        media_url = str(payload["mediaUrl"])
         speaker_labels = payload.get("speakerLabels", True)
         language_detection = payload.get("languageDetection", True)
 
@@ -153,18 +153,20 @@ def create_job(payload: CreateJobRequest, background_tasks: BackgroundTasks):
 
     print(f"[{job_id}] Job created")
 
+    payload_data = payload.model_dump(mode="json")
+
     JOBS[job_id] = {
         "id": job_id,
         "status": "queued",
         "created_at": utc_now(),
         "updated_at": utc_now(),
-        "input": payload.model_dump(),
+        "input": payload_data,
         "assemblyai_transcript_id": None,
         "result": None,
         "error": None,
     }
 
-    background_tasks.add_task(run_caption_job, job_id, payload.model_dump())
+    background_tasks.add_task(run_caption_job, job_id, payload_data)
     print(f"[{job_id}] Background task dispatched")
 
     return {
