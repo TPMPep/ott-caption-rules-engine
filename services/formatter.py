@@ -24,64 +24,6 @@ FUNCTION_WORDS = {
 
 BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 
-def detect_protected_phrases_from_backbone(backbone: List[Dict[str, Any]]) -> List[str]:
-    """
-    Auto-detect likely proper nouns / titles from transcript text.
-
-    Heuristic:
-    - consecutive Capitalized words
-    - keep 2-6 word phrases
-    - ignore all-caps sound tags because those get stripped first
-    """
-    phrases: List[str] = []
-    seen = set()
-
-    for cue in backbone:
-        raw_text = " ".join(cue.get("lines", [])).strip()
-        text = strip_sound_tags(raw_text)
-
-        # Match sequences like:
-        # Andy Cohen
-        # Below Deck Med
-        # Watch What Happens Live
-        matches = re.findall(
-            r"\b(?:[A-Z][a-z]+|[A-Z]{2,})(?:\s+(?:[A-Z][a-z]+|[A-Z]{2,})){1,5}\b",
-            text,
-        )
-
-        for phrase in matches:
-            phrase = phrase.strip()
-
-            # skip obvious junk
-            words = phrase.split()
-            if len(words) < 2 or len(words) > 6:
-                continue
-
-            # skip phrases that are mostly function words
-            lowered = [w.lower() for w in words]
-            if sum(1 for w in lowered if w in FUNCTION_WORDS) >= len(words) - 1:
-                continue
-
-            if phrase not in seen:
-                seen.add(phrase)
-                phrases.append(phrase)
-
-    return phrases
-
-
-def build_runtime_protected_phrases(
-    backbone: List[Dict[str, Any]],
-    protected_phrases: List[str] | None = None,
-) -> List[str]:
-    """
-    Combine:
-    - any phrases explicitly passed in
-    - auto-detected proper nouns/titles from transcript text
-    """
-    explicit = protected_phrases or []
-    detected = detect_protected_phrases_from_backbone(backbone)
-    combined = list(dict.fromkeys(explicit + detected))
-    return combined
 
 def process_caption_job(
     backbone_srt_text: str,
@@ -96,6 +38,7 @@ def process_caption_job(
     backbone = parse_srt(backbone_srt_text)
     cues_in = len(backbone)
     print(f"[FORMATTER] Backbone cues: {cues_in}")
+
     protected_phrases = build_runtime_protected_phrases(backbone, protected_phrases)
     print(f"[FORMATTER] Protected phrases detected: {len(protected_phrases)}")
 
@@ -132,13 +75,17 @@ def process_caption_job(
     print("[FORMATTER] Applying readability rules")
     cues = apply_readability_rules(cues)
 
+    print("[FORMATTER] Running post-format repair")
+    cues = post_format_repair(cues, protected_phrases)
+    print(f"[FORMATTER] Cues after repair: {len(cues)}")
+
     print("[FORMATTER] Resolving overlaps")
     cues = resolve_overlaps_dialogue_first(cues)
     print("[FORMATTER] Overlaps resolved")
 
     cues = remove_empty_or_tiny_cues(cues)
 
-    cues.sort(key=lambda c: (c["start_ms"], c["end_ms"]))
+    cues.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     for i, cue in enumerate(cues, start=1):
         cue["idx"] = i
 
@@ -159,6 +106,44 @@ def process_caption_job(
         "scc": scc_out,
         "qc": qc,
     }
+
+
+def detect_protected_phrases_from_backbone(backbone: List[Dict[str, Any]]) -> List[str]:
+    phrases: List[str] = []
+    seen = set()
+
+    for cue in backbone:
+        raw_text = " ".join(cue.get("lines", [])).strip()
+        text = strip_sound_tags(raw_text)
+
+        matches = re.findall(
+            r"\b(?:[A-Z][a-z]+|[A-Z]{2,})(?:\s+(?:[A-Z][a-z]+|[A-Z]{2,})){1,5}\b",
+            text,
+        )
+
+        for phrase in matches:
+            phrase = phrase.strip()
+            words = phrase.split()
+            if len(words) < 2 or len(words) > 6:
+                continue
+            lowered = [w.lower() for w in words]
+            if sum(1 for w in lowered if w in FUNCTION_WORDS) >= len(words) - 1:
+                continue
+            if phrase not in seen:
+                seen.add(phrase)
+                phrases.append(phrase)
+
+    return phrases
+
+
+def build_runtime_protected_phrases(
+    backbone: List[Dict[str, Any]],
+    protected_phrases: List[str] | None = None,
+) -> List[str]:
+    explicit = protected_phrases or []
+    detected = detect_protected_phrases_from_backbone(backbone)
+    combined = list(dict.fromkeys(PROTECTED_DEFAULTS + explicit + detected))
+    return combined
 
 
 def build_dialogue_cues_from_srt(
@@ -328,7 +313,11 @@ def normalize_sound_label(text: str) -> str:
         if p not in deduped:
             deduped.append(p)
 
-    if deduped == ["NOISE"] or deduped == ["SOUND"] or deduped == ["SOUND EFFECT"]:
+    # drop obvious junk / garbage terms
+    junk = {"NOISE", "SOUND", "SOUND EFFECT", "SPEAKER", "VOICE", "TALKING", "LAUGHING?"}
+    deduped = [p for p in deduped if p not in junk]
+
+    if not deduped:
         return ""
 
     if "NOISE" in deduped and any(x in deduped for x in ["APPLAUSE", "LAUGHTER", "CHEERING", "MUSIC"]):
@@ -379,6 +368,8 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
     last_music_end = -999999
+    last_label = None
+    last_label_end = -999999
 
     for ev in events:
         label = ev["label"]
@@ -390,9 +381,15 @@ def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if label == "[♪]" and ev["start_ms"] - last_music_end < 5000:
             continue
 
+        # suppress rapid duplicate reactions
+        if label == last_label and ev["start_ms"] - last_label_end < 1500:
+            continue
+
         if label == "[♪]":
             last_music_end = ev["end_ms"]
 
+        last_label = label
+        last_label_end = ev["end_ms"]
         filtered.append(ev)
 
     return filtered
@@ -447,13 +444,12 @@ def fit_sound_into_dialogue_gap(
     start = max(desired_start, gap_start)
     end = min(desired_end, gap_end)
 
-    # let applause/music use the available full gap, not just 1 second, when possible
-    if end - start < MIN_SOUND_MS:
-        if gap_end - gap_start >= MIN_SOUND_MS:
-            start = gap_start
-            end = gap_end
-        else:
-            return None
+    # let sound cue use the whole available gap if helpful
+    if gap_end - gap_start >= MIN_SOUND_MS:
+        start = gap_start
+        end = gap_end
+    elif end - start < MIN_SOUND_MS:
+        return None
 
     return {
         "idx": 0,
@@ -562,19 +558,16 @@ def format_cues(cues: List[Dict[str, Any]], protected_phrases: List[str], max_ro
         is_two_speaker = bool(cue["meta"].get("two_speaker")) and len(runs) == 2
 
         if is_two_speaker:
-            left_text = runs[0]["text"]
-            right_text = runs[1]["text"]
+            left_text = clean_dialogue_text(runs[0]["text"])
+            right_text = clean_dialogue_text(runs[1]["text"])
 
-            left_line = fit_single_line(left_text, MAX_CHARS - 2, protected_phrases)
-            right_line = fit_single_line(right_text, MAX_CHARS - 2, protected_phrases)
-
-            # if either speaker cannot fit cleanly on one line, split into separate events
+            # one speaker per line only; if either line doesn't fit, split to two events
             if len(left_text) > MAX_CHARS - 2 or len(right_text) > MAX_CHARS - 2:
                 child_results = format_cues(split_two_speaker_cue(cue), protected_phrases, max_rounds=max_rounds)
                 formatted.extend(child_results)
                 continue
 
-            cue["lines"] = [f"- {left_line}", f"- {right_line}"]
+            cue["lines"] = [f"- {left_text}", f"- {right_text}"]
             formatted.append(cue)
             continue
 
@@ -602,7 +595,12 @@ def format_cues(cues: List[Dict[str, Any]], protected_phrases: List[str], max_ro
             continue
 
         if count_function_word_endings(cue["lines"]) > 0 and max_rounds > 0:
-            improved, _ = smart_split(text, protected_phrases, prefer_balance=False)
+            improved, needs_split = smart_split(text, protected_phrases, prefer_balance=False)
+            if needs_split:
+                children = split_cue(cue)
+                child_results = format_cues(children, protected_phrases, max_rounds=max_rounds - 1)
+                formatted.extend(child_results)
+                continue
             cue["lines"] = improved[:MAX_LINES]
 
         formatted.append(cue)
@@ -717,14 +715,6 @@ def smart_split(
     protected_phrases: List[str],
     prefer_balance: bool = True,
 ) -> Tuple[List[str], bool]:
-    """
-    Returns:
-      (lines, needs_event_split)
-
-    Critical rule:
-    Never raw-character-slice a word.
-    If a clean 2-line split is not possible, tell caller to split into 2 events.
-    """
     text = clean_dialogue_text(text)
     if not text:
         return [""], False
@@ -749,7 +739,6 @@ def smart_split(
         candidates.sort(key=lambda x: x[0])
         return candidates[0][1], False
 
-    # cannot fit safely into 2 lines -> split into separate caption events
     return [text], True
 
 
@@ -777,7 +766,6 @@ def fit_single_line(text: str, max_chars: int, protected_phrases: List[str]) -> 
         out.pop()
         candidate = " ".join(out).strip()
 
-    # don't cut protected phrase tails
     for phrase in protected_phrases:
         pw = phrase.split()
         cw = candidate.split()
@@ -814,16 +802,122 @@ def split_score(left: str, right: str, protected_phrases: List[str], prefer_bala
     return score
 
 
+def clean_dialogue_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.replace(" ,", ",").replace(" .", ".").replace(" !", "!").replace(" ?", "?")
+    return text
+
+
 def sanitize_last_word(text: str) -> str:
     text = re.sub(r"[^\w']+$", "", text.strip().lower())
     parts = text.split()
     return parts[-1] if parts else ""
 
 
-def clean_dialogue_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text).strip()
-    text = text.replace(" ,", ",").replace(" .", ".").replace(" !", "!").replace(" ?", "?")
-    return text
+def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
+    """
+    Final repair pass:
+    - merge orphan dialogue cues like 'And I'
+    - fix duplicated adjacent words
+    - enforce line limits again
+    - clean malformed sound labels
+    - ensure 2-speaker rules are respected
+    """
+    cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
+
+    repaired: List[Dict[str, Any]] = []
+    i = 0
+
+    while i < len(cues):
+        cue = cues[i]
+
+        # clean malformed sound labels
+        if cue["type"] == "sound":
+            label = cue["lines"][0].strip() if cue.get("lines") else ""
+            label = normalize_sound_label(label)
+            if not label:
+                i += 1
+                continue
+            cue["lines"] = [label[:MAX_CHARS]]
+            repaired.append(cue)
+            i += 1
+            continue
+
+        # merge tiny orphan dialogue cue with next dialogue cue if appropriate
+        text = " ".join(cue.get("lines", [])).strip()
+        word_count = len(text.split())
+        dur = cue["end_ms"] - cue["start_ms"]
+
+        if (
+            cue["type"] == "dialogue"
+            and i < len(cues) - 1
+            and cues[i + 1]["type"] == "dialogue"
+            and (word_count <= 2 or dur < 900)
+        ):
+            nxt = cues[i + 1]
+            merged_text = merge_adjacent_dialogue_texts(text, " ".join(nxt.get("lines", [])).strip())
+            merged_lines, needs_split = smart_split(merged_text, protected_phrases)
+            if not needs_split:
+                merged_cue = {
+                    **cue,
+                    "end_ms": nxt["end_ms"],
+                    "lines": merged_lines[:MAX_LINES],
+                    "meta": {**cue["meta"], "dialogue_text": merged_text},
+                }
+                repaired.append(merged_cue)
+                i += 2
+                continue
+
+        # de-duplicate adjacent boundary words
+        if repaired and repaired[-1]["type"] == "dialogue":
+            prev = repaired[-1]
+            prev_text = " ".join(prev.get("lines", [])).strip()
+            curr_text = text
+            fixed_prev, fixed_curr = dedupe_boundary_words(prev_text, curr_text)
+            prev_lines, prev_needs_split = smart_split(fixed_prev, protected_phrases)
+            curr_lines, curr_needs_split = smart_split(fixed_curr, protected_phrases)
+
+            if not prev_needs_split and prev_lines:
+                prev["lines"] = prev_lines[:MAX_LINES]
+                prev["meta"]["dialogue_text"] = fixed_prev
+            if not curr_needs_split and curr_lines:
+                cue["lines"] = curr_lines[:MAX_LINES]
+                cue["meta"]["dialogue_text"] = fixed_curr
+
+        # revalidate one more time
+        cue_lines, needs_split = smart_split(cue["meta"].get("dialogue_text", text), protected_phrases)
+        if not needs_split:
+            cue["lines"] = cue_lines[:MAX_LINES]
+
+        repaired.append(cue)
+        i += 1
+
+    return repaired
+
+
+def merge_adjacent_dialogue_texts(a: str, b: str) -> str:
+    a = clean_dialogue_text(a)
+    b = clean_dialogue_text(b)
+    if not a:
+        return b
+    if not b:
+        return a
+    if a.split() and b.split() and a.split()[-1].lower() == b.split()[0].lower():
+        b = " ".join(b.split()[1:]).strip()
+    return clean_dialogue_text(f"{a} {b}".strip())
+
+
+def dedupe_boundary_words(prev_text: str, curr_text: str) -> Tuple[str, str]:
+    prev_words = prev_text.split()
+    curr_words = curr_text.split()
+
+    if not prev_words or not curr_words:
+        return prev_text, curr_text
+
+    if prev_words[-1].lower() == curr_words[0].lower():
+        curr_words = curr_words[1:]
+
+    return " ".join(prev_words).strip(), " ".join(curr_words).strip()
 
 
 def resolve_overlaps_dialogue_first(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -876,6 +970,10 @@ def remove_empty_or_tiny_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
 
         if cue["type"] == "sound" and dur < MIN_SOUND_MS:
+            continue
+
+        # enforce hard line limit one last time
+        if any(len(line) > MAX_CHARS for line in cue.get("lines", [])):
             continue
 
         cleaned.append(cue)
