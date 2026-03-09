@@ -480,7 +480,7 @@ def fit_sound_into_dialogue_gap(
 
     # Do not let sound cues consume the entire lead-in before dialogue.
     if next_dialogue is not None and gap_end - gap_start > MIN_SOUND_MS + 250:
-        end = min(end, gap_end - 250)
+        end = min(end, gap_end - 500)
 
     if end - start < MIN_SOUND_MS:
         if gap_end - gap_start >= MIN_SOUND_MS:
