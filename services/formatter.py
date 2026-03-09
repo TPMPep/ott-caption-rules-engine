@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Tuple
 from services.assembly import normalize_tokens, is_sound_token
 from services.exporters import parse_srt, export_srt, export_vtt, export_scc
 from services.qc import qc_report, violates_line_limits, count_function_word_endings
-from services.readability import apply_readability_rules
 
 MAX_LINES = 2
 MAX_CHARS = 32
@@ -82,8 +81,8 @@ def process_caption_job(
     cues = format_cues(cues, protected_phrases)
     print(f"[FORMATTER] Cues after formatting: {len(cues)}")
 
-    print("[FORMATTER] Applying readability rules")
-    cues = apply_readability_rules(cues)
+    print("[FORMATTER] Applying conservative readability pass")
+    cues = conservative_readability_pass(cues)
 
     print("[FORMATTER] Running post-format repair")
     cues = post_format_repair(cues, protected_phrases)
@@ -827,16 +826,40 @@ def split_score(left: str, right: str, protected_phrases: List[str], prefer_bala
     return score
 
 
+
+
+def conservative_readability_pass(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Very conservative readability pass.
+    Do NOT merge/split dialogue text here.
+    Only extend short sound cues slightly when there is clear room.
+    """
+    cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
+    out: List[Dict[str, Any]] = []
+
+    for i, cue in enumerate(cues):
+        cue = cue.copy()
+        if cue["type"] == "sound":
+            min_end = cue["start_ms"] + MIN_SOUND_MS
+            if cue["end_ms"] < min_end:
+                next_start = cues[i + 1]["start_ms"] if i < len(cues) - 1 else min_end
+                cue["end_ms"] = min(max(min_end, cue["end_ms"]), next_start)
+        out.append(cue)
+
+    return out
+
 def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
     """
     Lightweight, non-destructive repair pass:
     - normalize sound labels again
-    - remove duplicated boundary words only
-    - enforce line limits by splitting more events, never by trimming content away
+    - re-split invalid dialogue safely
+    - merge obvious fragment cues with neighbors
+    - de-duplicate repeated boundary words
     """
     cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     repaired: List[Dict[str, Any]] = []
 
+    # first pass: normalize each cue safely
     for cue in cues:
         if cue["type"] == "sound":
             label = cue["lines"][0].strip() if cue.get("lines") else ""
@@ -860,16 +883,62 @@ def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str])
                 repaired.extend(rendered)
                 continue
 
+        cue["meta"]["dialogue_text"] = text
         cue["lines"] = lines[:MAX_LINES]
         repaired.append(cue)
 
-    # de-duplicate exact repeated boundary word between adjacent dialogue cues
-    for i in range(1, len(repaired)):
-        prev = repaired[i - 1]
-        curr = repaired[i]
+    # second pass: merge obvious dialogue fragments with following dialogue cue
+    merged: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(repaired):
+        cue = repaired[i]
+        if cue["type"] == "dialogue" and i < len(repaired) - 1 and repaired[i + 1]["type"] == "dialogue":
+            curr_text = cue["meta"].get("dialogue_text", " ".join(cue.get("lines", [])).strip())
+            next_text = repaired[i + 1]["meta"].get("dialogue_text", " ".join(repaired[i + 1].get("lines", [])).strip())
+
+            curr_words = curr_text.split()
+            is_fragment = (
+                len(curr_words) <= 2
+                or curr_text in {"It's.", "And I", "Who made"}
+                or (curr_words and curr_words[-1].lower() in FUNCTION_WORDS)
+            )
+
+            if is_fragment:
+                combined = clean_dialogue_text((curr_text + " " + next_text).strip())
+                lines, needs_split = smart_split(combined, protected_phrases)
+                if not needs_split:
+                    new_cue = cue.copy()
+                    new_cue["end_ms"] = repaired[i + 1]["end_ms"]
+                    new_cue["meta"] = dict(cue["meta"])
+                    new_cue["meta"]["dialogue_text"] = combined
+                    new_cue["lines"] = lines[:MAX_LINES]
+                    merged.append(new_cue)
+                    i += 2
+                    continue
+                else:
+                    # keep combined content by splitting into events from the combined text
+                    new_cue = cue.copy()
+                    new_cue["end_ms"] = repaired[i + 1]["end_ms"]
+                    new_cue["meta"] = dict(cue["meta"])
+                    new_cue["meta"]["dialogue_text"] = combined
+                    split_children = split_cue(new_cue)
+                    rendered: List[Dict[str, Any]] = []
+                    for child in split_children:
+                        rendered.extend(format_cues([child], protected_phrases, max_rounds=0))
+                    merged.extend(rendered)
+                    i += 2
+                    continue
+
+        merged.append(cue)
+        i += 1
+
+    # third pass: de-duplicate exact repeated boundary word between adjacent dialogue cues
+    for i in range(1, len(merged)):
+        prev = merged[i - 1]
+        curr = merged[i]
         if prev["type"] == "dialogue" and curr["type"] == "dialogue":
-            prev_text = " ".join(prev.get("lines", [])).strip()
-            curr_text = " ".join(curr.get("lines", [])).strip()
+            prev_text = prev["meta"].get("dialogue_text", " ".join(prev.get("lines", [])).strip())
+            curr_text = curr["meta"].get("dialogue_text", " ".join(curr.get("lines", [])).strip())
             if prev_text and curr_text:
                 prev_words = prev_text.split()
                 curr_words = curr_text.split()
@@ -881,7 +950,7 @@ def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str])
                             curr["meta"]["dialogue_text"] = curr_text
                             curr["lines"] = lines[:MAX_LINES]
 
-    return repaired
+    return merged
 
 
 def resolve_overlaps_dialogue_first(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -941,12 +1010,6 @@ def remove_empty_or_tiny_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
 
         if cue["type"] == "sound" and dur < MIN_SOUND_MS:
-            continue
-
-        if len(cue.get("lines", [])) > MAX_LINES:
-            continue
-
-        if any(len(line) > MAX_CHARS for line in cue.get("lines", [])):
             continue
 
         cleaned.append(cue)
