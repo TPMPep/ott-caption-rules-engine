@@ -4,6 +4,11 @@ from typing import Any, Dict, List, Tuple
 from services.assembly import normalize_tokens, is_sound_token
 from services.exporters import parse_srt, export_srt, export_vtt, export_scc
 from services.qc import qc_report, violates_line_limits, count_function_word_endings
+try:
+    from services.editorial_ai import editorial_refine_cues
+except Exception:
+    def editorial_refine_cues(cues, protected_phrases):
+        return cues
 
 MAX_LINES = 2
 MAX_CHARS = 32
@@ -88,9 +93,16 @@ def process_caption_job(
     cues = post_format_repair(cues, protected_phrases)
     print(f"[FORMATTER] Cues after repair: {len(cues)}")
 
+    print("[FORMATTER] Running AI editorial pass")
+    cues = editorial_refine_cues(cues, protected_phrases)
+    print(f"[FORMATTER] Cues after AI editorial: {len(cues)}")
+
     print("[FORMATTER] Resolving overlaps")
     cues = resolve_overlaps_dialogue_first(cues)
     print("[FORMATTER] Overlaps resolved")
+
+    print("[FORMATTER] Running final hard validation")
+    cues = final_hard_validate(cues, protected_phrases)
 
     cues = remove_empty_or_tiny_cues(cues)
 
@@ -1010,6 +1022,65 @@ def sanitize_last_word(text: str) -> str:
     parts = text.split()
     return parts[-1] if parts else ""
 
+
+
+
+def final_hard_validate(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
+    """
+    Final safety pass after AI:
+    - preserve cue count/timing unless cue is empty
+    - ensure max 2 lines, 32 chars
+    - if invalid, fall back to deterministic splitter using stored dialogue_text
+    """
+    validated: List[Dict[str, Any]] = []
+    for cue in cues:
+        if cue.get("type") == "sound":
+            lines = cue.get("lines", [])[:1]
+            if not lines:
+                continue
+            cue["lines"] = [clean_dialogue_text(lines[0])[:MAX_CHARS]]
+            validated.append(cue)
+            continue
+
+        text = cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))).strip()
+        text = clean_dialogue_text(text)
+        lines = [clean_dialogue_text(x) for x in cue.get("lines", []) if clean_dialogue_text(x)]
+        if not lines:
+            lines = [text] if text else []
+
+        # keep valid two-speaker dash format
+        runs = cue.get("meta", {}).get("runs", [])
+        is_two = bool(cue.get("meta", {}).get("two_speaker")) and len(runs) == 2
+        if is_two:
+            if len(lines) == 2 and all(line.startswith("- ") and len(line) <= MAX_CHARS for line in lines):
+                validated.append(cue)
+                continue
+            # fallback deterministic two-speaker
+            left = clean_dialogue_text(runs[0].get("text", ""))
+            right = clean_dialogue_text(runs[1].get("text", ""))
+            if left and right and len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
+                cue["lines"] = [f"- {left}", f"- {right}"]
+                validated.append(cue)
+                continue
+
+        if len(lines) <= MAX_LINES and all(len(line) <= MAX_CHARS for line in lines):
+            cue["lines"] = lines
+            validated.append(cue)
+            continue
+
+        broken, needs_split = smart_split(text, protected_phrases)
+        if not needs_split:
+            cue["lines"] = broken[:MAX_LINES]
+            validated.append(cue)
+            continue
+
+        # keep best-effort deterministic fit
+        first = fit_single_line(text, MAX_CHARS, protected_phrases)
+        remainder = clean_dialogue_text(text[len(first):].strip())
+        second = fit_single_line(remainder, MAX_CHARS, protected_phrases) if remainder else ""
+        cue["lines"] = [x for x in [first, second] if x][:MAX_LINES]
+        validated.append(cue)
+    return validated
 
 def remove_empty_or_tiny_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     cleaned: List[Dict[str, Any]] = []
