@@ -217,7 +217,6 @@ def build_dialogue_cues_from_srt(
 
     return cues
 
-
 def strip_sound_tags(text: str) -> str:
     if not text:
         return ""
@@ -254,41 +253,79 @@ def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]
 
         current_run["text_parts"].append(text)
 
+    collapsed: List[Dict[str, Any]] = []
     for run in runs:
-        run["text"] = clean_dialogue_text(" ".join(run["text_parts"]))
-        del run["text_parts"]
+        run_text = clean_dialogue_text(" ".join(run["text_parts"]))
+        if not run_text:
+            continue
+        words = run_text.split()
+        if collapsed and (len(words) <= 2 or len(run_text) <= 10):
+            collapsed[-1]["text"] = clean_dialogue_text(collapsed[-1]["text"] + " " + run_text)
+            continue
+        collapsed.append({"speaker": run["speaker"], "text": run_text})
 
-    return runs
+    if len(collapsed) > 2:
+        return [{"speaker": collapsed[0]["speaker"], "text": clean_dialogue_text(" ".join(r["text"] for r in collapsed))}]
 
+    return collapsed
 
 def align_runs_to_text(runs: List[Dict[str, Any]], full_text: str) -> List[Dict[str, Any]]:
     """
-    Preserve multi-speaker structure, but keep the full SRT dialogue text intact.
+    Keep speaker runs only when they can be aligned safely.
+    The earlier proportional char slicing created cross-speaker corruption.
+    If confidence is low, fall back to a single-speaker cue instead of inventing
+    malformed two-speaker structure.
     """
+    full_text = clean_dialogue_text(full_text)
     if not full_text:
         return runs
+
+    cleaned_runs = []
+    for run in runs:
+        run_text = clean_dialogue_text(run.get("text", ""))
+        if run_text:
+            cleaned_runs.append({"speaker": run.get("speaker") or "A", "text": run_text})
+    runs = cleaned_runs
 
     if len(runs) <= 1:
         return [{"speaker": runs[0]["speaker"] if runs else "A", "text": full_text}]
 
-    total_chars = sum(max(1, len(r.get("text", ""))) for r in runs)
-    assigned: List[Dict[str, Any]] = []
+    full_words = full_text.split()
+    if not full_words:
+        return [{"speaker": runs[0]["speaker"], "text": full_text}]
+
+    assigned = []
     cursor = 0
-
     for i, run in enumerate(runs):
+        target = run["text"].split()
+        if not target:
+            continue
         if i == len(runs) - 1:
-            piece = full_text[cursor:].strip()
+            piece_words = full_words[cursor:]
         else:
-            share = max(1, int(len(full_text) * (max(1, len(run.get("text", ""))) / total_chars)))
-            cut = find_nearest_space(full_text, cursor + share)
-            piece = full_text[cursor:cut].strip()
-            cursor = cut
+            n = len(target)
+            piece_words = None
+            best_end = None
+            for end in range(cursor + max(1, n - 2), min(len(full_words), cursor + n + 4) + 1):
+                candidate = full_words[cursor:end]
+                target_slice = target[:len(candidate)]
+                if [w.lower() for w in candidate] == [w.lower() for w in target_slice]:
+                    piece_words = candidate
+                    best_end = end
+            if piece_words is None:
+                return [{"speaker": runs[0]["speaker"], "text": full_text}]
+            cursor = best_end
+        assigned.append({"speaker": run["speaker"], "text": clean_dialogue_text(" ".join(piece_words))})
 
-        assigned.append({"speaker": run["speaker"], "text": piece})
+    assigned = [r for r in assigned if r["text"]]
+    if len(assigned) < 2:
+        return [{"speaker": assigned[0]["speaker"] if assigned else "A", "text": full_text}]
 
-    cleaned = [r for r in assigned if r["text"]]
-    return cleaned or [{"speaker": "A", "text": full_text}]
+    reconstructed = clean_dialogue_text(" ".join(r["text"] for r in assigned))
+    if [w.lower() for w in reconstructed.split()] != [w.lower() for w in full_words]:
+        return [{"speaker": assigned[0]["speaker"], "text": full_text}]
 
+    return assigned
 
 def find_nearest_space(text: str, target: int) -> int:
     target = max(0, min(len(text), target))
@@ -566,12 +603,15 @@ def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         runs = cue["meta"].get("runs", [])
 
-        if len(runs) <= 1:
-            out.append(cue)
-            continue
-
         if len(runs) == 2:
-            cue["meta"]["two_speaker"] = True
+            left = clean_dialogue_text(runs[0].get("text", ""))
+            right = clean_dialogue_text(runs[1].get("text", ""))
+            if left and right:
+                cue["meta"]["two_speaker"] = True
+                out.append(cue)
+                continue
+
+        if len(runs) <= 1:
             out.append(cue)
             continue
 
@@ -580,10 +620,9 @@ def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         total_length = max(1, sum(lengths))
         current_start = cue["start_ms"]
 
-        for run, length in zip(runs, lengths):
+        for j, (run, length) in enumerate(zip(runs, lengths)):
             dur = int(total_duration * (length / total_length))
-            new_end = current_start + max(1, dur)
-
+            new_end = cue["end_ms"] if j == len(runs) - 1 else current_start + max(1, dur)
             out.append(
                 {
                     "idx": 0,
@@ -597,7 +636,6 @@ def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             current_start = new_end
 
     return out
-
 
 def format_cues(cues: List[Dict[str, Any]], protected_phrases: List[str], max_rounds: int = 3) -> List[Dict[str, Any]]:
     formatted: List[Dict[str, Any]] = []
@@ -747,7 +785,7 @@ def choose_split_midpoint(words: List[str]) -> int:
     best = midpoint
     best_score = 999999
 
-    for i in range(max(1, midpoint - 5), min(len(words), midpoint + 6)):
+    for i in range(max(1, midpoint - 8), min(len(words), midpoint + 9)):
         left = words[:i]
         right = words[i:]
         if not left or not right:
@@ -755,19 +793,24 @@ def choose_split_midpoint(words: List[str]) -> int:
 
         left_text = " ".join(left)
         right_text = " ".join(right)
-
         score = abs(len(left_text) - len(right_text))
 
         left_last = re.sub(r"[^\w',;:.?!-]+$", "", left[-1]).lower()
+        right_first = re.sub(r"^[^\w']+", "", right[0]).lower()
         if left_last in FUNCTION_WORDS:
-            score += 25
-
-        if re.search(r"[,.;:?!]$", left[-1]):
-            score -= 25
+            score += 35
+        if right_first in FUNCTION_WORDS:
+            score += 14
+        if re.search(r"[,;:]$", left[-1]):
+            score -= 30
+        elif re.search(r"[\.!?]$", left[-1]):
+            score -= 36
         if len(right) <= 2:
-            score += 18
+            score += 25
         if len(left) <= 2:
-            score += 10
+            score += 20
+        if len(left) == 1 and left[0].lower() in {"and", "but", "so", "because"}:
+            score += 50
 
         if score < best_score:
             best_score = score
@@ -781,9 +824,8 @@ def smart_split(
     prefer_balance: bool = True,
 ) -> Tuple[List[str], bool]:
     """
-    Never raw-character-slice a word.
-    Prefer punctuation / full phrase boundaries over visual balance.
-    If it cannot fit safely into 2 lines, signal caller to split into additional events.
+    Prefer clean phrase boundaries. If 2-line wrapping is unsafe, ask caller to split into
+    additional caption events instead of forcing a bad fragment.
     """
     text = clean_dialogue_text(text)
     if not text:
@@ -807,7 +849,9 @@ def smart_split(
 
     if candidates:
         candidates.sort(key=lambda x: x[0])
-        return candidates[0][1], False
+        best_score, best_lines = candidates[0]
+        if best_score < 120:
+            return best_lines, False
 
     return [text], True
 
@@ -854,30 +898,47 @@ def split_score(left: str, right: str, protected_phrases: List[str], prefer_bala
         score += abs(len(left) - len(right))
 
     if re.search(r"[,;:]$", left):
-        score -= 18
-    elif re.search(r"[\.\?!]$", left):
         score -= 24
+    elif re.search(r"[\.!?]$", left):
+        score -= 34
     else:
-        score += 14
+        score += 24
 
     left_last = sanitize_last_word(left)
+    right_first = re.sub(r"^[^\w']+", "", right.strip().split()[0]).lower() if right.strip().split() else ""
     if left_last in FUNCTION_WORDS:
-        score += 24
+        score += 40
+    if right_first in FUNCTION_WORDS:
+        score += 18
 
     combined = left + "\n" + right
     for phrase in protected_phrases:
         if phrase and phrase in combined.replace("\n", " ") and phrase.replace(" ", "\n") in combined:
-            score += 220
+            score += 250
 
-    if len(right.split()) <= 2:
-        score += 18
-    if len(right.split()) == 1:
-        score += 40
+    weak_fragment_starts = {"and", "but", "or", "to", "of", "for", "with", "because", "that", "this", "these", "those"}
+    weak_fragment_ends = {"and", "but", "or", "to", "of", "for", "with", "because", "that", "this", "these", "those", "i", "it", "who", "what"}
+    left_words = left.split()
+    right_words = right.split()
+
+    if len(right_words) <= 2:
+        score += 28
+    if len(right_words) == 1:
+        score += 60
+    if len(left_words) <= 2:
+        score += 28
+    if left_words and left_words[-1].lower() in weak_fragment_ends:
+        score += 45
+    if right_words and right_words[0].lower() in weak_fragment_starts:
+        score += 26
+
+    awkward_heads = {"and i", "it's", "who made", "what was", "because i", "just go", "little bit"}
+    if " ".join(left_words[-2:]).lower() in awkward_heads:
+        score += 70
+    if " ".join(right_words[:2]).lower() in awkward_heads:
+        score += 60
 
     return score
-
-
-
 
 def conservative_readability_pass(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -901,12 +962,8 @@ def conservative_readability_pass(cues: List[Dict[str, Any]]) -> List[Dict[str, 
 
 def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
     """
-    Lightweight, non-destructive repair pass:
-    - preserve two-speaker dash formatting
-    - normalize sound labels again
-    - re-split invalid dialogue safely
-    - merge obvious fragment cues with neighbors
-    - de-duplicate repeated boundary words
+    Non-destructive repair pass focused on fragments, malformed speaker cues,
+    duplicated carryover words, and bad cue joins.
     """
     cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     repaired: List[Dict[str, Any]] = []
@@ -927,26 +984,29 @@ def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str])
         if is_two_speaker:
             left = clean_dialogue_text(runs[0]["text"])
             right = clean_dialogue_text(runs[1]["text"])
-            if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
+            if left and right and len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
                 cue["lines"] = [f"- {left}", f"- {right}"]
                 cue["meta"]["dialogue_text"] = f"{left} {right}".strip()
                 repaired.append(cue)
                 continue
+            split_children = split_two_speaker_cue(cue)
+            rendered: List[Dict[str, Any]] = []
+            for child in split_children:
+                rendered.extend(format_cues([child], protected_phrases, max_rounds=1))
+            repaired.extend(rendered)
+            continue
 
-        text = cue["meta"].get("dialogue_text", " ".join(cue.get("lines", []))).strip()
-        text = clean_dialogue_text(text)
-        lines, needs_event_split = smart_split(text, protected_phrases)
-
+        text = clean_dialogue_text(cue["meta"].get("dialogue_text", " ".join(cue.get("lines", []))).strip())
+        cue["meta"]["dialogue_text"] = text
+        lines, needs_event_split = smart_split(text, protected_phrases, prefer_balance=False)
         if needs_event_split:
             split_children = split_cue(cue)
             if split_children != [cue]:
-                rendered: List[Dict[str, Any]] = []
+                rendered = []
                 for child in split_children:
-                    rendered.extend(format_cues([child], protected_phrases, max_rounds=0))
+                    rendered.extend(format_cues([child], protected_phrases, max_rounds=1))
                 repaired.extend(rendered)
                 continue
-
-        cue["meta"]["dialogue_text"] = text
         cue["lines"] = tidy_lines_for_readability(lines[:MAX_LINES], protected_phrases)
         repaired.append(cue)
 
@@ -956,36 +1016,33 @@ def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str])
         cue = repaired[i]
         if (
             cue["type"] == "dialogue"
-            and not (cue["meta"].get("two_speaker") and len(cue["meta"].get("runs", [])) == 2)
             and i < len(repaired) - 1
             and repaired[i + 1]["type"] == "dialogue"
-            and not (repaired[i + 1]["meta"].get("two_speaker") and len(repaired[i + 1]["meta"].get("runs", [])) == 2)
+            and not cue["meta"].get("two_speaker")
+            and not repaired[i + 1]["meta"].get("two_speaker")
         ):
-            curr_text = cue["meta"].get("dialogue_text", " ".join(cue.get("lines", [])).strip())
-            next_text = repaired[i + 1]["meta"].get("dialogue_text", " ".join(repaired[i + 1].get("lines", [])).strip())
-
+            curr_text = clean_dialogue_text(cue["meta"].get("dialogue_text", " ".join(cue.get("lines", []))))
+            next_text = clean_dialogue_text(repaired[i + 1]["meta"].get("dialogue_text", " ".join(repaired[i + 1].get("lines", []))))
             curr_words = curr_text.split()
-            is_fragment = (
-                len(curr_words) <= 2
-                or curr_text in {"It's.", "And I", "Who made"}
-                or (curr_words and curr_words[-1].lower() in FUNCTION_WORDS)
+            fragment_like = (
+                len(curr_words) <= 3
+                or curr_text.lower() in {"and i", "it's", "who made", "what was your", "because i always said to", "just go home", "little bit about his"}
+                or sanitize_last_word(curr_text) in FUNCTION_WORDS | {"i", "it", "who", "what", "this", "that"}
             )
-
-            if is_fragment:
+            if fragment_like:
                 combined = clean_dialogue_text((curr_text + " " + next_text).strip())
-                lines, needs_split = smart_split(combined, protected_phrases)
+                lines, needs_split = smart_split(combined, protected_phrases, prefer_balance=False)
                 if not needs_split:
                     new_cue = cue.copy()
                     new_cue["end_ms"] = repaired[i + 1]["end_ms"]
                     new_cue["meta"] = dict(cue["meta"])
                     new_cue["meta"]["dialogue_text"] = combined
-                    new_cue["meta"]["runs"] = [{"speaker": cue["meta"].get("runs", [{"speaker":"A"}])[0]["speaker"], "text": combined}]
+                    new_cue["meta"]["runs"] = [{"speaker": cue["meta"].get("runs", [{"speaker": "A"}])[0]["speaker"], "text": combined}]
                     new_cue["meta"]["two_speaker"] = False
-                    new_cue["lines"] = lines[:MAX_LINES]
+                    new_cue["lines"] = tidy_lines_for_readability(lines[:MAX_LINES], protected_phrases)
                     merged.append(new_cue)
                     i += 2
                     continue
-
         merged.append(cue)
         i += 1
 
@@ -993,16 +1050,17 @@ def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str])
         prev = merged[i - 1]
         curr = merged[i]
         if prev["type"] == "dialogue" and curr["type"] == "dialogue":
-            prev_text = prev["meta"].get("dialogue_text", " ".join(prev.get("lines", [])).strip())
-            curr_text = curr["meta"].get("dialogue_text", " ".join(curr.get("lines", [])).strip())
+            prev_text = clean_dialogue_text(prev["meta"].get("dialogue_text", " ".join(prev.get("lines", []))))
+            curr_text = clean_dialogue_text(curr["meta"].get("dialogue_text", " ".join(curr.get("lines", []))))
             pw = prev_text.split()
             cw = curr_text.split()
             if pw and cw and pw[-1].lower() == cw[0].lower():
-                curr_text = " ".join(cw[1:]).strip()
-                if curr_text:
-                    lines, needs_split = smart_split(curr_text, protected_phrases)
+                trimmed = clean_dialogue_text(" ".join(cw[1:]))
+                if trimmed:
+                    lines, needs_split = smart_split(trimmed, protected_phrases, prefer_balance=False)
                     if not needs_split:
-                        curr["meta"]["dialogue_text"] = curr_text
+                        curr["meta"]["dialogue_text"] = trimmed
+                        curr["meta"]["runs"] = [{"speaker": curr["meta"].get("runs", [{"speaker": "A"}])[0]["speaker"], "text": trimmed}]
                         curr["lines"] = tidy_lines_for_readability(lines[:MAX_LINES], protected_phrases)
     return merged
 
@@ -1047,14 +1105,22 @@ def tidy_lines_for_readability(lines: List[str], protected_phrases: List[str]) -
     if not lines:
         return lines
     if len(lines) == 2:
-        left, right = lines[0].strip(), lines[1].strip()
-        if len(right.split()) == 1 and right.lower() in {"is", "to", "of", "and", "or", "but", "for", "with"}:
+        left, right = clean_dialogue_text(lines[0]), clean_dialogue_text(lines[1])
+        weak_single = {"is", "to", "of", "and", "or", "but", "for", "with"}
+        weak_ends = FUNCTION_WORDS | {"i", "it", "who", "what", "this", "that"}
+        weak_starts = {"and", "or", "but", "to", "of", "for", "with", "because", "that", "this"}
+        if len(right.split()) == 1 and right.lower() in weak_single:
             joined = clean_dialogue_text(f"{left} {right}")
             better, needs_split = smart_split(joined, protected_phrases, prefer_balance=False)
             if not needs_split:
                 return better[:2]
-    return lines
-
+        if sanitize_last_word(left) in weak_ends or (right.split() and right.split()[0].lower() in weak_starts):
+            joined = clean_dialogue_text(f"{left} {right}")
+            better, needs_split = smart_split(joined, protected_phrases, prefer_balance=False)
+            if not needs_split:
+                return better[:2]
+        return [left, right]
+    return [clean_dialogue_text(x) for x in lines]
 
 def sanitize_last_word(text: str) -> str:
     text = re.sub(r"[^\w']+$", "", text.strip().lower())
@@ -1066,12 +1132,14 @@ def sanitize_last_word(text: str) -> str:
 
 def final_hard_validate(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
     """
-    Final safety pass after AI:
-    - preserve cue count/timing unless cue is empty
-    - ensure max 2 lines, 32 chars
-    - if invalid, fall back to deterministic splitter using stored dialogue_text
+    Final gate. Reject cues that are technically short enough but editorially ugly.
     """
     validated: List[Dict[str, Any]] = []
+    bad_fragment_patterns = {
+        "and i", "it's", "who made", "what was your", "because i always said to",
+        "just go home", "little bit about his", "the shower drain. of"
+    }
+
     for cue in cues:
         if cue.get("type") == "sound":
             lines = cue.get("lines", [])[:1]
@@ -1081,39 +1149,59 @@ def final_hard_validate(cues: List[Dict[str, Any]], protected_phrases: List[str]
             validated.append(cue)
             continue
 
-        text = cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))).strip()
-        text = clean_dialogue_text(text)
-        lines = [clean_dialogue_text(x) for x in cue.get("lines", []) if clean_dialogue_text(x)]
-        if not lines:
-            lines = [text] if text else []
-
-        # keep valid two-speaker dash format
+        text = clean_dialogue_text(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))).strip())
         runs = cue.get("meta", {}).get("runs", [])
         is_two = bool(cue.get("meta", {}).get("two_speaker")) and len(runs) == 2
+        lines = [clean_dialogue_text(x) for x in cue.get("lines", []) if clean_dialogue_text(x)]
+        if not lines and text:
+            lines = [text]
+
         if is_two:
-            if len(lines) == 2 and all(line.startswith("- ") and len(line) <= MAX_CHARS for line in lines):
+            good = len(lines) == 2 and all(line.startswith("- ") and len(line) <= MAX_CHARS for line in lines)
+            if good:
+                cue["lines"] = lines
                 validated.append(cue)
                 continue
-            # fallback deterministic two-speaker
             left = clean_dialogue_text(runs[0].get("text", ""))
             right = clean_dialogue_text(runs[1].get("text", ""))
             if left and right and len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
                 cue["lines"] = [f"- {left}", f"- {right}"]
+                cue["meta"]["dialogue_text"] = f"{left} {right}".strip()
                 validated.append(cue)
                 continue
+            split_children = split_two_speaker_cue(cue)
+            validated.extend(format_cues(split_children, protected_phrases, max_rounds=1))
+            continue
 
-        if len(lines) <= MAX_LINES and all(len(line) <= MAX_CHARS for line in lines):
+        def looks_bad(ls: List[str]) -> bool:
+            if not ls or len(ls) > MAX_LINES or any(len(x) > MAX_CHARS for x in ls):
+                return True
+            joined = clean_dialogue_text(" ".join(ls)).lower()
+            if joined in bad_fragment_patterns:
+                return True
+            if len(ls) == 2:
+                if sanitize_last_word(ls[0]) in FUNCTION_WORDS | {"i", "it", "who", "what", "this", "that"}:
+                    return True
+                if ls[1].split() and ls[1].split()[0].lower() in {"and", "or", "but", "to", "of", "for", "with", "because", "that", "this"}:
+                    return True
+            return False
+
+        if lines and not looks_bad(lines):
             cue["lines"] = lines
             validated.append(cue)
             continue
 
-        broken, needs_split = smart_split(text, protected_phrases)
-        if not needs_split:
+        broken, needs_split = smart_split(text, protected_phrases, prefer_balance=False)
+        if not needs_split and not looks_bad(broken[:MAX_LINES]):
             cue["lines"] = tidy_lines_for_readability(broken[:MAX_LINES], protected_phrases)
             validated.append(cue)
             continue
 
-        # keep best-effort deterministic fit
+        children = split_cue(cue)
+        if children != [cue]:
+            validated.extend(format_cues(children, protected_phrases, max_rounds=1))
+            continue
+
         first = fit_single_line(text, MAX_CHARS, protected_phrases)
         remainder = clean_dialogue_text(text[len(first):].strip())
         second = fit_single_line(remainder, MAX_CHARS, protected_phrases) if remainder else ""
