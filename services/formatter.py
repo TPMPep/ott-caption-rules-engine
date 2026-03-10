@@ -221,7 +221,14 @@ def build_dialogue_cues_from_srt(
 def strip_sound_tags(text: str) -> str:
     if not text:
         return ""
-    text = BRACKET_TAG_RE.sub(" ", text)
+    # Preserve dialogue-meaningful inline tags like [INAUDIBLE] inside spoken text,
+    # while stripping non-dialogue sound cues that should be handled separately.
+    def _replace(match: re.Match) -> str:
+        tag = match.group(0).upper()
+        if tag == "[INAUDIBLE]":
+            return " [INAUDIBLE] "
+        return " "
+    text = BRACKET_TAG_RE.sub(_replace, text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -472,20 +479,33 @@ def fit_sound_into_dialogue_gap(
     gap_start = prev_dialogue["end_ms"] if prev_dialogue else desired_start
     gap_end = next_dialogue["start_ms"] if next_dialogue else desired_end
 
-    if gap_end - gap_start < MIN_GAP_FOR_SOUND_MS:
+    gap_len = gap_end - gap_start
+    if gap_len < MIN_GAP_FOR_SOUND_MS:
         return None
 
-    start = max(desired_start, gap_start)
-    end = min(desired_end, gap_end)
+    # General policy:
+    # - sound cues should usually be readable for ~3-5 seconds
+    # - never shorter than 1 second
+    # - do not consume the entire lead-in before dialogue
+    target_ms = 3500
+    max_ms = 5000
+    lead_out_ms = 250 if next_dialogue is not None else 0
 
-    # Do not let sound cues consume the entire lead-in before dialogue.
-    if next_dialogue is not None and gap_end - gap_start > MIN_SOUND_MS + 250:
-        end = min(end, gap_end - 500)
+    start = max(desired_start, gap_start)
+    latest_end = max(start + MIN_SOUND_MS, gap_end - lead_out_ms)
+    latest_end = min(latest_end, gap_end)
+
+    preferred_end = min(start + target_ms, gap_end - lead_out_ms if next_dialogue is not None else gap_end)
+    preferred_end = max(preferred_end, start + MIN_SOUND_MS)
+
+    if next_dialogue is not None:
+        end = min(preferred_end, gap_end - lead_out_ms)
+    else:
+        end = min(max(desired_end, preferred_end), min(gap_end, start + max_ms))
 
     if end - start < MIN_SOUND_MS:
-        if gap_end - gap_start >= MIN_SOUND_MS:
-            start = gap_start
-            end = start + MIN_SOUND_MS
+        if gap_len >= MIN_SOUND_MS:
+            end = min(gap_end, start + MIN_SOUND_MS)
         else:
             return None
 
@@ -857,7 +877,7 @@ def conservative_readability_pass(cues: List[Dict[str, Any]]) -> List[Dict[str, 
     """
     Very conservative readability pass.
     Do NOT merge/split dialogue text here.
-    Only extend short sound cues slightly when there is clear room.
+    Only extend short sound cues when there is clear room, aiming for readability.
     """
     cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     out: List[Dict[str, Any]] = []
@@ -865,10 +885,10 @@ def conservative_readability_pass(cues: List[Dict[str, Any]]) -> List[Dict[str, 
     for i, cue in enumerate(cues):
         cue = cue.copy()
         if cue["type"] == "sound":
+            target_end = cue["start_ms"] + 3500
             min_end = cue["start_ms"] + MIN_SOUND_MS
-            if cue["end_ms"] < min_end:
-                next_start = cues[i + 1]["start_ms"] if i < len(cues) - 1 else min_end
-                cue["end_ms"] = min(max(min_end, cue["end_ms"]), next_start)
+            next_start = cues[i + 1]["start_ms"] if i < len(cues) - 1 else target_end
+            cue["end_ms"] = min(max(min_end, cue["end_ms"], min(target_end, cue["start_ms"] + 5000)), max(min_end, next_start - 250))
         out.append(cue)
 
     return out
