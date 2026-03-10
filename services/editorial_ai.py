@@ -103,6 +103,8 @@ def _refine_two_speaker_cue(client, cue: Dict, runs: List[Dict], protected_phras
         return None
     if _has_bad_titlecase(right, ai_lines[1][2:]):
         return None
+    if _has_bad_period_lowercase_sequence(" ".join([ai_lines[0][2:], ai_lines[1][2:]])):
+        return None
     new_cue = dict(cue)
     new_cue["lines"] = ai_lines
     return new_cue
@@ -137,7 +139,7 @@ def _refine_single_speaker_cue(client, cue: Dict, dialogue_text: str, prev_text:
                     "Do NOT capitalize a word just because it starts a new caption line. "
                     "Only capitalize if it truly begins a sentence, is the pronoun I, or is already a proper noun/title. "
                     "Preserve sentence meaning and continuity across neighboring cues. "
-                    "Prefer punctuation and phrase boundaries over visual balance. "
+                    "Prefer punctuation and phrase boundaries over visual balance. If punctuation is ambiguous and the thought clearly continues, prefer a comma or semicolon rather than a period. "
                     "Use commas rather than periods when the sentence clearly continues, for example 'I'm your host, Andy Cohen.' "
                     "Preserve titles and proper nouns. Do not split proper nouns or show titles awkwardly across lines. "
                     "If the source contains [INAUDIBLE], preserve it exactly as [INAUDIBLE]. "
@@ -152,11 +154,16 @@ def _refine_single_speaker_cue(client, cue: Dict, dialogue_text: str, prev_text:
         return None
     if not ai_lines or len(ai_lines) > MAX_LINES or any(len(line) > MAX_CHARS for line in ai_lines):
         return None
-    if _word_fingerprint(" ".join(ai_lines)) != _word_fingerprint(dialogue_text):
+    joined = " ".join(ai_lines)
+    if _word_fingerprint(joined) != _word_fingerprint(dialogue_text):
         return None
-    if _has_bad_titlecase(dialogue_text, " ".join(ai_lines)):
+    if _has_bad_titlecase(dialogue_text, joined):
         return None
-    if _bad_initial_capitalization_due_to_continuation(dialogue_text, " ".join(ai_lines), prev_text):
+    if _bad_initial_capitalization_due_to_continuation(dialogue_text, joined, prev_text):
+        return None
+    if _has_bad_period_lowercase_sequence(joined):
+        return None
+    if _has_weak_one_word_line(ai_lines):
         return None
     new_cue = dict(cue)
     new_cue["lines"] = ai_lines
@@ -174,6 +181,18 @@ def _normalize_lines(lines: List[str]) -> List[str]:
         if line:
             out.append(line)
     return out[:MAX_LINES]
+
+
+def _has_bad_period_lowercase_sequence(edited: str) -> bool:
+    return bool(re.search(r"[A-Za-z]\.(?:\s+)([a-z])", edited))
+
+def _has_weak_one_word_line(lines: List[str]) -> bool:
+    weak = {"is", "to", "of", "and", "or", "but", "for", "with", "a", "an", "the"}
+    for line in lines:
+        words = line.replace("- ", "").split()
+        if len(words) == 1 and words[0].lower() in weak:
+            return True
+    return False
 
 
 def _token_case_list(text: str) -> List[str]:
