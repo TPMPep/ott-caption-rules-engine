@@ -1,12 +1,20 @@
 import json
 import os
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 MAX_LINES = 2
 MAX_CHARS = 32
-_WORD_RE = re.compile(r"[\w']+")
+_WORD_RE = re.compile(r"\b[\w']+\b")
 _SENT_BOUNDARY_RE = re.compile(r"[.!?]\s*$")
+_WEAK_WORDS = {
+    "is", "to", "of", "and", "or", "but", "for", "with", "a", "an", "the",
+    "that", "this", "these", "those", "in", "on", "at", "from", "by",
+}
+_FRAGMENT_PATTERNS = {
+    "and i", "and i had", "it’s", "it's", "who made", "did it", "do you",
+    "from below", "speaking of", "by the way",
+}
 
 
 def editorial_refine_cues(cues: List[Dict], protected_phrases: List[str]) -> List[Dict]:
@@ -39,7 +47,7 @@ def editorial_refine_cues(cues: List[Dict], protected_phrases: List[str]) -> Lis
         if idx < total - 1 and cues[idx + 1].get("type") == "dialogue":
             next_text = cues[idx + 1].get("meta", {}).get("dialogue_text", " ".join(cues[idx + 1].get("lines", []))).strip()
 
-        if len(runs) == 2:
+        if len(runs) == 2 and cue.get("meta", {}).get("two_speaker"):
             new_cue = _refine_two_speaker_cue(client, cue, runs, protected_phrases)
         else:
             new_cue = _refine_single_speaker_cue(client, cue, dialogue_text, prev_text, next_text, protected_phrases)
@@ -53,6 +61,9 @@ def _refine_two_speaker_cue(client, cue: Dict, runs: List[Dict], protected_phras
     right = (runs[1].get("text") or "").strip()
     if not left or not right:
         return None
+    if len(left) > MAX_CHARS - 2 or len(right) > MAX_CHARS - 2:
+        return None
+
     payload = {
         "speaker_run_1": left,
         "speaker_run_2": right,
@@ -91,6 +102,7 @@ def _refine_two_speaker_cue(client, cue: Dict, runs: List[Dict], protected_phras
         ai_lines = _normalize_lines([str(x).strip() for x in data.get("lines", []) if str(x).strip()])
     except Exception:
         return None
+
     if len(ai_lines) != 2 or not all(line.startswith('- ') for line in ai_lines):
         return None
     if any(len(line) > MAX_CHARS for line in ai_lines):
@@ -103,14 +115,20 @@ def _refine_two_speaker_cue(client, cue: Dict, runs: List[Dict], protected_phras
         return None
     if _has_bad_titlecase(right, ai_lines[1][2:]):
         return None
-    if _has_bad_period_lowercase_sequence(" ".join([ai_lines[0][2:], ai_lines[1][2:]])):
+    joined = " ".join([ai_lines[0][2:], ai_lines[1][2:]])
+    if _has_bad_period_lowercase_sequence(joined):
         return None
+    if _looks_fragmentary(ai_lines[0][2:]) or _looks_fragmentary(ai_lines[1][2:]):
+        return None
+
     new_cue = dict(cue)
     new_cue["lines"] = ai_lines
     return new_cue
 
 
 def _refine_single_speaker_cue(client, cue: Dict, dialogue_text: str, prev_text: str, next_text: str, protected_phrases: List[str]):
+    if not dialogue_text.strip():
+        return None
     payload = {
         "dialogue_text": dialogue_text,
         "current_lines": cue.get("lines", []),
@@ -152,8 +170,10 @@ def _refine_single_speaker_cue(client, cue: Dict, dialogue_text: str, prev_text:
         ai_lines = _normalize_lines([str(x).strip() for x in data.get("lines", []) if str(x).strip()])
     except Exception:
         return None
+
     if not ai_lines or len(ai_lines) > MAX_LINES or any(len(line) > MAX_CHARS for line in ai_lines):
         return None
+
     joined = " ".join(ai_lines)
     if _word_fingerprint(joined) != _word_fingerprint(dialogue_text):
         return None
@@ -165,6 +185,13 @@ def _refine_single_speaker_cue(client, cue: Dict, dialogue_text: str, prev_text:
         return None
     if _has_weak_one_word_line(ai_lines):
         return None
+    if _breaks_protected_phrase(ai_lines, protected_phrases):
+        return None
+    if _looks_fragmentary(joined):
+        return None
+    if _creates_bad_boundary_with_neighbors(joined, prev_text, next_text):
+        return None
+
     new_cue = dict(cue)
     new_cue["lines"] = ai_lines
     return new_cue
@@ -186,11 +213,11 @@ def _normalize_lines(lines: List[str]) -> List[str]:
 def _has_bad_period_lowercase_sequence(edited: str) -> bool:
     return bool(re.search(r"[A-Za-z]\.(?:\s+)([a-z])", edited))
 
+
 def _has_weak_one_word_line(lines: List[str]) -> bool:
-    weak = {"is", "to", "of", "and", "or", "but", "for", "with", "a", "an", "the"}
     for line in lines:
         words = line.replace("- ", "").split()
-        if len(words) == 1 and words[0].lower() in weak:
+        if len(words) == 1 and words[0].lower() in _WEAK_WORDS:
             return True
     return False
 
@@ -200,23 +227,15 @@ def _token_case_list(text: str) -> List[str]:
 
 
 def _has_bad_titlecase(original: str, edited: str) -> bool:
-    """
-    Reject edits that randomly title-case mid-sentence words.
-    Allowed case changes:
-    - i -> I
-    - original already capitalized
-    - first word of a true sentence after punctuation
-    """
     orig_tokens = _token_case_list(original)
     edit_tokens = _token_case_list(edited)
     if len(orig_tokens) != len(edit_tokens):
         return True
-    # determine allowed sentence starts from edited text char positions
+
     allowed_sentence_starts = set()
     idx = 0
     first = True
     for m in _WORD_RE.finditer(edited):
-        token = m.group(0)
         if first:
             allowed_sentence_starts.add(idx)
             first = False
@@ -225,6 +244,7 @@ def _has_bad_titlecase(original: str, edited: str) -> bool:
             if prefix and prefix[-1] in '.!?':
                 allowed_sentence_starts.add(idx)
         idx += 1
+
     for i, (o, e) in enumerate(zip(orig_tokens, edit_tokens)):
         if o == e:
             continue
@@ -236,7 +256,6 @@ def _has_bad_titlecase(original: str, edited: str) -> bool:
             continue
         if i in allowed_sentence_starts and e[:1].isupper():
             continue
-        # otherwise reject random capitalization change
         return True
     return False
 
@@ -263,4 +282,64 @@ def _bad_initial_capitalization_due_to_continuation(original: str, edited: str, 
         return False
     if o[:1].islower() and e[:1].isupper():
         return True
+    return False
+
+
+def _breaks_protected_phrase(lines: List[str], protected_phrases: List[str]) -> bool:
+    if len(lines) < 2:
+        return False
+    combined = "\n".join(lines)
+    for phrase in protected_phrases:
+        p = re.sub(r"\s+", " ", (phrase or "").strip())
+        if not p:
+            continue
+        if p in combined.replace("\n", " ") and p.replace(" ", "\n") in combined:
+            return True
+    return False
+
+
+def _looks_fragmentary(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if not clean:
+        return True
+    lowered = clean.lower().strip(" ,;:-")
+    words = lowered.split()
+    if lowered in _FRAGMENT_PATTERNS:
+        return True
+    if len(words) <= 2 and words[-1] in _WEAK_WORDS:
+        return True
+    if len(words) <= 3 and not re.search(r"[.!?]$", clean) and words[0] in {"and", "but", "or", "so", "because"}:
+        return True
+    if clean.endswith((" And", " and", " to", " of", " from", " with")):
+        return True
+    return False
+
+
+def _first_word(text: str) -> Optional[str]:
+    m = _WORD_RE.search(text or "")
+    return m.group(0).lower() if m else None
+
+
+def _last_word(text: str) -> Optional[str]:
+    tokens = _word_fingerprint(text or "")
+    return tokens[-1] if tokens else None
+
+
+def _creates_bad_boundary_with_neighbors(joined: str, prev_text: str, next_text: str) -> bool:
+    joined = (joined or "").strip()
+    if not joined:
+        return True
+    first = _first_word(joined)
+    last = _last_word(joined)
+    if first is None or last is None:
+        return True
+
+    if prev_text:
+        prev_last = _last_word(prev_text)
+        if prev_last and prev_last == first and len(_word_fingerprint(joined)) <= 4:
+            return True
+    if next_text:
+        next_first = _first_word(next_text)
+        if next_first and next_first == last and len(_word_fingerprint(joined)) <= 4:
+            return True
     return False
