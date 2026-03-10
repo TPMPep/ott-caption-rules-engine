@@ -146,6 +146,7 @@ def process_caption_job(
             win["tokens"] = [t for t in tokens if t["start_ms"] < win["end_ms"] and t["end_ms"] > win["start_ms"] and not token_is_sound(t["text"])]
         win["runs"] = build_runs_from_tokens(win["tokens"], win["dialogue_text"])
 
+    leading_sound_events = build_leading_sound_events(dialogue_windows)
     dialogue_atoms = explode_windows_to_atoms(dialogue_windows)
     dialogue_atoms = merge_same_speaker_atoms(dialogue_atoms, protected)
     dialogue_atoms = pack_adjacent_two_speaker(dialogue_atoms)
@@ -155,7 +156,8 @@ def process_caption_job(
         formatted_dialogue.extend(format_dialogue_atom(atom, protected))
     formatted_dialogue = merge_fragment_dialogue_cues(formatted_dialogue, protected)
 
-    merged_sound = merge_sound_events(sound_events)
+    token_sound_events = build_sound_events_from_tokens(tokens)
+    merged_sound = merge_sound_events(sound_events + leading_sound_events + token_sound_events)
     sound_cues = place_sound_events(merged_sound, formatted_dialogue)
 
     cues = formatted_dialogue + sound_cues
@@ -339,12 +341,12 @@ def build_windows_from_backbone(backbone: List[Dict[str, Any]]) -> Tuple[List[Di
                 "end_ms": end_ms,
                 "raw_text": raw_text,
                 "dialogue_text": repair_continuing_punctuation(dialogue_text),
-                "leading_sound": dominant_sound_label(leading),
+                "leading_sound": dominant_sound_label(leading, prefer_first_reaction=True),
                 "tokens": [],
                 "runs": [],
             })
         else:
-            label = dominant_sound_label(all_labels)
+            label = dominant_sound_label(all_labels, prefer_first_reaction=True)
             if label:
                 # extend a pure sound cue to the next cue start if the next cue begins with the same sound label.
                 next_start = end_ms
@@ -406,14 +408,36 @@ def normalize_sound_label(text: str) -> str:
     return dominant_sound_label(labels)
 
 
-def dominant_sound_label(labels: Sequence[str]) -> str:
-    counts: Dict[str, int] = {}
-    for label in labels:
-        if label in ALLOWED_SOUND:
-            counts[label] = counts.get(label, 0) + 1
-    if not counts:
+def dominant_sound_label(labels: Sequence[str], prefer_first_reaction: bool = False) -> str:
+    ordered = [label for label in labels if label in ALLOWED_SOUND]
+    if not ordered:
         return ""
+    if prefer_first_reaction:
+        for label in ordered:
+            if label in {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]"}:
+                return label
+    counts: Dict[str, int] = {}
+    for label in ordered:
+        counts[label] = counts.get(label, 0) + 1
     return sorted(counts.items(), key=lambda kv: (kv[1], SOUND_PRIORITY.get(kv[0], 0)), reverse=True)[0][0]
+
+
+def build_leading_sound_events(windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for win in windows:
+        label = win.get("leading_sound")
+        if label not in ALLOWED_SOUND:
+            continue
+        toks = win.get("tokens") or []
+        if toks:
+            end_ms = toks[0]["start_ms"]
+        else:
+            end_ms = min(win["end_ms"], win["start_ms"] + TARGET_SOUND_MS)
+        start_ms = win["start_ms"]
+        if end_ms - start_ms < MIN_SOUND_MS:
+            continue
+        events.append({"label": label, "start_ms": start_ms, "end_ms": end_ms})
+    return events
 
 
 # ------------ dialogue window merging ------------
@@ -513,11 +537,19 @@ def slice_tokens_to_dialogue(candidate_tokens: List[Dict[str, Any]], dialogue_te
 
 
 def build_runs_from_tokens(tokens: List[Dict[str, Any]], fallback_text: str) -> List[Dict[str, Any]]:
+    text = normalize_space(fallback_text)
     if not tokens:
-        text = normalize_space(fallback_text)
         if not text:
             return []
         return [{"speaker": "A", "text": text, "start_ms": 0, "end_ms": 0, "tokens": []}]
+    if len({(t.get("speaker") or "A") for t in tokens}) == 1:
+        return [{
+            "speaker": tokens[0].get("speaker") or "A",
+            "text": repair_continuing_punctuation(text or join_tokens(tokens)),
+            "start_ms": tokens[0]["start_ms"],
+            "end_ms": tokens[-1]["end_ms"],
+            "tokens": tokens,
+        }]
     runs: List[Dict[str, Any]] = []
     current = [tokens[0]]
     for tok in tokens[1:]:
@@ -765,13 +797,17 @@ def chunk_score(chunk: List[Dict[str, Any]], text: str, lines: List[str], next_w
     elif cps > TARGET_CPS:
         score += (cps - TARGET_CPS) * 8
     if total_len < 8:
-        score += 60
+        score += 80
     elif total_len < 14:
-        score += 28
+        score += 42
     elif total_len < 20:
-        score += 10
+        score += 18
+    elif total_len < 26 and not re.search(r"[.!?,;:]$", text):
+        score += 14
     if len(chunk) < MIN_FRAGMENT_WORDS:
-        score += 22
+        score += 28
+    elif len(chunk) < 5 and not re.search(r"[.!?,;:]$", text):
+        score += 12
     if boundary_splits_protected(text, " ".join(next_word.split()), protected):
         score += 20
     return score
@@ -783,7 +819,7 @@ def maybe_best_layout(text: str, protected: List[str]) -> Optional[List[str]]:
         return None
     if len(text) <= MAX_CHARS:
         two = best_two_line_split(text, protected)
-        if two and len(text) >= 24 and split_layout_score(two, protected) < 12:
+        if two and len(text) >= 24 and split_layout_score(two, protected) < 10:
             return two
         return [text]
     if len(text) > MAX_CUE_CHARS:
@@ -926,6 +962,27 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
         working = out
     return working
 
+def build_sound_events_from_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for tok in tokens:
+        if not token_is_sound(tok.get("text", "")):
+            current = None
+            continue
+        label = normalize_sound_label(tok.get("text", ""))
+        if label not in ALLOWED_SOUND:
+            current = None
+            continue
+        start_ms = int(tok["start_ms"])
+        end_ms = int(tok["end_ms"])
+        if current and current["label"] == label and start_ms - current["end_ms"] <= SOUND_CLUSTER_GAP_MS:
+            current["end_ms"] = end_ms
+        else:
+            current = {"label": label, "start_ms": start_ms, "end_ms": end_ms}
+            events.append(current)
+    return events
+
+
 def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     events = [e for e in events if e.get("label") in ALLOWED_SOUND]
     if not events:
@@ -944,8 +1001,15 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         first = labels[0]
         start = cluster_events[0]["start_ms"]
         end = max(e["end_ms"] for e in cluster_events)
-        # Prefer the first salient reaction label over later repeated [MUSIC] spam.
         if first in {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]"}:
+            music_events = [e for e in cluster_events if e["label"] == "[MUSIC]" and e["start_ms"] > cluster_events[0]["end_ms"]]
+            if music_events:
+                reaction_end = max(cluster_events[0]["end_ms"], min(end, start + 1200))
+                merged.append({"label": first, "start_ms": start, "end_ms": reaction_end})
+                music_start = music_events[0]["start_ms"]
+                if end - music_start >= 250:
+                    merged.append({"label": "[MUSIC]", "start_ms": music_start, "end_ms": end})
+                return
             merged.append({"label": first, "start_ms": start, "end_ms": end})
             return
         counts: Dict[str, int] = {}
@@ -1012,6 +1076,61 @@ def place_sound_event(ev: Dict[str, Any], dialogue: List[Dict[str, Any]]) -> Opt
     return {"idx": 0, "start_ms": start, "end_ms": min(desired_end, start + MAX_SOUND_MS), "lines": [ev["label"]], "type": "sound", "meta": {"sound_label": ev["label"]}}
 
 
+def repair_global_fragments(cues: List[Dict[str, Any]], protected: List[str]) -> List[Dict[str, Any]]:
+    if not cues:
+        return []
+    cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
+
+    def cue_text(c: Dict[str, Any]) -> str:
+        return repair_continuing_punctuation(normalize_space(c.get("meta", {}).get("dialogue_text", " ".join(c.get("lines", [])))))
+
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(cues):
+        cur = cues[i]
+        if cur["type"] != "dialogue":
+            out.append(cur)
+            i += 1
+            continue
+        cur_runs = cur.get("meta", {}).get("runs", [])
+        cur_text = cue_text(cur)
+        frag = is_ultra_fragment(cur_text) or is_fragment(cur_text)
+        merged = False
+        if frag and len(cur_runs) == 1:
+            # try next first
+            if i + 1 < len(cues):
+                nxt = cues[i + 1]
+                nxt_runs = nxt.get("meta", {}).get("runs", [])
+                if nxt["type"] == "dialogue" and len(nxt_runs) == 1 and nxt_runs[0].get("speaker") == cur_runs[0].get("speaker") and nxt["start_ms"] - cur["end_ms"] <= 1000:
+                    combined = repair_continuing_punctuation(normalize_space(f"{cur_text} {cue_text(nxt)}"))
+                    if len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
+                        new = dict(cur)
+                        new["end_ms"] = nxt["end_ms"]
+                        new["meta"] = dict(cur.get("meta", {}))
+                        new["meta"]["dialogue_text"] = combined
+                        new["meta"]["runs"] = [{**cur_runs[0], "text": combined, "end_ms": nxt["end_ms"], "tokens": cur_runs[0].get("tokens", []) + nxt_runs[0].get("tokens", [])}]
+                        new["lines"] = best_layout(combined, protected)
+                        out.append(new)
+                        i += 2
+                        merged = True
+            if not merged and out:
+                prev = out[-1]
+                prev_runs = prev.get("meta", {}).get("runs", []) if isinstance(prev.get("meta"), dict) else []
+                if prev.get("type") == "dialogue" and len(prev_runs) == 1 and prev_runs[0].get("speaker") == cur_runs[0].get("speaker") and cur["start_ms"] - prev["end_ms"] <= 1000:
+                    combined = repair_continuing_punctuation(normalize_space(f"{cue_text(prev)} {cur_text}"))
+                    if len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
+                        prev["end_ms"] = cur["end_ms"]
+                        prev["meta"]["dialogue_text"] = combined
+                        prev["meta"]["runs"] = [{**prev_runs[0], "text": combined, "end_ms": cur["end_ms"], "tokens": prev_runs[0].get("tokens", []) + cur_runs[0].get("tokens", [])}]
+                        prev["lines"] = best_layout(combined, protected)
+                        i += 1
+                        merged = True
+        if not merged:
+            out.append(cur)
+            i += 1
+    return out
+
+
 # ------------ final cleanup ------------
 
 def resolve_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1035,6 +1154,8 @@ def resolve_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 cue["start_ms"] = prev["end_ms"]
         if cue["end_ms"] <= cue["start_ms"]:
             cue["end_ms"] = cue["start_ms"] + 1
+        if cue["type"] == "sound" and cue["end_ms"] - cue["start_ms"] < 500:
+            continue
         out.append(cue)
     return [c for c in out if c["end_ms"] > c["start_ms"]]
 
@@ -1062,6 +1183,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
             text = repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", [])))))
             cue["meta"]["dialogue_text"] = text
             cue["lines"] = best_layout(text, protected)
+        cue["lines"] = [repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS] for x in cue.get("lines", []) if repair_continuing_punctuation(normalize_space(x))]
         if cue["lines"]:
             out.append(cue)
 
@@ -1069,7 +1191,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     dialogue = [c for c in out if c["type"] == "dialogue"]
     sounds = [c for c in out if c["type"] == "sound"]
     dialogue = merge_fragment_dialogue_cues(dialogue, protected)
-    final = dialogue + sounds
+    final = repair_global_fragments(dialogue + sounds, protected)
     final.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     return final
 
