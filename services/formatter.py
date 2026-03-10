@@ -112,6 +112,10 @@ WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that",
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
 ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]"}
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4}
+MIN_FRAGMENT_WORDS = 3
+MIN_FRAGMENT_CHARS = 10
+LONG_GAP_BRIDGE_MS = 2200
+BRIDGE_PAD_MS = 120
 TAG_RE = re.compile(r"\[[^\]]+\]")
 WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 TITLEISH_RE = re.compile(r"^[A-Z][A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?$|^[A-Z0-9]{2,}$")
@@ -235,6 +239,15 @@ def sanitize_last_word(text: str) -> str:
     return words[-1] if words else ""
 
 
+def text_word_count(text: str) -> int:
+    return len(flatten_words(text))
+
+
+def is_ultra_fragment(text: str) -> bool:
+    text = normalize_space(text)
+    return text_word_count(text) <= 1 or len(text) <= 6
+
+
 def repair_continuing_punctuation(text: str) -> str:
     text = normalize_space(text)
     if not text:
@@ -243,6 +256,8 @@ def repair_continuing_punctuation(text: str) -> str:
     text = re.sub(r"\b([Ii]'?m your host)\. ([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,2})\b", r"\1, \2", text)
     text = re.sub(r"\. (?=(?:right|okay|ok|speaking|please|because|which|who|where|when|while|though|that|if|but|and|or|so|then|now)\b)", ", ", text, flags=re.I)
     text = re.sub(r"\b(Yes|No)\. (?=(?:yes|no)\b)", r"\1, ", text)
+    text = re.sub(r"\b([A-Z][A-Za-z]+)\. (?=(?:welcome|speaking|wearing|thank|please|because|and|but|or|so|then|now)\b)", r"\1, ", text)
+    text = re.sub(r"\b([A-Z][A-Za-z]+), (?=(?:[a-z]))", r"\1, ", text)
     # If a period is followed by a lowercase word, it is usually a broken continuation.
     text = re.sub(r"(?<![A-Z])\. (?=[a-z])", ", ", text)
     text = re.sub(r",, +", ", ", text)
@@ -553,7 +568,7 @@ def can_two_speaker(runs: List[Dict[str, Any]]) -> bool:
         return False
     if runs[1]["end_ms"] - runs[0]["start_ms"] > MAX_TWO_SPEAKER_WINDOW_MS:
         return False
-    return all(len(normalize_space(r["text"])) <= MAX_CHARS - 2 for r in runs)
+    return all(len(normalize_space(r["text"])) <= MAX_CHARS - 2 and text_word_count(normalize_space(r["text"])) <= 8 for r in runs)
 
 
 def make_atom(runs: List[Dict[str, Any]], two_speaker: bool, win: Dict[str, Any]) -> Dict[str, Any]:
@@ -608,7 +623,7 @@ def pack_adjacent_two_speaker(atoms: List[Dict[str, Any]]) -> List[Dict[str, Any
             if not atom["meta"].get("two_speaker") and not nxt["meta"].get("two_speaker") and len(ar) == len(nr) == 1 and ar[0]["speaker"] != nr[0]["speaker"]:
                 left = normalize_space(ar[0]["text"])
                 right = normalize_space(nr[0]["text"])
-                if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2 and nxt["start_ms"] - atom["end_ms"] <= TWO_SPEAKER_GAP_MS and nxt["end_ms"] - atom["start_ms"] <= MAX_TWO_SPEAKER_WINDOW_MS:
+                if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2 and text_word_count(left) <= 8 and text_word_count(right) <= 8 and nxt["start_ms"] - atom["end_ms"] <= TWO_SPEAKER_GAP_MS and nxt["end_ms"] - atom["start_ms"] <= MAX_TWO_SPEAKER_WINDOW_MS:
                     packed.append({
                         "idx": 0,
                         "start_ms": atom["start_ms"],
@@ -659,14 +674,15 @@ def segment_single_speaker_atom(atom: Dict[str, Any], run: Dict[str, Any], prote
     i = 0
     while i < len(tokens):
         end = choose_chunk_end(tokens, i, protected)
+        while end < len(tokens):
+            chunk = tokens[i:end]
+            text = repair_continuing_punctuation(join_tokens(chunk))
+            if (text_word_count(text) >= MIN_FRAGMENT_WORDS and len(text) >= MIN_FRAGMENT_CHARS) or re.search(r"[.!?]$", text):
+                break
+            end += 1
         chunk = tokens[i:end]
         text = repair_continuing_punctuation(join_tokens(chunk))
         lines = best_layout(text, protected)
-        if end < len(tokens) and len(flatten_words(text)) < 2:
-            end += 1
-            chunk = tokens[i:end]
-            text = repair_continuing_punctuation(join_tokens(chunk))
-            lines = best_layout(text, protected)
         start_ms = atom["start_ms"] if i == 0 else chunk[0]["start_ms"]
         end_ms = atom["end_ms"] if end >= len(tokens) else chunk[-1]["end_ms"]
         out.append({
@@ -678,13 +694,30 @@ def segment_single_speaker_atom(atom: Dict[str, Any], run: Dict[str, Any], prote
             "meta": {"dialogue_text": text, "runs": [{"speaker": run["speaker"], "text": text, "tokens": chunk, "start_ms": start_ms, "end_ms": end_ms}], "two_speaker": False},
         })
         i = end
-    return out
+
+    # Merge any leftover micro-fragments created by timing gaps.
+    merged: List[Dict[str, Any]] = []
+    for cue in out:
+        text = cue["meta"]["dialogue_text"]
+        if merged and cue["start_ms"] - merged[-1]["end_ms"] <= 900:
+            prev = merged[-1]
+            prev_text = prev["meta"]["dialogue_text"]
+            combined = repair_continuing_punctuation(normalize_space(f"{prev_text} {text}"))
+            if (is_ultra_fragment(text) or is_fragment(text) or is_fragment(prev_text)) and len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
+                prev["end_ms"] = cue["end_ms"]
+                prev["meta"]["dialogue_text"] = combined
+                prev["meta"]["runs"][0]["text"] = combined
+                prev["meta"]["runs"][0]["tokens"] = prev["meta"]["runs"][0].get("tokens", []) + cue["meta"]["runs"][0].get("tokens", [])
+                prev["lines"] = best_layout(combined, protected)
+                continue
+        merged.append(cue)
+    return merged
 
 
 def choose_chunk_end(tokens: List[Dict[str, Any]], start_idx: int, protected: List[str]) -> int:
     best_end = start_idx + 1
     best_score: Optional[float] = None
-    max_end = min(len(tokens), start_idx + 24)
+    max_end = min(len(tokens), start_idx + 28)
     for end in range(start_idx + 1, max_end + 1):
         chunk = tokens[start_idx:end]
         text = repair_continuing_punctuation(join_tokens(chunk))
@@ -732,11 +765,13 @@ def chunk_score(chunk: List[Dict[str, Any]], text: str, lines: List[str], next_w
     elif cps > TARGET_CPS:
         score += (cps - TARGET_CPS) * 8
     if total_len < 8:
-        score += 34
+        score += 60
     elif total_len < 14:
-        score += 16
+        score += 28
     elif total_len < 20:
-        score += 4
+        score += 10
+    if len(chunk) < MIN_FRAGMENT_WORDS:
+        score += 22
     if boundary_splits_protected(text, " ".join(next_word.split()), protected):
         score += 20
     return score
@@ -748,7 +783,7 @@ def maybe_best_layout(text: str, protected: List[str]) -> Optional[List[str]]:
         return None
     if len(text) <= MAX_CHARS:
         two = best_two_line_split(text, protected)
-        if two and len(text) >= 26 and split_layout_score(two, protected) < 6:
+        if two and len(text) >= 24 and split_layout_score(two, protected) < 12:
             return two
         return [text]
     if len(text) > MAX_CUE_CHARS:
@@ -896,17 +931,37 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not events:
         return []
     events.sort(key=lambda e: (e["start_ms"], e["end_ms"]))
-    merged = [events[0].copy()]
+    merged: List[Dict[str, Any]] = []
+    cluster: List[Dict[str, Any]] = [events[0].copy()]
+
+    def flush_cluster(cluster_events: List[Dict[str, Any]]) -> None:
+        if not cluster_events:
+            return
+        if len(cluster_events) == 1:
+            merged.append(cluster_events[0].copy())
+            return
+        labels = [e["label"] for e in cluster_events]
+        first = labels[0]
+        start = cluster_events[0]["start_ms"]
+        end = max(e["end_ms"] for e in cluster_events)
+        # Prefer the first salient reaction label over later repeated [MUSIC] spam.
+        if first in {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]"}:
+            merged.append({"label": first, "start_ms": start, "end_ms": end})
+            return
+        counts: Dict[str, int] = {}
+        for lab in labels:
+            counts[lab] = counts.get(lab, 0) + 1
+        label = sorted(counts.items(), key=lambda kv: (kv[1], SOUND_PRIORITY.get(kv[0], 0)), reverse=True)[0][0]
+        merged.append({"label": label, "start_ms": start, "end_ms": end})
+
     for ev in events[1:]:
-        prev = merged[-1]
-        if ev["label"] == prev["label"] and ev["start_ms"] - prev["end_ms"] <= SOUND_CLUSTER_GAP_MS:
-            prev["end_ms"] = max(prev["end_ms"], ev["end_ms"])
-            continue
-        if ev["start_ms"] - prev["end_ms"] <= 250:
-            prev["label"] = dominant_sound_label([prev["label"], ev["label"], ev["label"]]) or prev["label"]
-            prev["end_ms"] = max(prev["end_ms"], ev["end_ms"])
-            continue
-        merged.append(ev.copy())
+        prev = cluster[-1]
+        if ev["start_ms"] - prev["end_ms"] <= SOUND_CLUSTER_GAP_MS:
+            cluster.append(ev.copy())
+        else:
+            flush_cluster(cluster)
+            cluster = [ev.copy()]
+    flush_cluster(cluster)
     return merged
 
 
@@ -937,15 +992,21 @@ def place_sound_event(ev: Dict[str, Any], dialogue: List[Dict[str, Any]]) -> Opt
             break
     gap_start = prev["end_ms"] if prev else ev["start_ms"]
     gap_end = nxt["start_ms"] if nxt else max(ev["end_ms"], ev["start_ms"] + TARGET_SOUND_MS)
-    start = max(gap_start, ev["start_ms"])
-    lead_out = 120 if nxt else 0
+    if gap_end - gap_start < MIN_SOUND_MS:
+        return None
+    # In long dead-air gaps, bridge earlier instead of pinning the cue right on top of dialogue.
+    if ev["start_ms"] - gap_start >= 1000 and gap_end - gap_start >= LONG_GAP_BRIDGE_MS:
+        start = gap_start + BRIDGE_PAD_MS
+    else:
+        start = max(gap_start, ev["start_ms"])
+    lead_out = BRIDGE_PAD_MS if nxt else 0
     end_cap = gap_end - lead_out
     if end_cap <= start:
         return None
-    desired_end = min(end_cap, max(ev["end_ms"], start + TARGET_SOUND_MS))
-    min_required = MIN_SOUND_MS if ev["label"] != "[MUSIC]" else 700
-    if desired_end - start < min_required:
-        desired_end = end_cap
+    desired_len = TARGET_SOUND_MS if ev["label"] == "[MUSIC]" else max(MIN_SOUND_MS, 1200)
+    desired_end = min(end_cap, start + desired_len, max(ev["end_ms"], start + MIN_SOUND_MS))
+    if desired_end - start < MIN_SOUND_MS:
+        desired_end = min(end_cap, start + MIN_SOUND_MS)
     if desired_end - start < 500:
         return None
     return {"idx": 0, "start_ms": start, "end_ms": min(desired_end, start + MAX_SOUND_MS), "lines": [ev["label"]], "type": "sound", "meta": {"sound_label": ev["label"]}}
