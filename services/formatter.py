@@ -365,15 +365,18 @@ def normalize_sound_label(text: str) -> str:
     if "NOISE" in deduped and any(x in deduped for x in ["APPLAUSE", "LAUGHTER", "CHEERING", "MUSIC"]):
         deduped = [p for p in deduped if p != "NOISE"]
 
-    if "MUSIC" in deduped and any(x in deduped for x in ["APPLAUSE", "LAUGHTER", "CHEERING"]):
-        deduped = [p for p in deduped if p != "MUSIC"]
-
     cleaned = " AND ".join(deduped).strip()
     if not cleaned:
         return ""
 
     if cleaned == "MUSIC":
         return "[♪]"
+    if cleaned in ("APPLAUSE AND MUSIC", "MUSIC AND APPLAUSE"):
+        return "[APPLAUSE AND ♪]"
+    if cleaned in ("LAUGHTER AND MUSIC", "MUSIC AND LAUGHTER"):
+        return "[LAUGHTER AND ♪]"
+    if cleaned in ("CHEERING AND MUSIC", "MUSIC AND CHEERING"):
+        return "[CHEERING AND ♪]"
 
     return f"[{cleaned}]"
 
@@ -485,29 +488,26 @@ def fit_sound_into_dialogue_gap(
 
     # General policy:
     # - sound cues should usually be readable for ~3-5 seconds
-    # - never shorter than 1 second
+    # - reaction/music cues may be a little shorter when gap is tight
     # - do not consume the entire lead-in before dialogue
-    target_ms = 3500
+    label = ev.get("label", "")
+    target_ms = 3200
     max_ms = 5000
-    lead_out_ms = 250 if next_dialogue is not None else 0
+    lead_out_ms = 180 if next_dialogue is not None else 0
+    min_required = 700 if any(x in label for x in ("APPLAUSE", "LAUGHTER", "CHEERING", "♪")) else MIN_SOUND_MS
 
     start = max(desired_start, gap_start)
-    latest_end = max(start + MIN_SOUND_MS, gap_end - lead_out_ms)
-    latest_end = min(latest_end, gap_end)
+    available_end = gap_end - lead_out_ms if next_dialogue is not None else gap_end
+    if available_end - start < min_required:
+        return None
 
-    preferred_end = min(start + target_ms, gap_end - lead_out_ms if next_dialogue is not None else gap_end)
-    preferred_end = max(preferred_end, start + MIN_SOUND_MS)
+    preferred_end = min(start + target_ms, available_end)
+    preferred_end = max(preferred_end, start + min_required)
 
-    if next_dialogue is not None:
-        end = min(preferred_end, gap_end - lead_out_ms)
-    else:
-        end = min(max(desired_end, preferred_end), min(gap_end, start + max_ms))
+    end = min(preferred_end, min(available_end, start + max_ms))
 
-    if end - start < MIN_SOUND_MS:
-        if gap_len >= MIN_SOUND_MS:
-            end = min(gap_end, start + MIN_SOUND_MS)
-        else:
-            return None
+    if end - start < min_required:
+        return None
 
     return {
         "idx": 0,
@@ -639,7 +639,7 @@ def format_cues(cues: List[Dict[str, Any]], protected_phrases: List[str], max_ro
             formatted.extend(child_results)
             continue
 
-        cue["lines"] = broken[:MAX_LINES]
+        cue["lines"] = tidy_lines_for_readability(broken[:MAX_LINES], protected_phrases)
 
         if violates_line_limits(cue["lines"], MAX_LINES, MAX_CHARS):
             if max_rounds > 0:
@@ -658,7 +658,7 @@ def format_cues(cues: List[Dict[str, Any]], protected_phrases: List[str], max_ro
                 child_results = format_cues(children, protected_phrases, max_rounds=max_rounds - 1)
                 formatted.extend(child_results)
                 continue
-            cue["lines"] = improved[:MAX_LINES]
+            cue["lines"] = tidy_lines_for_readability(improved[:MAX_LINES], protected_phrases)
 
         formatted.append(cue)
 
@@ -853,20 +853,26 @@ def split_score(left: str, right: str, protected_phrases: List[str], prefer_bala
     if prefer_balance:
         score += abs(len(left) - len(right))
 
-    if not re.search(r"[,\.\?!:;]$", left):
-        score += 8
+    if re.search(r"[,;:]$", left):
+        score -= 18
+    elif re.search(r"[\.\?!]$", left):
+        score -= 24
+    else:
+        score += 14
 
     left_last = sanitize_last_word(left)
     if left_last in FUNCTION_WORDS:
-        score += 15
+        score += 24
 
     combined = left + "\n" + right
     for phrase in protected_phrases:
         if phrase and phrase in combined.replace("\n", " ") and phrase.replace(" ", "\n") in combined:
-            score += 100
+            score += 220
 
     if len(right.split()) <= 2:
-        score += 12
+        score += 18
+    if len(right.split()) == 1:
+        score += 40
 
     return score
 
@@ -941,7 +947,7 @@ def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str])
                 continue
 
         cue["meta"]["dialogue_text"] = text
-        cue["lines"] = lines[:MAX_LINES]
+        cue["lines"] = tidy_lines_for_readability(lines[:MAX_LINES], protected_phrases)
         repaired.append(cue)
 
     merged: List[Dict[str, Any]] = []
@@ -997,7 +1003,7 @@ def post_format_repair(cues: List[Dict[str, Any]], protected_phrases: List[str])
                     lines, needs_split = smart_split(curr_text, protected_phrases)
                     if not needs_split:
                         curr["meta"]["dialogue_text"] = curr_text
-                        curr["lines"] = lines[:MAX_LINES]
+                        curr["lines"] = tidy_lines_for_readability(lines[:MAX_LINES], protected_phrases)
     return merged
 
 def resolve_overlaps_dialogue_first(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1035,6 +1041,19 @@ def clean_dialogue_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = text.replace(" ,", ",").replace(" .", ".").replace(" !", "!").replace(" ?", "?")
     return text
+
+
+def tidy_lines_for_readability(lines: List[str], protected_phrases: List[str]) -> List[str]:
+    if not lines:
+        return lines
+    if len(lines) == 2:
+        left, right = lines[0].strip(), lines[1].strip()
+        if len(right.split()) == 1 and right.lower() in {"is", "to", "of", "and", "or", "but", "for", "with"}:
+            joined = clean_dialogue_text(f"{left} {right}")
+            better, needs_split = smart_split(joined, protected_phrases, prefer_balance=False)
+            if not needs_split:
+                return better[:2]
+    return lines
 
 
 def sanitize_last_word(text: str) -> str:
@@ -1090,7 +1109,7 @@ def final_hard_validate(cues: List[Dict[str, Any]], protected_phrases: List[str]
 
         broken, needs_split = smart_split(text, protected_phrases)
         if not needs_split:
-            cue["lines"] = broken[:MAX_LINES]
+            cue["lines"] = tidy_lines_for_readability(broken[:MAX_LINES], protected_phrases)
             validated.append(cue)
             continue
 
