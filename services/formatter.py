@@ -20,7 +20,12 @@ SOUND_MERGE_GAP_MS = 700
 ENABLE_EDITORIAL_AI = False
 ALLOWED_SOUND_LABELS = {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]", "[♪]"}
 
-PROTECTED_DEFAULTS: List[str] = []
+PROTECTED_DEFAULTS: List[str] = [
+    "Watch What Happens Live",
+    "Below Deck Med",
+    "Below Deck Mediterranean",
+    "Andy Cohen",
+]
 
 FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but",
@@ -67,11 +72,15 @@ def process_caption_job(
     dialogue_cues = build_dialogue_cues_from_srt(backbone, tokens)
     print(f"[FORMATTER] Dialogue cues: {len(dialogue_cues)}")
 
+    print("[FORMATTER] Merging phrase-fragment dialogue cues")
+    dialogue_cues = merge_dialogue_cue_fragments(dialogue_cues, protected_phrases)
+    print(f"[FORMATTER] Dialogue cues after merge: {len(dialogue_cues)}")
+
     print("[FORMATTER] Building sound events from tokens")
     raw_sound_events = build_sound_events(tokens)
     print(f"[FORMATTER] Raw sound events: {len(raw_sound_events)}")
 
-    print("[FORMATTER] Inserting sound cues into real gaps only")
+    print("[FORMATTER] Inserting sound cues with bridge placement")
     sound_cues = place_sound_cues_in_gaps(raw_sound_events, dialogue_cues)
     print(f"[FORMATTER] Sound cues placed: {len(sound_cues)}")
 
@@ -183,6 +192,66 @@ def build_runtime_protected_phrases(
     combined = list(dict.fromkeys(PROTECTED_DEFAULTS + explicit + detected))
     return combined
 
+def phrase_crosses_boundary(left: str, right: str, protected_phrases: List[str]) -> bool:
+    combined = clean_dialogue_text(f"{left} {right}").lower()
+    l = left.lower()
+    r = right.lower()
+    for phrase in protected_phrases:
+        p = phrase.lower()
+        if p in combined and p not in l and p not in r:
+            return True
+    return False
+
+
+def should_merge_dialogue_cues(curr: Dict[str, Any], nxt: Dict[str, Any], protected_phrases: List[str]) -> bool:
+    if curr.get("type") != "dialogue" or nxt.get("type") != "dialogue":
+        return False
+    if nxt["start_ms"] - curr["end_ms"] > 800:
+        return False
+    left = clean_dialogue_text(curr.get("meta", {}).get("dialogue_text", ""))
+    right = clean_dialogue_text(nxt.get("meta", {}).get("dialogue_text", ""))
+    if not left or not right:
+        return False
+    combined = clean_dialogue_text(f"{left} {right}")
+    if len(combined) > MAX_CHARS * 3:
+        return False
+    left_last = sanitize_last_word(left)
+    right_first = re.sub(r"^[^\w']+", "", right.split()[0]).lower() if right.split() else ""
+    return (
+        len(left.split()) <= 3
+        or left.lower() in {"it's", "and", "but", "so", "because", "from", "with"}
+        or left_last in FUNCTION_WORDS | {"it", "it's", "who", "what", "this", "that"}
+        or right_first in {"and", "or", "but", "with", "from", "to"}
+        or phrase_crosses_boundary(left, right, protected_phrases)
+    )
+
+
+def merge_dialogue_cue_fragments(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
+    if not cues:
+        return cues
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(cues):
+        curr = cues[i]
+        while i < len(cues) - 1 and should_merge_dialogue_cues(curr, cues[i + 1], protected_phrases):
+            nxt = cues[i + 1]
+            merged_text = clean_dialogue_text(f"{curr['meta'].get('dialogue_text','')} {nxt['meta'].get('dialogue_text','')}")
+            curr = {
+                **curr,
+                "end_ms": nxt["end_ms"],
+                "meta": {
+                    **curr.get("meta", {}),
+                    "dialogue_text": merged_text,
+                    "raw_text": clean_dialogue_text(f"{curr.get('meta',{}).get('raw_text','')} {nxt.get('meta',{}).get('raw_text','')}"),
+                    "runs": curr.get("meta", {}).get("runs", []) + nxt.get("meta", {}).get("runs", []),
+                    "two_speaker": False,
+                },
+            }
+            i += 1
+        out.append(curr)
+        i += 1
+    return out
+
 
 def build_dialogue_cues_from_srt(
     backbone: List[Dict[str, Any]],
@@ -246,37 +315,25 @@ def build_speaker_runs_for_cue(cue: Dict[str, Any], tokens: List[Dict[str, Any]]
         if token["start_ms"] > cue["end_ms"]:
             break
 
-        text = (token["text"] or "").strip()
-        if not text or is_sound_token(text):
+        tok_text = (token["text"] or "").strip()
+        if not tok_text or is_sound_token(tok_text):
             continue
 
         speaker = token.get("speaker") or "A"
-
         if current_run is None or current_run["speaker"] != speaker:
             current_run = {"speaker": speaker, "text_parts": []}
             runs.append(current_run)
+        current_run["text_parts"].append(tok_text)
 
-        current_run["text_parts"].append(text)
-
-    collapsed: List[Dict[str, Any]] = []
+    cleaned: List[Dict[str, Any]] = []
     for run in runs:
         run_text = clean_dialogue_text(" ".join(run["text_parts"]))
-        if not run_text:
-            continue
-        if collapsed and collapsed[-1]["speaker"] == run["speaker"]:
-            collapsed[-1]["text"] = clean_dialogue_text(collapsed[-1]["text"] + " " + run_text)
-            continue
-        collapsed.append({"speaker": run["speaker"], "text": run_text})
-
-    return collapsed
+        if run_text:
+            cleaned.append({"speaker": run["speaker"], "text": run_text})
+    return cleaned
 
 def align_runs_to_text(runs: List[Dict[str, Any]], full_text: str) -> List[Dict[str, Any]]:
-    """
-    Keep speaker runs only when they can be aligned safely.
-    The earlier proportional char slicing created cross-speaker corruption.
-    If confidence is low, fall back to a single-speaker cue instead of inventing
-    malformed two-speaker structure.
-    """
+    """Preserve multi-speaker structure whenever possible; never flatten into one blob."""
     full_text = clean_dialogue_text(full_text)
     if not full_text:
         return runs
@@ -292,41 +349,40 @@ def align_runs_to_text(runs: List[Dict[str, Any]], full_text: str) -> List[Dict[
         return [{"speaker": runs[0]["speaker"] if runs else "A", "text": full_text}]
 
     full_words = full_text.split()
-    if not full_words:
-        return [{"speaker": runs[0]["speaker"], "text": full_text}]
-
-    assigned = []
+    lowered_full = [w.lower() for w in full_words]
     cursor = 0
+    assigned: List[Dict[str, Any]] = []
+
     for i, run in enumerate(runs):
-        target = run["text"].split()
-        if not target:
+        target_words = run["text"].split()
+        if not target_words:
             continue
+        lowered_target = [w.lower() for w in target_words]
+
         if i == len(runs) - 1:
-            piece_words = full_words[cursor:]
+            tail = full_words[cursor:] or target_words
+            assigned.append({"speaker": run["speaker"], "text": clean_dialogue_text(" ".join(tail))})
+            break
+
+        best_end = None
+        best_score = 10**9
+        for end in range(cursor + 1, min(len(full_words), cursor + len(target_words) + 5) + 1):
+            cand = lowered_full[cursor:end]
+            overlap = sum(1 for a, b in zip(cand, lowered_target) if a == b)
+            if overlap <= 0:
+                continue
+            score = abs(len(cand) - len(lowered_target)) * 5 - overlap * 8
+            if score < best_score:
+                best_score = score
+                best_end = end
+        if best_end is None:
+            assigned.append({"speaker": run["speaker"], "text": run["text"]})
         else:
-            n = len(target)
-            piece_words = None
-            best_end = None
-            for end in range(cursor + max(1, n - 2), min(len(full_words), cursor + n + 4) + 1):
-                candidate = full_words[cursor:end]
-                target_slice = target[:len(candidate)]
-                if [w.lower() for w in candidate] == [w.lower() for w in target_slice]:
-                    piece_words = candidate
-                    best_end = end
-            if piece_words is None:
-                return [{"speaker": runs[0]["speaker"], "text": full_text}]
+            assigned.append({"speaker": run["speaker"], "text": clean_dialogue_text(" ".join(full_words[cursor:best_end]))})
             cursor = best_end
-        assigned.append({"speaker": run["speaker"], "text": clean_dialogue_text(" ".join(piece_words))})
 
     assigned = [r for r in assigned if r["text"]]
-    if len(assigned) < 2:
-        return [{"speaker": assigned[0]["speaker"] if assigned else "A", "text": full_text}]
-
-    reconstructed = clean_dialogue_text(" ".join(r["text"] for r in assigned))
-    if [w.lower() for w in reconstructed.split()] != [w.lower() for w in full_words]:
-        return [{"speaker": assigned[0]["speaker"], "text": full_text}]
-
-    return assigned
+    return assigned if len(assigned) >= 2 else runs
 
 def find_nearest_space(text: str, target: int) -> int:
     target = max(0, min(len(text), target))
@@ -380,34 +436,30 @@ def build_sound_events(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def normalize_sound_label(text: str) -> str:
     label = text.strip().upper()
-
     if not label.startswith("[") or not label.endswith("]"):
         return ""
-
     inner = label[1:-1].strip()
     if not inner:
         return ""
 
     parts = [p.strip() for p in re.split(r"\s+AND\s+|,\s*", inner) if p.strip()]
-    junk = {"NOISE", "SOUND", "SOUND EFFECT", "SPEAKER", "VOICE", "TALKING", "INAUDIBLE", "PAUSE"}
-    parts = [p for p in parts if p and p not in junk]
-    if not parts:
+    normalized: List[str] = []
+    for p in parts:
+        if p in {"NOISE", "SOUND", "SOUND EFFECT", "SPEAKER", "VOICE", "TALKING", "INAUDIBLE", "PAUSE"}:
+            continue
+        if p == "MUSIC":
+            p = "♪"
+        if p not in normalized:
+            normalized.append(p)
+
+    if not normalized:
         return ""
 
-    priority = ["APPLAUSE", "LAUGHTER", "CHEERING", "MUSIC"]
-    picked = None
-    for candidate in priority:
-        if candidate in parts:
-            picked = candidate
-            break
-
-    if picked is None:
-        return ""
-    if picked == "MUSIC":
-        return "[♪]"
-    normalized = f"[{picked}]"
-    return normalized if normalized in ALLOWED_SOUND_LABELS else ""
-
+    for pref in ["APPLAUSE", "LAUGHTER", "CHEERING", "♪"]:
+        if pref in normalized:
+            lbl = f"[{pref}]"
+            return lbl if lbl in ALLOWED_SOUND_LABELS else ""
+    return ""
 
 def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not events:
@@ -428,9 +480,8 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         if ev["start_ms"] - prev["end_ms"] <= 150 and abs(ev["start_ms"] - prev["start_ms"]) <= 500:
-            # Do not synthesize combo labels; keep the stronger, approved label only.
-            if sound_priority(ev["label"]) > sound_priority(prev["label"]):
-                prev["label"] = ev["label"]
+            combined = combine_sound_labels(prev["label"], ev["label"])
+            prev["label"] = combined
             prev["end_ms"] = max(prev["end_ms"], ev["end_ms"])
             continue
 
@@ -447,8 +498,6 @@ def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     for ev in events:
         label = ev["label"]
-        if label not in ALLOWED_SOUND_LABELS:
-            continue
         duration = ev["end_ms"] - ev["start_ms"]
 
         if label == "[♪]" and duration < MUSIC_MIN_DURATION_MS:
@@ -492,16 +541,11 @@ def fit_sound_into_dialogue_gap(
     ev: Dict[str, Any],
     dialogue_sorted: List[Dict[str, Any]],
 ) -> Dict[str, Any] | None:
-    label = ev.get("label", "")
-    if label not in ALLOWED_SOUND_LABELS:
-        return None
-
     desired_start = ev["start_ms"]
-    desired_end = max(ev["end_ms"], desired_start + MIN_SOUND_MS)
+    desired_end = max(ev["end_ms"], desired_start + 1)
 
     prev_dialogue = None
     next_dialogue = None
-
     for cue in dialogue_sorted:
         if cue["end_ms"] <= desired_start:
             prev_dialogue = cue
@@ -513,23 +557,24 @@ def fit_sound_into_dialogue_gap(
             return None
 
     gap_start = prev_dialogue["end_ms"] if prev_dialogue else desired_start
-    gap_end = next_dialogue["start_ms"] if next_dialogue else desired_end
-    gap_len = gap_end - gap_start
-    if gap_len < MIN_GAP_FOR_SOUND_MS:
+    gap_end = next_dialogue["start_ms"] if next_dialogue else max(desired_end, desired_start + 1)
+    if gap_end - gap_start < MIN_GAP_FOR_SOUND_MS:
         return None
 
+    label = ev.get("label", "")
+    target_ms = 2200 if label == "[♪]" else 1600
+    min_required = 800 if label == "[♪]" else 700
     lead_out_ms = 180 if next_dialogue is not None else 0
-    start = max(desired_start, gap_start)
-    available_end = gap_end - lead_out_ms if next_dialogue is not None else gap_end
-
-    min_required = 900 if label == "[♪]" else 700
-    target_ms = 2000 if label == "[♪]" else 1500
-    max_ms = 3500 if label == "[♪]" else 2200
-
-    if available_end - start < min_required:
+    usable_end = gap_end - lead_out_ms if next_dialogue is not None else gap_end
+    if usable_end - gap_start < min_required:
         return None
 
-    end = min(available_end, start + max(target_ms, min_required), start + max_ms)
+    # Bridge placement: backfill from dead air if the raw sound burst is too short.
+    start = max(gap_start, desired_start)
+    end = min(usable_end, max(desired_end, start + target_ms))
+    if end - start < min_required:
+        end = usable_end
+        start = max(gap_start, end - target_ms)
     if end - start < min_required:
         return None
 
@@ -537,11 +582,11 @@ def fit_sound_into_dialogue_gap(
         "idx": 0,
         "start_ms": start,
         "end_ms": end,
-        "lines": [label[:MAX_CHARS]],
+        "lines": [ev["label"][:MAX_CHARS]],
         "type": "sound",
         "meta": {
-            "sound_label": label,
-            "sound_priority": sound_priority(label),
+            "sound_label": ev["label"],
+            "sound_priority": sound_priority(ev["label"]),
         },
     }
 
@@ -550,9 +595,7 @@ def intervals_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> boo
 
 
 def sound_priority(label: str) -> int:
-    if label in ("[APPLAUSE]", "[CHEERING]"):
-        return 4
-    if label == "[LAUGHTER]":
+    if label in ("[LAUGHTER]", "[APPLAUSE]", "[CHEERING]"):
         return 3
     if label == "[♪]":
         return 1
@@ -560,8 +603,10 @@ def sound_priority(label: str) -> int:
 
 
 def combine_sound_labels(a: str, b: str) -> str:
-    return a if sound_priority(a) >= sound_priority(b) else b
-
+    for lbl in ("[APPLAUSE]", "[LAUGHTER]", "[CHEERING]", "[♪]"):
+        if a == lbl or b == lbl:
+            return lbl
+    return a if a in ALLOWED_SOUND_LABELS else (b if b in ALLOWED_SOUND_LABELS else "")
 
 def presplit_multispeaker(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -820,7 +865,7 @@ def smart_split(
     if candidates:
         candidates.sort(key=lambda x: x[0])
         best_score, best_lines = candidates[0]
-        if best_score < 120:
+        if best_score < 175:
             return best_lines, False
 
     return [text], True
@@ -884,7 +929,7 @@ def split_score(left: str, right: str, protected_phrases: List[str], prefer_bala
     combined = left + "\n" + right
     for phrase in protected_phrases:
         if phrase and phrase in combined.replace("\n", " ") and phrase.replace(" ", "\n") in combined:
-            score += 250
+            score += 450
 
     weak_fragment_starts = {"and", "but", "or", "to", "of", "for", "with", "because", "that", "this", "these", "those"}
     weak_fragment_ends = {"and", "but", "or", "to", "of", "for", "with", "because", "that", "this", "these", "those", "i", "it", "who", "what"}
@@ -1068,9 +1113,6 @@ def resolve_overlaps_dialogue_first(cues: List[Dict[str, Any]]) -> List[Dict[str
 def clean_dialogue_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = text.replace(" ,", ",").replace(" .", ".").replace(" !", "!").replace(" ?", "?")
-    text = re.sub(r"([Yy]es)\.\s+([Yy]es)", r", ", text)
-    text = re.sub(r",\s*right\?", ", right?", text)
-    text = re.sub(r"(?<=[A-Za-z])\.\s+(right\?)", r", ", text, flags=re.IGNORECASE)
     return text
 
 
