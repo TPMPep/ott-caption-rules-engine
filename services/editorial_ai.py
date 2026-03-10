@@ -77,9 +77,12 @@ def _refine_two_speaker_cue(client, cue: Dict, runs: List[Dict], protected_phras
                     "Return exactly two lines. Each line must begin with '- '. "
                     "Line 1 must contain ONLY speaker_run_1. Line 2 must contain ONLY speaker_run_2. "
                     "Do not add, remove, replace, reorder, or transfer words between speakers. "
+                    "Keep each speaker turn atomic. Never split one speaker's phrase across the other speaker's line. "
                     "You may only adjust punctuation and capitalization inside each speaker run. "
                     "Do not title-case words just because a new caption line starts. "
-                    "Return JSON only with the shape {"lines":["...","..."]}."
+                    "Only capitalize a line-start word if it truly starts a sentence, is the pronoun I, or is already a proper noun/title. "
+                    "Use commas instead of periods when a phrase continues as an appositive, for example 'I'm your host, Andy Cohen.' "
+                    "Return JSON only with the shape {\"lines\":[\"...\",\"...\"]}."
                 )},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
@@ -133,8 +136,12 @@ def _refine_single_speaker_cue(client, cue: Dict, dialogue_text: str, prev_text:
                     "You may only adjust punctuation, capitalization, and line breaks. "
                     "Do NOT capitalize a word just because it starts a new caption line. "
                     "Only capitalize if it truly begins a sentence, is the pronoun I, or is already a proper noun/title. "
-                    "Prefer punctuation and phrase boundaries. Preserve titles and proper nouns. "
-                    "Return JSON only with the shape {"lines":["...","..."]}."
+                    "Preserve sentence meaning and continuity across neighboring cues. "
+                    "Prefer punctuation and phrase boundaries over visual balance. "
+                    "Use commas rather than periods when the sentence clearly continues, for example 'I'm your host, Andy Cohen.' "
+                    "Preserve titles and proper nouns. Do not split proper nouns or show titles awkwardly across lines. "
+                    "If the source contains [INAUDIBLE], preserve it exactly as [INAUDIBLE]. "
+                    "Return JSON only with the shape {\"lines\":[\"...\",\"...\"]}."
                 )},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
@@ -148,6 +155,8 @@ def _refine_single_speaker_cue(client, cue: Dict, dialogue_text: str, prev_text:
     if _word_fingerprint(" ".join(ai_lines)) != _word_fingerprint(dialogue_text):
         return None
     if _has_bad_titlecase(dialogue_text, " ".join(ai_lines)):
+        return None
+    if _bad_initial_capitalization_due_to_continuation(dialogue_text, " ".join(ai_lines), prev_text):
         return None
     new_cue = dict(cue)
     new_cue["lines"] = ai_lines
@@ -209,5 +218,30 @@ def _has_bad_titlecase(original: str, edited: str) -> bool:
         if i in allowed_sentence_starts and e[:1].isupper():
             continue
         # otherwise reject random capitalization change
+        return True
+    return False
+
+
+def _continuation_likely(prev_text: str) -> bool:
+    prev_text = (prev_text or "").strip()
+    if not prev_text:
+        return False
+    return not _SENT_BOUNDARY_RE.search(prev_text)
+
+
+def _bad_initial_capitalization_due_to_continuation(original: str, edited: str, prev_text: str) -> bool:
+    orig_tokens = _token_case_list(original)
+    edit_tokens = _token_case_list(edited)
+    if not orig_tokens or not edit_tokens:
+        return False
+    if not _continuation_likely(prev_text):
+        return False
+    o = orig_tokens[0]
+    e = edit_tokens[0]
+    if o.lower() != e.lower():
+        return False
+    if o.lower() == "i" and e == "I":
+        return False
+    if o[:1].islower() and e[:1].isupper():
         return True
     return False
