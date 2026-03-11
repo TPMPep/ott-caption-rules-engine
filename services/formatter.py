@@ -264,6 +264,12 @@ def capitalize_i_pronoun(text: str) -> str:
     if not text or len(text) < 2:
         return text
     text = normalize_space(text)
+    # After comma (mid-sentence): pronoun I stays capitalized
+    text = re.sub(r",\s*i'm\b", ", I'm", text, flags=re.I)
+    text = re.sub(r",\s*i've\b", ", I've", text, flags=re.I)
+    text = re.sub(r",\s*i'll\b", ", I'll", text, flags=re.I)
+    text = re.sub(r",\s*i'd\b", ", I'd", text, flags=re.I)
+    text = re.sub(r",\s+i\b", ", I ", text)
     # At start of string
     text = re.sub(r"^\s*i'm\b", "I'm", text, flags=re.I)
     text = re.sub(r"^\s*i've\b", "I've", text, flags=re.I)
@@ -306,11 +312,14 @@ def repair_continuing_punctuation(text: str) -> str:
     # Explicit period + continuation word -> comma + lowercase (broadcast: no false sentence breaks)
     for word in ("It's", "But", "So", "And", "Well", "Now", "This", "That", "They", "We", "He", "She", "Because", "Which", "Then", "Or", "If"):
         text = re.sub(r"\.\s+" + word + r"\b", ", " + word.lower(), text)
+    # Period before "I " or "And " (continuation) -> comma so next phrase isn't treated as new sentence
+    text = re.sub(r"\.\s+I\s+", ", I ", text)
+    text = re.sub(r"\.\s+And\s+", ", and ", text, flags=re.I)
     # Comma then capital (mid-sentence continuation): lowercase so not sentence start (broadcast spec).
     for word in (
         "You", "She", "He", "They", "This", "That", "What", "When", "Where", "Which", "Who", "How",
         "Because", "And", "But", "So", "While", "Thank", "My", "Your", "They're", "We're", "It's", "I'm",
-        "Now", "Well", "Then", "Or", "If", "Though", "Yet", "Still", "Here", "There",
+        "Now", "Well", "Then", "Or", "If", "Though", "Yet", "Still", "Here", "There", "It",
     ):
         text = re.sub(r",\s*" + word + r"\b", ", " + word.lower(), text)
     text = re.sub(r",, +", ", ", text)
@@ -918,10 +927,8 @@ def maybe_best_layout(text: str, protected: List[str]) -> Optional[List[str]]:
     text = normalize_space(text)
     if not text:
         return None
+    # Broadcast: if it fits in one line (≤32 chars), use one line; 2 lines is max, not required
     if len(text) <= MAX_CHARS:
-        two = best_two_line_split(text, protected)
-        if two and len(text) >= 24 and split_layout_score(two, protected) < 10:
-            return two
         return [text]
     if len(text) > MAX_CUE_CHARS:
         return None
@@ -1312,8 +1319,24 @@ def _apply_sound_min_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return cues
 
 
+def _capitalize_cue_starts(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Capitalize first letter of each dialogue cue's first line (sentence start / broadcast)."""
+    for c in cues:
+        if c.get("type") != "dialogue" or not c.get("lines"):
+            continue
+        line = c["lines"][0]
+        if not line:
+            continue
+        # Find first lowercase letter (after optional "- " prefix) and capitalize
+        match = re.search(r"(^-?\s*)([a-z])", line)
+        if match:
+            start, letter = match.start(2), match.group(2)
+            c["lines"][0] = line[:start] + letter.upper() + line[start + 1:]
+    return cues
+
+
 def _lowercase_continuation_at_cue_start(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """When a dialogue cue starts with a continuation word and the previous cue ended mid-sentence (period/comma), lowercase it (broadcast)."""
+    """Only when previous cue ended with a COMMA (mid-sentence): lowercase continuation word at cue start. Never after period (new sentence)."""
     for i in range(1, len(cues)):
         c = cues[i]
         if c.get("type") != "dialogue" or not c.get("lines"):
@@ -1322,7 +1345,7 @@ def _lowercase_continuation_at_cue_start(cues: List[Dict[str, Any]]) -> List[Dic
         if prev.get("type") != "dialogue" or not prev.get("lines"):
             continue
         last_prev = (prev["lines"][-1] or "").strip()
-        if not last_prev or last_prev[-1] not in ".,":
+        if not last_prev or last_prev[-1] != ",":
             continue
         first_line = (c["lines"][0] or "").strip()
         if not first_line:
@@ -1403,6 +1426,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     final = _apply_sound_min_duration(final)
     final = _resolve_dialogue_overlaps(final)
     final = _lowercase_continuation_at_cue_start(final)
+    final = _capitalize_cue_starts(final)
     return final
 
 if __name__ == "__main__":
