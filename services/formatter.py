@@ -119,7 +119,8 @@ ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wron
 # Words that often continue a sentence (lowercase when previous cue ended with period/comma — broadcast)
 CONTINUATION_STARTERS = frozenset(
     {"it's", "but", "so", "and", "well", "now", "this", "that", "they", "we", "you", "he", "she",
-     "because", "which", "who", "when", "where", "what", "how", "then", "or", "if", "though", "yet", "still"}
+     "because", "which", "who", "when", "where", "what", "how", "then", "or", "if", "though", "yet", "still",
+     "really", "wow", "hey", "there", "ok", "okay"}
 )
 MIN_FRAGMENT_WORDS = 3
 MIN_FRAGMENT_CHARS = 10
@@ -310,7 +311,7 @@ def repair_continuing_punctuation(text: str) -> str:
     # If a period is followed by a lowercase word, treat as continuing phrase.
     text = re.sub(r"(?<![A-Z])\. (?=[a-z])", ", ", text)
     # Explicit period + continuation word -> comma + lowercase (broadcast: no false sentence breaks)
-    for word in ("It's", "But", "So", "And", "Well", "Now", "This", "That", "They", "We", "He", "She", "Because", "Which", "Then", "Or", "If"):
+    for word in ("It's", "But", "So", "And", "Well", "Now", "This", "That", "They", "We", "He", "She", "Because", "Which", "Then", "Or", "If", "Oh", "Really", "Wow", "There", "Hey", "OK", "Okay"):
         text = re.sub(r"\.\s+" + word + r"\b", ", " + word.lower(), text)
     # Period before "I " or "And " (continuation) -> comma so next phrase isn't treated as new sentence
     text = re.sub(r"\.\s+I\s+", ", I ", text)
@@ -1320,18 +1321,53 @@ def _apply_sound_min_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 def _capitalize_cue_starts(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Capitalize first letter of each dialogue cue's first line (sentence start / broadcast)."""
-    for c in cues:
+    """Capitalize first letter of each dialogue cue's first line when it's a sentence start (not continuation)."""
+    for i, c in enumerate(cues):
         if c.get("type") != "dialogue" or not c.get("lines"):
             continue
+        # Skip if previous cue ended with comma (this cue is continuation; keep lowercase)
+        if i > 0:
+            prev = cues[i - 1]
+            if prev.get("type") == "dialogue" and prev.get("lines"):
+                last_prev = (prev["lines"][-1] or "").strip()
+                if last_prev and last_prev[-1] == ",":
+                    continue
         line = c["lines"][0]
         if not line:
             continue
-        # Find first lowercase letter (after optional "- " prefix) and capitalize
         match = re.search(r"(^-?\s*)([a-z])", line)
         if match:
             start, letter = match.start(2), match.group(2)
             c["lines"][0] = line[:start] + letter.upper() + line[start + 1:]
+    return cues
+
+
+def _cross_cue_period_to_comma(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """When a cue ends with a period and the next cue starts with a continuation word, use comma instead (broadcast: same thought = comma)."""
+    for i in range(len(cues) - 1):
+        cur = cues[i]
+        nxt = cues[i + 1]
+        if cur.get("type") != "dialogue" or nxt.get("type") != "dialogue":
+            continue
+        if not cur.get("lines") or not nxt.get("lines"):
+            continue
+        last = (cur["lines"][-1] or "").strip()
+        first_line = (nxt["lines"][0] or "").strip()
+        if not last or last[-1] != ".":
+            continue
+        prefix = ""
+        if first_line.startswith("- "):
+            prefix, first_line = "- ", first_line[2:].lstrip()
+        words = first_line.split()
+        if not words or words[0].lower() not in CONTINUATION_STARTERS:
+            continue
+        # Replace period with comma on previous cue's last line
+        cur["lines"][-1] = cur["lines"][-1].rstrip()
+        if cur["lines"][-1].endswith("."):
+            cur["lines"][-1] = cur["lines"][-1][:-1] + ","
+        # Lowercase continuation word at start of next cue
+        words[0] = words[0].lower()
+        nxt["lines"][0] = prefix + " ".join(words)
     return cues
 
 
@@ -1426,6 +1462,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     final = _apply_sound_min_duration(final)
     final = _resolve_dialogue_overlaps(final)
     final = _lowercase_continuation_at_cue_start(final)
+    final = _cross_cue_period_to_comma(final)
     final = _capitalize_cue_starts(final)
     return final
 
