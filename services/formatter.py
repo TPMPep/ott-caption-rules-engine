@@ -279,14 +279,18 @@ def apply_asr_corrections(text: str) -> str:
     text = normalize_space(text)
     # Universal mishears (any content)
     text = re.sub(r"\bdickhand\b", "deckhand", text, flags=re.I)
-    # Duplicate word
+    # Duplicate word (any content)
     text = re.sub(r"\bdown\s+down\b", "down", text, flags=re.I)
-    # Capitalization: comma then capitalized mid-sentence word
+    # Capitalization: comma then capitalized mid-sentence word (grammar rule)
     text = re.sub(r",\s*But\s+", ", but ", text)
     text = re.sub(r",\s*So\s+", ", so ", text)
     text = re.sub(r",\s*Because\s+", ", because ", text)
     text = re.sub(r",\s*And\s+", ", and ", text)
-    # Grammar: "in I would" → "and I would"
+    # Mid-sentence: "we Come back" → "we come back" (any "when we come back" etc.)
+    text = re.sub(r"\bwe Come back\b", "we come back", text, flags=re.I)
+    # Greeting: "Hey everybody. welcome" → "Hey everybody, welcome" (common pattern)
+    text = re.sub(r"\bHey everybody\.\s+welcome\b", "Hey everybody, welcome", text, flags=re.I)
+    # Grammar: "in I would" → "and I would" (common ASR/grammar)
     text = re.sub(r"\s+in\s+I\s+would\s+", " and I would ", text, flags=re.I)
     return normalize_space(text)
 
@@ -940,8 +944,11 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
         max_gap = max(MERGE_GAP_MS, 900)
         if len(words_bt) <= 2 and not re.search(r"[.!?]$", bt):
             max_gap = 1200  # Allow larger gap when merging short fragments
-        if (b["end_ms"] - b["start_ms"]) < MIN_DIALOGUE_MS:
+        b_dur = b["end_ms"] - b["start_ms"]
+        if b_dur < MIN_DIALOGUE_MS:
             max_gap = max(max_gap, 1200)  # Merge very short display-time cues
+        if b_dur < 500:
+            max_gap = max(max_gap, 1500)  # Pull in micro-cues (< 0.5s on screen)
         if gap > max_gap:
             return False
         combined = repair_continuing_punctuation(normalize_space(f"{at} {bt}"))
@@ -949,6 +956,9 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
             return False
         if maybe_best_layout(combined, protected) is None:
             return False
+        # Always merge single-word cues (except standalones) when combined fits
+        if len(words_bt) == 1:
+            return True
         if is_fragment(at) or is_fragment(bt):
             return True
         if continues_sentence(at, bt) or boundary_splits_protected(at, bt, protected):
@@ -958,7 +968,8 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
     def merge_pair(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         arun = a["meta"]["runs"][0]
         brun = b["meta"]["runs"][0]
-        text = repair_continuing_punctuation(normalize_space(f"{cue_text(a)} {cue_text(b)}"))
+        raw_combined = repair_continuing_punctuation(normalize_space(f"{cue_text(a)} {cue_text(b)}"))
+        text = apply_asr_corrections(raw_combined)
         tokens = list(arun.get("tokens", [])) + list(brun.get("tokens", []))
         return {
             "idx": 0,
@@ -1206,8 +1217,8 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
             continue
         runs = cue.get("meta", {}).get("runs", [])
         if cue.get("meta", {}).get("two_speaker") and len(runs) == 2:
-            left = repair_continuing_punctuation(normalize_space(runs[0]["text"]))
-            right = repair_continuing_punctuation(normalize_space(runs[1]["text"]))
+            left = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[0]["text"])))
+            right = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[1]["text"])))
             if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
                 cue["lines"] = [f"- {left}", f"- {right}"]
             else:
@@ -1215,7 +1226,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
                 out.extend(format_dialogue_atom(make_atom([runs[1]], False, cue), protected))
                 continue
         else:
-            text = repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", [])))))
+            text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
             cue["meta"]["dialogue_text"] = text
             cue["lines"] = best_layout(text, protected)
         cue["lines"] = [repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS] for x in cue.get("lines", []) if repair_continuing_punctuation(normalize_space(x))]
