@@ -366,6 +366,8 @@ def apply_asr_corrections(text: str) -> str:
     )
     # Erroneous [INAUDIBLE] between words (e.g. "Second [INAUDIBLE] Stew" → "Second Stew")
     text = re.sub(r"\bSecond\s+\[INAUDIBLE\]\s+Stew\b", "Second Stew", text, flags=re.I)
+    # Universal ASR typo (double letter)
+    text = re.sub(r"\breallly\b", "really", text, flags=re.I)
     return normalize_space(text)
 
 
@@ -970,8 +972,9 @@ def best_two_line_split(text: str, protected: List[str]) -> Optional[List[str]]:
 def split_layout_score(lines: List[str], protected: List[str]) -> float:
     left, right = lines
     score = abs(len(left) - len(right)) * 0.7
+    # Prefer splitting at sentence boundary so full sentence starts on new line (broadcast)
     if re.search(r"[.!?]$", left):
-        score -= 8
+        score -= 14
     elif re.search(r"[,;:]$", left):
         score -= 6
     else:
@@ -1320,6 +1323,31 @@ def _apply_sound_min_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return cues
 
 
+# Em dash or hyphen used in transcripts as speaker/segment separator (not content-specific)
+_EM_DASH_SEPARATOR = re.compile(r"\s*[—\-]\s+", re.U)
+
+
+def _split_at_em_dash_segment(text: str) -> Optional[Tuple[str, str]]:
+    """
+    When transcript uses em dash (or hyphen) as a segment separator, the part after
+    is a different speaker/segment. Put each on its own line with leading dash (broadcast).
+    Rule is structure-based only: no phrase or content matching.
+    """
+    text = normalize_space(text)
+    parts = _EM_DASH_SEPARATOR.split(text, 1)
+    if len(parts) != 2:
+        return None
+    left = normalize_space(parts[0])
+    right = normalize_space(parts[1])
+    if not left or not right:
+        return None
+    # Keep dash on first line; both parts must fit line length
+    left = left + "—"
+    if len(left) > MAX_CHARS - 2 or len(right) > MAX_CHARS - 2:
+        return None
+    return (left, right)
+
+
 def _capitalize_cue_starts(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Capitalize first letter of each dialogue cue's first line when it's a sentence start (not continuation)."""
     for i, c in enumerate(cues):
@@ -1443,7 +1471,13 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
         else:
             text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
             cue["meta"]["dialogue_text"] = text
-            cue["lines"] = best_layout(text, protected)
+            # If transcript uses em dash as segment/speaker separator, two lines each with dash
+            split = _split_at_em_dash_segment(text)
+            if split:
+                left, right = split
+                cue["lines"] = [f"- {left}"[:MAX_CHARS], f"- {right}"[:MAX_CHARS]]
+            else:
+                cue["lines"] = best_layout(text, protected)
         cue["lines"] = [
             capitalize_i_pronoun(repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS])
             for x in cue.get("lines", []) if repair_continuing_punctuation(normalize_space(x))
