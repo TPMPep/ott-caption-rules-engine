@@ -116,6 +116,8 @@ ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]"}
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4}
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
 ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
+# Words that must not be the only content on a second line (broadcast: no one-word weak second lines)
+WEAK_SECOND_LINE_WORDS = {"well", "still", "yeah", "right", "ok", "okay", "so", "and", "but", "or"}
 # Words that often continue a sentence (lowercase when previous cue ended with period/comma — broadcast)
 CONTINUATION_STARTERS = frozenset(
     {"it's", "but", "so", "and", "well", "now", "this", "that", "they", "we", "you", "he", "she",
@@ -1030,8 +1032,8 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
         max_gap = max(MERGE_GAP_MS, 900)
         if len(words_bt) <= 2 and not re.search(r"[.!?]$", bt):
             max_gap = 1200  # Allow larger gap when merging short fragments
-        # Continuation words that should not stand alone (e.g. "still." "well.")
-        if len(words_bt) <= 2 and sanitize_last_word(bt).lower() in ("still", "well"):
+        # Continuation/weak words that should not stand alone (e.g. "still." "well." "yeah.")
+        if len(words_bt) <= 2 and sanitize_last_word(bt).lower() in ("still", "well", "yeah"):
             max_gap = max(max_gap, 1800)
         # Cue that is only [INAUDIBLE] or similar: merge with previous when close
         bt_stripped = strip_non_dialogue_tags(bt).strip()
@@ -1351,6 +1353,71 @@ def _split_at_em_dash_segment(text: str) -> Optional[Tuple[str, str]]:
     return (left, right)
 
 
+def _fix_weak_second_line(cues: List[Dict[str, Any]], protected: List[str]) -> List[Dict[str, Any]]:
+    """Broadcast: avoid one-word weak second lines. Merge with next or fold into first line when possible."""
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(cues):
+        c = cues[i]
+        if c.get("type") != "dialogue" or c.get("meta", {}).get("two_speaker") or not c.get("lines"):
+            out.append(c)
+            i += 1
+            continue
+        lines = c["lines"]
+        if len(lines) != 2:
+            out.append(c)
+            i += 1
+            continue
+        second = (lines[1] or "").strip()
+        second_word = sanitize_last_word(second).lower()
+        if second_word not in WEAK_SECOND_LINE_WORDS and second_word not in WEAK_ENDS:
+            out.append(c)
+            i += 1
+            continue
+        words_second = second.split()
+        if len(words_second) > 2:
+            out.append(c)
+            i += 1
+            continue
+        # Second line is weak (e.g. "Well." "Still." "Yeah."). Try merge with next or fold.
+        combined_one_line = normalize_space(f"{lines[0]} {second}")
+        if len(combined_one_line) <= MAX_CHARS:
+            c = dict(c)
+            c["lines"] = [combined_one_line]
+            if c.get("meta"):
+                c["meta"] = dict(c["meta"])
+                c["meta"]["dialogue_text"] = combined_one_line
+            out.append(c)
+            i += 1
+            continue
+        # Try merge with next cue (same speaker, close gap)
+        if i + 1 < len(cues):
+            nxt = cues[i + 1]
+            if (nxt.get("type") == "dialogue" and not nxt.get("meta", {}).get("two_speaker")
+                    and nxt["start_ms"] - c["end_ms"] <= 1200):
+                runs_c = c.get("meta", {}).get("runs", [])
+                runs_n = nxt.get("meta", {}).get("runs", [])
+                if len(runs_c) == 1 and len(runs_n) == 1 and runs_c[0].get("speaker") == runs_n[0].get("speaker"):
+                    text_c = normalize_space(" ".join(c["lines"]))
+                    text_n = normalize_space(" ".join(nxt.get("lines", [])))
+                    merged_text = repair_continuing_punctuation(f"{text_c} {text_n}")
+                    layout = maybe_best_layout(merged_text, protected) if len(merged_text) <= MAX_CUE_CHARS else None
+                    if layout:
+                        new_cue = dict(c)
+                        new_cue["end_ms"] = nxt["end_ms"]
+                        new_cue["meta"] = dict(c.get("meta", {}))
+                        new_cue["meta"]["dialogue_text"] = apply_asr_corrections(merged_text)
+                        new_cue["meta"]["runs"] = [{"speaker": runs_c[0].get("speaker", "A"), "text": new_cue["meta"]["dialogue_text"],
+                            "start_ms": c["start_ms"], "end_ms": nxt["end_ms"], "tokens": runs_c[0].get("tokens", []) + runs_n[0].get("tokens", [])}]
+                        new_cue["lines"] = layout
+                        out.append(new_cue)
+                        i += 2
+                        continue
+        out.append(c)
+        i += 1
+    return out
+
+
 def _capitalize_cue_starts(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Capitalize first letter of each dialogue cue's first line when it's a sentence start (not continuation)."""
     for i, c in enumerate(cues):
@@ -1370,6 +1437,32 @@ def _capitalize_cue_starts(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if match:
             start, letter = match.start(2), match.group(2)
             c["lines"][0] = line[:start] + letter.upper() + line[start + 1:]
+    return cues
+
+
+def _capitalize_after_question(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """When previous cue ended with ?, capitalize next cue's first word (e.g. 'incredible that...' -> 'Incredible that...')."""
+    for i in range(1, len(cues)):
+        c = cues[i]
+        if c.get("type") != "dialogue" or not c.get("lines"):
+            continue
+        prev = cues[i - 1]
+        if prev.get("type") != "dialogue" or not prev.get("lines"):
+            continue
+        last_prev = (prev["lines"][-1] or "").strip()
+        if not last_prev or last_prev[-1] != "?":
+            continue
+        line = (c["lines"][0] or "").strip()
+        if not line:
+            continue
+        prefix = ""
+        if line.startswith("- "):
+            prefix, line = "- ", line[2:].lstrip()
+        words = line.split()
+        if not words or words[0][0].isupper():
+            continue
+        words[0] = words[0][0].upper() + words[0][1:]
+        c["lines"][0] = prefix + " ".join(words)
     return cues
 
 
@@ -1494,6 +1587,10 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     dialogue = merge_fragment_dialogue_cues(dialogue, protected)
     final = repair_global_fragments(dialogue + sounds, protected)
     final.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
+    dialogue = [c for c in final if c["type"] == "dialogue"]
+    sounds = [c for c in final if c["type"] == "sound"]
+    dialogue = _fix_weak_second_line(dialogue, protected)
+    final = sorted(dialogue + sounds, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     # Broadcast: enforce minimum display duration so short cues are readable
     final = _apply_minimum_display_duration(final)
     final = _apply_sound_min_duration(final)
@@ -1501,6 +1598,17 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     final = _lowercase_continuation_at_cue_start(final)
     final = _cross_cue_period_to_comma(final)
     final = _capitalize_cue_starts(final)
+    final = _capitalize_after_question(final)
+    # Populate speaker on each cue for output JSON (from AssemblyAI runs)
+    for c in final:
+        if c.get("type") == "dialogue":
+            runs = c.get("meta", {}).get("runs", [])
+            if len(runs) == 1:
+                c["speaker"] = str(runs[0].get("speaker") or "A")
+            elif len(runs) == 2:
+                c["speaker"] = f"{runs[0].get('speaker') or 'A'},{runs[1].get('speaker') or 'B'}"
+            else:
+                c["speaker"] = str(runs[0].get("speaker") or "A") if runs else None
     return final
 
 if __name__ == "__main__":
