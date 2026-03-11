@@ -257,13 +257,15 @@ def repair_continuing_punctuation(text: str) -> str:
     text = normalize_space(text)
     if not text:
         return text
-    # Preserve clear appositives / continuing phrases instead of inventing sentence stops.
+    # Use commas where the sentence is continuing; periods only at real sentence stop (broadcast spec).
+    # Appositives: "I'm your host. Andy" -> "I'm your host, Andy"
     text = re.sub(r"\b([Ii]'?m your host)\. ([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,2})\b", r"\1, \2", text)
-    text = re.sub(r"\. (?=(?:right|okay|ok|speaking|please|because|which|who|where|when|while|though|that|if|but|and|or|so|then|now)\b)", ", ", text, flags=re.I)
+    # Period before continuation words/phrases -> comma
+    text = re.sub(r"\. (?=(?:right|okay|ok|speaking|please|because|which|who|where|when|while|though|that|if|but|and|or|so|then|now|listen|well|hey|oh|mean|know|this is|this was|it is|it was|everybody|really)\b)", ", ", text, flags=re.I)
     text = re.sub(r"\b(Yes|No)\. (?=(?:yes|no)\b)", r"\1, ", text)
-    text = re.sub(r"\b([A-Z][A-Za-z]+)\. (?=(?:welcome|speaking|wearing|thank|please|because|and|but|or|so|then|now)\b)", r"\1, ", text)
-    text = re.sub(r"\b([A-Z][A-Za-z]+), (?=(?:[a-z]))", r"\1, ", text)
-    # If a period is followed by a lowercase word, it is usually a broken continuation.
+    text = re.sub(r"\b([A-Z][a-z]*)\. (?=(?:welcome|speaking|wearing|thank|please|because|and|but|or|so|then|now|the|that|this|they|we|you|I)\b)", r"\1, ", text, flags=re.I)
+    text = re.sub(r"\b(everybody|host|else|tonight)\. (?=[a-z])", r"\1, ", text, flags=re.I)
+    # If a period is followed by a lowercase word, treat as continuing phrase.
     text = re.sub(r"(?<![A-Z])\. (?=[a-z])", ", ", text)
     text = re.sub(r",, +", ", ", text)
     return normalize_space(text)
@@ -712,8 +714,9 @@ def format_dialogue_atom(atom: Dict[str, Any], protected: List[str]) -> List[Dic
         duration_s = max(duration_ms / 1000.0, 0.001)
         total_chars = len(left) + len(right) + 4  # "- " per line
         cps = total_chars / duration_s
-        # Broadcast: if two-speaker cue would exceed CPS limit, split into two cues so each has readable timing
-        if cps > MAX_CPS:
+        # Short exchange (e.g. "Thank you." / "Who made this?"): keep as one two-line cue so min duration applies once.
+        # Only split when CPS is high and (duration long or text long) so we don't create sub-second single-line cues.
+        if cps > MAX_CPS and (duration_s >= 2.0 or total_chars > 45):
             return [format_dialogue_atom(make_atom([run], False, atom), protected)[0] for run in runs]
         if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
             out = atom.copy()
@@ -1222,8 +1225,9 @@ def _apply_minimum_display_duration(cues: List[Dict[str, Any]]) -> List[Dict[str
         dur = c["end_ms"] - c["start_ms"]
         if dur >= MIN_DISPLAY_MS:
             continue
-        next_start = cues[i + 1]["start_ms"] if i + 1 < len(cues) else c["end_ms"] + MIN_DISPLAY_MS
-        new_end = min(c["start_ms"] + MIN_DISPLAY_MS, next_start)
+        # Extend so caption stays on at least MIN_DISPLAY_MS. Allow overlap with next cue so
+        # very short back-and-forth (e.g. "Thank you." then "Who made this?") is still readable.
+        new_end = c["start_ms"] + MIN_DISPLAY_MS
         if new_end > c["end_ms"]:
             c["end_ms"] = new_end
     return cues
@@ -1246,7 +1250,9 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
             duration_s = max(duration_ms / 1000.0, 0.001)
             total_chars = len(left) + len(right) + 4
             cps = total_chars / duration_s
-            if cps > MAX_CPS or len(left) > MAX_CHARS - 2 or len(right) > MAX_CHARS - 2:
+            # Keep short multi-speaker exchanges as one cue (two lines); only split when CPS high and not a quick back-and-forth.
+            split_for_cps = cps > MAX_CPS and (duration_s >= 2.0 or total_chars > 45)
+            if split_for_cps or len(left) > MAX_CHARS - 2 or len(right) > MAX_CHARS - 2:
                 out.extend(format_dialogue_atom(make_atom([runs[0]], False, cue), protected))
                 out.extend(format_dialogue_atom(make_atom([runs[1]], False, cue), protected))
                 continue
