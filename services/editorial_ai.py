@@ -82,7 +82,7 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
                             "You may only change capitalization, punctuation, and line breaks. "
                             "Capitalization: capitalize only the first word of a true sentence and proper nouns (names, titles, I). "
                             "Do not capitalize a word just because it follows a comma or starts a new caption line. "
-                            "Punctuation: use commas where the sentence continues; use periods only at sentence end. "
+                            "Punctuation: use commas where the sentence continues; use periods only at a real sentence stop. Do not use a period when the next phrase continues the same thought—use a comma. "
                             "When splitting into two lines, avoid a single word on the second line unless it is a brief response (Yes, No, OK, Yeah, Right). "
                             "Prefer splitting at phrase or clause boundaries. "
                             "If there are exactly two speaker runs, format as two lines and begin each line with '- '. "
