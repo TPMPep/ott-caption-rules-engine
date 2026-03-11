@@ -112,12 +112,12 @@ WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that",
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
 ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]"}
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4}
+# Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
+ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
 MIN_FRAGMENT_WORDS = 3
 MIN_FRAGMENT_CHARS = 10
 LONG_GAP_BRIDGE_MS = 2200
 BRIDGE_PAD_MS = 120
-# Default protected phrases for broadcast (show titles, avoid split/corruption)
-DEFAULT_PROTECTED_PHRASES = ["Watch What Happens Live", "Below Deck Med", "Below Deck Mediterranean"]
 TAG_RE = re.compile(r"\[[^\]]+\]")
 WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 TITLEISH_RE = re.compile(r"^[A-Z][A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?$|^[A-Z0-9]{2,}$")
@@ -130,7 +130,6 @@ def process_caption_job(
     output_formats: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     protected_phrases = protected_phrases or []
-    protected_phrases = list(DEFAULT_PROTECTED_PHRASES) + protected_phrases
     output_formats = output_formats or ["srt"]
 
     backbone = _parse_srt(backbone_srt_text)
@@ -272,37 +271,22 @@ def repair_continuing_punctuation(text: str) -> str:
 def apply_asr_corrections(text: str) -> str:
     """
     Fix common ASR (speech-to-text) errors for broadcast captions.
-    Only whole-word/phrase replacements; preserves timing and word count.
+    Only whole-word/phrase replacements that apply to any content; no show-specific rules.
+    Preserves timing and word count.
     """
     if not text or not text.strip():
         return text
     text = normalize_space(text)
-    # Show names / recurring ASR confusions (whole-word)
-    text = re.sub(r"\bAsia\b", "Ayesha", text, flags=re.I)
-    text = re.sub(r"\bCathy\b", "Kathy", text)
-    text = re.sub(r"\bChizzy\b", "Kizzy", text)
+    # Universal mishears (any content)
     text = re.sub(r"\bdickhand\b", "deckhand", text, flags=re.I)
-    # Meaning-critical: "comprehensible" in suicide context → "incomprehensible"
-    text = re.sub(
-        r"\bwhich is just[—\-]\s*(?:\[[^\]]+\]\s*)?comprehensible\s+to the family",
-        "which is just— incomprehensible to the family",
-        text,
-        flags=re.I,
-    )
-    text = re.sub(
-        r"\bcomprehensible\s+to the family\s+and everyone that knew him\b",
-        "incomprehensible to the family and everyone that knew him",
-        text,
-        flags=re.I,
-    )
     # Duplicate word
     text = re.sub(r"\bdown\s+down\b", "down", text, flags=re.I)
-    # Show title corruption
-    text = re.sub(r"\bwatch\s+what\s+doing\b", "Watch What Happens Live", text, flags=re.I)
-    # Capitalization: mid-sentence "Come" / "But" after comma
-    text = re.sub(r"When we Come back", "When we come back", text)
+    # Capitalization: comma then capitalized mid-sentence word
     text = re.sub(r",\s*But\s+", ", but ", text)
-    # Grammar: "in I would" → "and I would" (e.g. "kiss Josh in I would kill" → "and")
+    text = re.sub(r",\s*So\s+", ", so ", text)
+    text = re.sub(r",\s*Because\s+", ", because ", text)
+    text = re.sub(r",\s*And\s+", ", and ", text)
+    # Grammar: "in I would" → "and I would"
     text = re.sub(r"\s+in\s+I\s+would\s+", " and I would ", text, flags=re.I)
     return normalize_space(text)
 
@@ -946,10 +930,20 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
         bruns = b.get("meta", {}).get("runs", [])
         if len(aruns) != 1 or len(bruns) != 1 or aruns[0].get("speaker") != bruns[0].get("speaker"):
             return False
-        if b["start_ms"] - a["end_ms"] > max(MERGE_GAP_MS, 900):
-            return False
         at = cue_text(a)
         bt = cue_text(b)
+        words_bt = bt.split()
+        # Single-word cue that is allowed to stand alone (e.g. "Yes." "No.") — do not merge
+        if len(words_bt) == 1 and sanitize_last_word(bt).lower() in ALLOWED_STANDALONE_WORDS:
+            return False
+        gap = b["start_ms"] - a["end_ms"]
+        max_gap = max(MERGE_GAP_MS, 900)
+        if len(words_bt) <= 2 and not re.search(r"[.!?]$", bt):
+            max_gap = 1200  # Allow larger gap when merging short fragments
+        if (b["end_ms"] - b["start_ms"]) < MIN_DIALOGUE_MS:
+            max_gap = max(max_gap, 1200)  # Merge very short display-time cues
+        if gap > max_gap:
+            return False
         combined = repair_continuing_punctuation(normalize_space(f"{at} {bt}"))
         if len(combined) > MAX_CUE_CHARS:
             return False
