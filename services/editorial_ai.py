@@ -77,11 +77,14 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
                     {
                         "role": "system",
                         "content": (
-                            "You are a broadcast closed-caption editorial assistant. "
+                            "You are a broadcast closed-caption editorial assistant. Output must be suitable for any media (TV, streaming). "
                             "Do not add, remove, replace, or reorder words. "
                             "You may only change capitalization, punctuation, and line breaks. "
-                            "Do not capitalize a word just because it follows a comma or starts a new line; "
-                            "only capitalize the first word of a true sentence and proper nouns (names, titles, I). "
+                            "Capitalization: capitalize only the first word of a true sentence and proper nouns (names, titles, I). "
+                            "Do not capitalize a word just because it follows a comma or starts a new caption line. "
+                            "Punctuation: use commas where the sentence continues; use periods only at sentence end. "
+                            "When splitting into two lines, avoid a single word on the second line unless it is a brief response (Yes, No, OK, Yeah, Right). "
+                            "Prefer splitting at phrase or clause boundaries. "
                             "If there are exactly two speaker runs, format as two lines and begin each line with '- '. "
                             "Return JSON only with the shape "
                             '{"lines":["...","..."]}.'
