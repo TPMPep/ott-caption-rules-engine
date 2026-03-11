@@ -93,6 +93,7 @@ MAX_CUE_CHARS = MAX_LINES * MAX_CHARS
 TARGET_CPS = 18.0
 MAX_CPS = 20.0
 MIN_DIALOGUE_MS = 800
+MIN_DISPLAY_MS = 1200  # Broadcast: minimum on-screen time so captions are readable
 MIN_SOUND_MS = 700
 TARGET_SOUND_MS = 1800
 MAX_SOUND_MS = 3500
@@ -707,6 +708,13 @@ def format_dialogue_atom(atom: Dict[str, Any], protected: List[str]) -> List[Dic
     if atom["meta"].get("two_speaker") and len(runs) == 2:
         left = normalize_space(runs[0]["text"])
         right = normalize_space(runs[1]["text"])
+        duration_ms = atom["end_ms"] - atom["start_ms"]
+        duration_s = max(duration_ms / 1000.0, 0.001)
+        total_chars = len(left) + len(right) + 4  # "- " per line
+        cps = total_chars / duration_s
+        # Broadcast: if two-speaker cue would exceed CPS limit, split into two cues so each has readable timing
+        if cps > MAX_CPS:
+            return [format_dialogue_atom(make_atom([run], False, atom), protected)[0] for run in runs]
         if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
             out = atom.copy()
             out["lines"] = [f"- {left}", f"- {right}"]
@@ -1206,6 +1214,21 @@ def resolve_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [c for c in out if c["end_ms"] > c["start_ms"]]
 
 
+def _apply_minimum_display_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enforce minimum on-screen time for dialogue cues so they are readable (broadcast standard)."""
+    for i, c in enumerate(cues):
+        if c.get("type") != "dialogue":
+            continue
+        dur = c["end_ms"] - c["start_ms"]
+        if dur >= MIN_DISPLAY_MS:
+            continue
+        next_start = cues[i + 1]["start_ms"] if i + 1 < len(cues) else c["end_ms"] + MIN_DISPLAY_MS
+        new_end = min(c["start_ms"] + MIN_DISPLAY_MS, next_start)
+        if new_end > c["end_ms"]:
+            c["end_ms"] = new_end
+    return cues
+
+
 def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for cue in cues:
@@ -1219,12 +1242,15 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
         if cue.get("meta", {}).get("two_speaker") and len(runs) == 2:
             left = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[0]["text"])))
             right = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[1]["text"])))
-            if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
-                cue["lines"] = [f"- {left}", f"- {right}"]
-            else:
+            duration_ms = cue["end_ms"] - cue["start_ms"]
+            duration_s = max(duration_ms / 1000.0, 0.001)
+            total_chars = len(left) + len(right) + 4
+            cps = total_chars / duration_s
+            if cps > MAX_CPS or len(left) > MAX_CHARS - 2 or len(right) > MAX_CHARS - 2:
                 out.extend(format_dialogue_atom(make_atom([runs[0]], False, cue), protected))
                 out.extend(format_dialogue_atom(make_atom([runs[1]], False, cue), protected))
                 continue
+            cue["lines"] = [f"- {left}", f"- {right}"]
         else:
             text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
             cue["meta"]["dialogue_text"] = text
@@ -1239,6 +1265,8 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     dialogue = merge_fragment_dialogue_cues(dialogue, protected)
     final = repair_global_fragments(dialogue + sounds, protected)
     final.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
+    # Broadcast: enforce minimum display duration so short cues are readable
+    final = _apply_minimum_display_duration(final)
     return final
 
 if __name__ == "__main__":
