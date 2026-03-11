@@ -94,6 +94,7 @@ TARGET_CPS = 18.0
 MAX_CPS = 20.0
 MIN_DIALOGUE_MS = 800
 MIN_DISPLAY_MS = 1200  # Broadcast: minimum on-screen time so captions are readable
+MIN_SOUND_DISPLAY_MS = 1000  # Minimum on-screen time for sound cues (broadcast)
 MIN_SOUND_MS = 700
 TARGET_SOUND_MS = 1800
 MAX_SOUND_MS = 3500
@@ -108,7 +109,7 @@ FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for",
     "that", "this", "these", "those", "is", "are", "was", "were", "be", "been", "being", "it", "i",
 }
-WEAK_ENDS = FUNCTION_WORDS | {"who", "what", "which", "when", "where", "why", "how"}
+WEAK_ENDS = FUNCTION_WORDS | {"who", "what", "which", "when", "where", "why", "how", "well", "still"}
 WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that", "this", "these", "those"}
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
 ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]"}
@@ -267,6 +268,9 @@ def repair_continuing_punctuation(text: str) -> str:
     text = re.sub(r"\b(everybody|host|else|tonight)\. (?=[a-z])", r"\1, ", text, flags=re.I)
     # If a period is followed by a lowercase word, treat as continuing phrase.
     text = re.sub(r"(?<![A-Z])\. (?=[a-z])", ", ", text)
+    # Comma then capital (mid-sentence continuation): lowercase so not sentence start (broadcast spec).
+    for word in ("You", "She", "He", "They", "This", "That", "What", "When", "Where", "Which", "Who", "How", "Because", "And", "But", "So", "While", "Thank", "My", "Your", "They're", "We're", "It's", "I'm"):
+        text = re.sub(r",\s*" + word + r"\b", ", " + word.lower(), text)
     text = re.sub(r",, +", ", ", text)
     return normalize_space(text)
 
@@ -295,6 +299,21 @@ def apply_asr_corrections(text: str) -> str:
     text = re.sub(r"\bHey everybody\.\s+welcome\b", "Hey everybody, welcome", text, flags=re.I)
     # Grammar: "in I would" → "and I would" (common ASR/grammar)
     text = re.sub(r"\s+in\s+I\s+would\s+", " and I would ", text, flags=re.I)
+    # Meaning-critical: "comprehensible" in negative/tragedy context → "incomprehensible"
+    text = re.sub(
+        r"\bwhich is just[—\-]\s*(?:\[[^\]]+\]\s*)?comprehensible\s+to the family\b",
+        "which is just— incomprehensible to the family",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\bcomprehensible\s+to the family\s+and everyone that knew him\b",
+        "incomprehensible to the family and everyone that knew him",
+        text,
+        flags=re.I,
+    )
+    # Erroneous [INAUDIBLE] between words (e.g. "Second [INAUDIBLE] Stew" → "Second Stew")
+    text = re.sub(r"\bSecond\s+\[INAUDIBLE\]\s+Stew\b", "Second Stew", text, flags=re.I)
     return normalize_space(text)
 
 
@@ -955,6 +974,13 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
         max_gap = max(MERGE_GAP_MS, 900)
         if len(words_bt) <= 2 and not re.search(r"[.!?]$", bt):
             max_gap = 1200  # Allow larger gap when merging short fragments
+        # Continuation words that should not stand alone (e.g. "still." "well.")
+        if len(words_bt) <= 2 and sanitize_last_word(bt).lower() in ("still", "well"):
+            max_gap = max(max_gap, 1800)
+        # Cue that is only [INAUDIBLE] or similar: merge with previous when close
+        bt_stripped = strip_non_dialogue_tags(bt).strip()
+        if re.match(r"^\[(?:INAUDIBLE|UNINTELLIGIBLE)\]\.?\s*$", bt_stripped, re.I):
+            max_gap = max(max_gap, 1200)
         b_dur = b["end_ms"] - b["start_ms"]
         if b_dur < MIN_DIALOGUE_MS:
             max_gap = max(max_gap, 1200)  # Merge very short display-time cues
@@ -1211,8 +1237,10 @@ def resolve_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 cue["start_ms"] = prev["end_ms"]
         if cue["end_ms"] <= cue["start_ms"]:
             cue["end_ms"] = cue["start_ms"] + 1
-        if cue["type"] == "sound" and cue["end_ms"] - cue["start_ms"] < 500:
-            continue
+        if cue["type"] == "sound":
+            dur = cue["end_ms"] - cue["start_ms"]
+            if dur < MIN_SOUND_DISPLAY_MS:
+                cue["end_ms"] = cue["start_ms"] + MIN_SOUND_DISPLAY_MS
         out.append(cue)
     return [c for c in out if c["end_ms"] > c["start_ms"]]
 
@@ -1225,11 +1253,35 @@ def _apply_minimum_display_duration(cues: List[Dict[str, Any]]) -> List[Dict[str
         dur = c["end_ms"] - c["start_ms"]
         if dur >= MIN_DISPLAY_MS:
             continue
-        # Extend so caption stays on at least MIN_DISPLAY_MS. Allow overlap with next cue so
-        # very short back-and-forth (e.g. "Thank you." then "Who made this?") is still readable.
         new_end = c["start_ms"] + MIN_DISPLAY_MS
         if new_end > c["end_ms"]:
             c["end_ms"] = new_end
+    return cues
+
+
+def _apply_sound_min_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enforce minimum on-screen time for sound cues (broadcast standard)."""
+    for c in cues:
+        if c.get("type") != "sound":
+            continue
+        dur = c["end_ms"] - c["start_ms"]
+        if dur < MIN_SOUND_DISPLAY_MS:
+            c["end_ms"] = c["start_ms"] + MIN_SOUND_DISPLAY_MS
+    return cues
+
+
+def _resolve_dialogue_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove overlaps: if a dialogue cue extends past the next cue's start, shift the next start to the previous end."""
+    cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c.get("type") == "dialogue" else 1))
+    for i in range(len(cues) - 1):
+        cur = cues[i]
+        nxt = cues[i + 1]
+        if cur["end_ms"] <= nxt["start_ms"]:
+            continue
+        # Overlap: shift next cue so it starts when this one ends
+        nxt["start_ms"] = cur["end_ms"]
+        if nxt["end_ms"] <= nxt["start_ms"]:
+            nxt["end_ms"] = nxt["start_ms"] + MIN_DIALOGUE_MS
     return cues
 
 
@@ -1257,6 +1309,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
                 out.extend(format_dialogue_atom(make_atom([runs[1]], False, cue), protected))
                 continue
             cue["lines"] = [f"- {left}", f"- {right}"]
+            cue["lines"] = [repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS] for x in cue["lines"] if repair_continuing_punctuation(normalize_space(x))]
         else:
             text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
             cue["meta"]["dialogue_text"] = text
@@ -1273,6 +1326,8 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     final.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     # Broadcast: enforce minimum display duration so short cues are readable
     final = _apply_minimum_display_duration(final)
+    final = _apply_sound_min_duration(final)
+    final = _resolve_dialogue_overlaps(final)
     return final
 
 if __name__ == "__main__":
