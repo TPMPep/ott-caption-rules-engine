@@ -116,6 +116,11 @@ ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]"}
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4}
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
 ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
+# Words that often continue a sentence (lowercase when previous cue ended with period/comma — broadcast)
+CONTINUATION_STARTERS = frozenset(
+    {"it's", "but", "so", "and", "well", "now", "this", "that", "they", "we", "you", "he", "she",
+     "because", "which", "who", "when", "where", "what", "how", "then", "or", "if", "though", "yet", "still"}
+)
 MIN_FRAGMENT_WORDS = 3
 MIN_FRAGMENT_CHARS = 10
 LONG_GAP_BRIDGE_MS = 2200
@@ -254,6 +259,31 @@ def is_ultra_fragment(text: str) -> bool:
     return text_word_count(text) <= 1 or len(text) <= 6
 
 
+def capitalize_i_pronoun(text: str) -> str:
+    """Capitalize pronoun I (I'm, I've, I'll, etc.) at line/cue start or after sentence end (broadcast spec)."""
+    if not text or len(text) < 2:
+        return text
+    text = normalize_space(text)
+    # At start of string
+    text = re.sub(r"^\s*i'm\b", "I'm", text, flags=re.I)
+    text = re.sub(r"^\s*i've\b", "I've", text, flags=re.I)
+    text = re.sub(r"^\s*i'll\b", "I'll", text, flags=re.I)
+    text = re.sub(r"^\s*i'd\b", "I'd", text, flags=re.I)
+    text = re.sub(r"^\s*i was\b", "I was", text, flags=re.I)
+    text = re.sub(r"^\s*i am\b", "I am", text, flags=re.I)
+    text = re.sub(r"^\s*i think\b", "I think", text, flags=re.I)
+    text = re.sub(r"^\s*i mean\b", "I mean", text, flags=re.I)
+    text = re.sub(r"^\s*i want\b", "I want", text, flags=re.I)
+    text = re.sub(r"^\s*i just\b", "I just", text, flags=re.I)
+    # After sentence end [.?!]
+    text = re.sub(r"([.?!])\s+i'm\b", r"\1 I'm", text, flags=re.I)
+    text = re.sub(r"([.?!])\s+i've\b", r"\1 I've", text, flags=re.I)
+    text = re.sub(r"([.?!])\s+i'll\b", r"\1 I'll", text, flags=re.I)
+    text = re.sub(r"([.?!])\s+i'd\b", r"\1 I'd", text, flags=re.I)
+    text = re.sub(r"([.?!])\s+i\b", r"\1 I", text, flags=re.I)
+    return text
+
+
 def repair_continuing_punctuation(text: str) -> str:
     text = normalize_space(text)
     if not text:
@@ -261,15 +291,27 @@ def repair_continuing_punctuation(text: str) -> str:
     # Use commas where the sentence is continuing; periods only at real sentence stop (broadcast spec).
     # Appositives: "I'm your host. Andy" -> "I'm your host, Andy"
     text = re.sub(r"\b([Ii]'?m your host)\. ([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,2})\b", r"\1, \2", text)
-    # Period before continuation words/phrases -> comma
-    text = re.sub(r"\. (?=(?:right|okay|ok|speaking|please|because|which|who|where|when|while|though|that|if|but|and|or|so|then|now|listen|well|hey|oh|mean|know|this is|this was|it is|it was|everybody|really)\b)", ", ", text, flags=re.I)
+    # Period before continuation words/phrases -> comma (broadcast: no period when thought continues)
+    text = re.sub(
+        r"\. (?=(?:right|okay|ok|speaking|please|because|which|who|where|when|while|though|that|if|but|and|or|so|then|now|listen|well|hey|oh|mean|know|this is|this was|it is|it was|everybody|really|it's|that's|what's|there's|here's|we're|they're)\b)",
+        ", ",
+        text,
+        flags=re.I,
+    )
     text = re.sub(r"\b(Yes|No)\. (?=(?:yes|no)\b)", r"\1, ", text)
     text = re.sub(r"\b([A-Z][a-z]*)\. (?=(?:welcome|speaking|wearing|thank|please|because|and|but|or|so|then|now|the|that|this|they|we|you|I)\b)", r"\1, ", text, flags=re.I)
     text = re.sub(r"\b(everybody|host|else|tonight)\. (?=[a-z])", r"\1, ", text, flags=re.I)
     # If a period is followed by a lowercase word, treat as continuing phrase.
     text = re.sub(r"(?<![A-Z])\. (?=[a-z])", ", ", text)
+    # Explicit period + continuation word -> comma + lowercase (broadcast: no false sentence breaks)
+    for word in ("It's", "But", "So", "And", "Well", "Now", "This", "That", "They", "We", "He", "She", "Because", "Which", "Then", "Or", "If"):
+        text = re.sub(r"\.\s+" + word + r"\b", ", " + word.lower(), text)
     # Comma then capital (mid-sentence continuation): lowercase so not sentence start (broadcast spec).
-    for word in ("You", "She", "He", "They", "This", "That", "What", "When", "Where", "Which", "Who", "How", "Because", "And", "But", "So", "While", "Thank", "My", "Your", "They're", "We're", "It's", "I'm"):
+    for word in (
+        "You", "She", "He", "They", "This", "That", "What", "When", "Where", "Which", "Who", "How",
+        "Because", "And", "But", "So", "While", "Thank", "My", "Your", "They're", "We're", "It's", "I'm",
+        "Now", "Well", "Then", "Or", "If", "Though", "Yet", "Still", "Here", "There",
+    ):
         text = re.sub(r",\s*" + word + r"\b", ", " + word.lower(), text)
     text = re.sub(r",, +", ", ", text)
     return normalize_space(text)
@@ -1270,6 +1312,32 @@ def _apply_sound_min_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return cues
 
 
+def _lowercase_continuation_at_cue_start(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """When a dialogue cue starts with a continuation word and the previous cue ended mid-sentence (period/comma), lowercase it (broadcast)."""
+    for i in range(1, len(cues)):
+        c = cues[i]
+        if c.get("type") != "dialogue" or not c.get("lines"):
+            continue
+        prev = cues[i - 1]
+        if prev.get("type") != "dialogue" or not prev.get("lines"):
+            continue
+        last_prev = (prev["lines"][-1] or "").strip()
+        if not last_prev or last_prev[-1] not in ".,":
+            continue
+        first_line = (c["lines"][0] or "").strip()
+        if not first_line:
+            continue
+        prefix = ""
+        if first_line.startswith("- "):
+            prefix, first_line = "- ", first_line[2:].lstrip()
+        words = first_line.split()
+        if not words or words[0].lower() not in CONTINUATION_STARTERS:
+            continue
+        words[0] = words[0].lower()
+        c["lines"][0] = prefix + " ".join(words)
+    return cues
+
+
 def _resolve_dialogue_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Remove overlaps: if a dialogue cue extends past the next cue's start, shift the next start to the previous end."""
     cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c.get("type") == "dialogue" else 1))
@@ -1309,12 +1377,18 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
                 out.extend(format_dialogue_atom(make_atom([runs[1]], False, cue), protected))
                 continue
             cue["lines"] = [f"- {left}", f"- {right}"]
-            cue["lines"] = [repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS] for x in cue["lines"] if repair_continuing_punctuation(normalize_space(x))]
+            cue["lines"] = [
+                capitalize_i_pronoun(repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS])
+                for x in cue["lines"] if repair_continuing_punctuation(normalize_space(x))
+            ]
         else:
             text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
             cue["meta"]["dialogue_text"] = text
             cue["lines"] = best_layout(text, protected)
-        cue["lines"] = [repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS] for x in cue.get("lines", []) if repair_continuing_punctuation(normalize_space(x))]
+        cue["lines"] = [
+            capitalize_i_pronoun(repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS])
+            for x in cue.get("lines", []) if repair_continuing_punctuation(normalize_space(x))
+        ]
         if cue["lines"]:
             out.append(cue)
 
@@ -1328,6 +1402,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     final = _apply_minimum_display_duration(final)
     final = _apply_sound_min_duration(final)
     final = _resolve_dialogue_overlaps(final)
+    final = _lowercase_continuation_at_cue_start(final)
     return final
 
 if __name__ == "__main__":
