@@ -152,6 +152,8 @@ def process_caption_job(
         aligned = slice_tokens_to_dialogue(candidate_tokens, win["dialogue_text"])
         if aligned:
             win["tokens"] = aligned
+            # Use AssemblyAI as source: preserve its punctuation (no phrase-specific overrides)
+            win["dialogue_text"] = normalize_space(join_tokens(aligned))
         else:
             win["tokens"] = [t for t in tokens if t["start_ms"] < win["end_ms"] and t["end_ms"] > win["start_ms"] and not token_is_sound(t["text"])]
         win["runs"] = build_runs_from_tokens(win["tokens"], win["dialogue_text"])
@@ -295,9 +297,7 @@ def repair_continuing_punctuation(text: str) -> str:
     text = normalize_space(text)
     if not text:
         return text
-    # Use commas where the sentence is continuing; periods only at real sentence stop (broadcast spec).
-    # Appositives: "I'm your host. Andy" -> "I'm your host, Andy"
-    text = re.sub(r"\b([Ii]'?m your host)\. ([A-Z][A-Za-z]+(?: [A-Z][A-Za-z]+){0,2})\b", r"\1, \2", text)
+    # Only period->comma for continuing thought (broadcast). Never comma->period. No phrase-specific rules.
     # Period before continuation words/phrases -> comma (broadcast: no period when thought continues)
     text = re.sub(
         r"\. (?=(?:right|okay|ok|speaking|please|because|which|who|where|when|while|though|that|if|but|and|or|so|then|now|listen|well|hey|oh|mean|know|this is|this was|it is|it was|everybody|really|it's|that's|what's|there's|here's|we're|they're)\b)",
@@ -647,10 +647,12 @@ def build_runs_from_tokens(tokens: List[Dict[str, Any]], fallback_text: str) -> 
         if not text:
             return []
         return [{"speaker": "A", "text": text, "start_ms": 0, "end_ms": 0, "tokens": []}]
+    # Use AssemblyAI token text as-is (only normalize + universal ASR fixes); preserve punctuation
+    token_text = normalize_space(join_tokens(tokens))
     if len({(t.get("speaker") or "A") for t in tokens}) == 1:
         return [{
             "speaker": tokens[0].get("speaker") or "A",
-            "text": apply_asr_corrections(repair_continuing_punctuation(text or join_tokens(tokens))),
+            "text": apply_asr_corrections(token_text or text),
             "start_ms": tokens[0]["start_ms"],
             "end_ms": tokens[-1]["end_ms"],
             "tokens": tokens,
@@ -669,9 +671,10 @@ def build_runs_from_tokens(tokens: List[Dict[str, Any]], fallback_text: str) -> 
 
 
 def run_from_tokens(tokens: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Preserve AssemblyAI punctuation; only universal ASR corrections
     return {
         "speaker": tokens[0]["speaker"] or "A",
-        "text": apply_asr_corrections(repair_continuing_punctuation(join_tokens(tokens))),
+        "text": apply_asr_corrections(normalize_space(join_tokens(tokens))),
         "start_ms": tokens[0]["start_ms"],
         "end_ms": tokens[-1]["end_ms"],
         "tokens": tokens,
