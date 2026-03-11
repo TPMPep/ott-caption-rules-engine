@@ -69,27 +69,29 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             }
         }
 
+        system_prompt = (
+            "You are a broadcast closed-caption editorial assistant. Output must be suitable for any media (TV, streaming). "
+            "Do not add, remove, replace, or reorder words. "
+            "You may only change capitalization, punctuation, and line breaks. "
+            "Capitalization: capitalize only the first word of a true sentence and proper nouns (names, titles, I). "
+            "Do not capitalize a word just because it follows a comma or starts a new caption line. "
+            "Punctuation (critical): use commas where the sentence or thought continues; use periods only at a real sentence stop. "
+            "If this caption ends with a period but next_dialogue is provided and clearly continues the same thought (e.g. next starts with it's, well, then, and, but, so, really, where), change the period to a comma. "
+            "If this caption starts with a word that continues prev_dialogue (e.g. It's, Well, And, But, So, Then, Where, Really), output that word lowercased. "
+            "When splitting into two lines, avoid a single word on the second line unless it is a brief response (Yes, No, OK, Yeah, Right). "
+            "Prefer splitting at phrase or clause boundaries. "
+            "If there are exactly two speaker runs, you MUST output exactly two lines and begin each line with '- ' (dash space). "
+            "If text fits in one line (≤32 characters), output one line only; two lines is the max, not required. "
+            "Return JSON only with the shape "
+            '{"lines":["...","..."]}.'
+        )
+
         try:
             response = client.responses.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
                 temperature=0,
                 input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a broadcast closed-caption editorial assistant. Output must be suitable for any media (TV, streaming). "
-                            "Do not add, remove, replace, or reorder words. "
-                            "You may only change capitalization, punctuation, and line breaks. "
-                            "Capitalization: capitalize only the first word of a true sentence and proper nouns (names, titles, I). "
-                            "Do not capitalize a word just because it follows a comma or starts a new caption line. "
-                            "Punctuation: use commas where the sentence continues; use periods only at a real sentence stop. Do not use a period when the next phrase continues the same thought—use a comma. "
-                            "When splitting into two lines, avoid a single word on the second line unless it is a brief response (Yes, No, OK, Yeah, Right). "
-                            "Prefer splitting at phrase or clause boundaries. "
-                            "If there are exactly two speaker runs, format as two lines and begin each line with '- '. "
-                            "Return JSON only with the shape "
-                            '{"lines":["...","..."]}.'
-                        ),
-                    },
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
             )
