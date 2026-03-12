@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -90,11 +91,11 @@ except Exception:
 MAX_LINES = 2
 MAX_CHARS = 32
 MAX_CUE_CHARS = MAX_LINES * MAX_CHARS
-TARGET_CPS = 18.0
-MAX_CPS = 20.0
+TARGET_CPS = 27.0
+MAX_CPS = 45.0
 MIN_DIALOGUE_MS = 800
-MIN_DISPLAY_MS = 1200  # Broadcast: minimum on-screen time so captions are readable
-MIN_SOUND_DISPLAY_MS = 1000  # Minimum on-screen time for sound cues (broadcast)
+MIN_DISPLAY_MS = 800  # Broadcast: minimum on-screen time so captions are readable
+MIN_SOUND_DISPLAY_MS = 800  # Minimum on-screen time for sound cues (broadcast)
 MIN_SOUND_MS = 700
 TARGET_SOUND_MS = 1800
 MAX_SOUND_MS = 3500
@@ -104,7 +105,7 @@ SAME_SPEAKER_HARD_GAP_MS = 3200
 SOUND_CLUSTER_GAP_MS = 700
 TWO_SPEAKER_GAP_MS = 900
 MAX_TWO_SPEAKER_WINDOW_MS = 4500
-INLINE_DIALOGUE_TAGS = {"[INAUDIBLE]", "[UNINTELLIGIBLE]"}
+INLINE_DIALOGUE_TAGS = {"[INAUDIBLE]", "[UNINTELLIGIBLE]", "[BLEEP]", "[BLEEPED]"}
 FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for",
     "that", "this", "these", "those", "is", "are", "was", "were", "be", "been", "being", "it", "i",
@@ -112,8 +113,8 @@ FUNCTION_WORDS = {
 WEAK_ENDS = FUNCTION_WORDS | {"who", "what", "which", "when", "where", "why", "how", "well", "still"}
 WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that", "this", "these", "those"}
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
-ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]"}
-SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4}
+ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]"}
+SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5}
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
 ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
 # Words that must not be the only content on a second line (broadcast: no one-word weak second lines)
@@ -131,6 +132,108 @@ BRIDGE_PAD_MS = 120
 TAG_RE = re.compile(r"\[[^\]]+\]")
 WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 TITLEISH_RE = re.compile(r"^[A-Z][A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?$|^[A-Z0-9]{2,}$")
+STYLE_TAG_RE = re.compile(r"\{\\+an\d\}")
+ITALIC_TAG_RE = re.compile(r"</?i>")
+
+TIMECODE_OFFSET_MS = int(os.getenv("TIMECODE_OFFSET_MS", "0") or 0)
+ALIGNMENT_DEFAULT = os.getenv("ALIGNMENT_DEFAULT", "an2")  # an2/an8/none
+ITALICIZE_PHRASES_RAW = os.getenv("ITALICIZE_PHRASES", "").strip()
+
+
+def _parse_timecode(tc: str) -> Optional[int]:
+    """Parse HH:MM:SS,mmm to ms."""
+    try:
+        hh, mm, ssms = tc.strip().split(":")
+        ss, ms = ssms.split(",")
+        return ((int(hh) * 60 + int(mm)) * 60 + int(ss)) * 1000 + int(ms)
+    except Exception:
+        return None
+
+
+def _parse_alignment_windows() -> List[Tuple[int, int, str]]:
+    """
+    Optional alignment windows via env ALIGNMENT_WINDOWS as JSON list:
+    [{"start":"HH:MM:SS,mmm","end":"HH:MM:SS,mmm","align":"an8"}]
+    """
+    raw = os.getenv("ALIGNMENT_WINDOWS", "").strip()
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+    except Exception:
+        return []
+    out = []
+    for item in items:
+        start = _parse_timecode(item.get("start", ""))
+        end = _parse_timecode(item.get("end", ""))
+        align = str(item.get("align", "")).strip().lower()
+        if start is None or end is None:
+            continue
+        if align not in {"an2", "an8"}:
+            continue
+        out.append((start, end, align))
+    return out
+
+
+ALIGNMENT_WINDOWS = _parse_alignment_windows()
+
+
+def _alignment_for_cue(start_ms: int, end_ms: int) -> Optional[str]:
+    if ALIGNMENT_DEFAULT.lower() == "none":
+        return None
+    for s, e, align in ALIGNMENT_WINDOWS:
+        if start_ms >= s and end_ms <= e:
+            return align
+    return ALIGNMENT_DEFAULT.lower()
+
+
+def _strip_style_tags(text: str) -> str:
+    return ITALIC_TAG_RE.sub("", STYLE_TAG_RE.sub("", text or ""))
+
+
+def _visible_len(text: str) -> int:
+    return len(_strip_style_tags(text))
+
+
+def _truncate_visible(text: str, max_chars: int) -> str:
+    if _visible_len(text) <= max_chars:
+        return text
+    out = ""
+    count = 0
+    i = 0
+    italic_open = False
+    while i < len(text) and count < max_chars:
+        if text.startswith("{\\an", i):
+            end = text.find("}", i)
+            if end != -1:
+                out += text[i:end + 1]
+                i = end + 1
+                continue
+        if text.startswith("<i>", i):
+            out += "<i>"
+            italic_open = True
+            i += 3
+            continue
+        if text.startswith("</i>", i):
+            out += "</i>"
+            italic_open = False
+            i += 4
+            continue
+        out += text[i]
+        count += 1
+        i += 1
+    if italic_open and "</i>" not in out:
+        out += "</i>"
+    return out.rstrip()
+
+def _parse_italicize_phrases() -> List[str]:
+    if not ITALICIZE_PHRASES_RAW:
+        return []
+    parts = [p.strip() for p in ITALICIZE_PHRASES_RAW.split(",") if p.strip()]
+    return sorted({p for p in parts if len(p) >= 2}, key=len, reverse=True)
+
+
+ITALICIZE_PHRASES = _parse_italicize_phrases()
 
 
 def process_caption_job(
@@ -181,9 +284,12 @@ def process_caption_job(
     for i, cue in enumerate(cues, 1):
         cue["idx"] = i
 
-    srt_out = _export_srt(cues)
-    vtt_out = _export_vtt(cues) if "vtt" in output_formats else None
-    scc_out = _export_scc(cues) if "scc" in output_formats else None
+    cues_for_export = apply_timecode_offset(cues, TIMECODE_OFFSET_MS)
+    cues_for_export = apply_alignment_tags(cues_for_export, TIMECODE_OFFSET_MS)
+
+    srt_out = _export_srt(cues_for_export)
+    vtt_out = _export_vtt(cues_for_export) if "vtt" in output_formats else None
+    scc_out = _export_scc(cues_for_export) if "scc" in output_formats else None
     qc = _qc_report(len(backbone), cues, protected)
     return {"srt": srt_out, "vtt": vtt_out, "scc": scc_out, "qc": qc}
 
@@ -202,6 +308,18 @@ def normalize_tokens(timestamps: Any) -> List[Dict[str, Any]]:
         if end <= start:
             end = start + 1
         out.append({"text": text, "start_ms": start, "end_ms": end, "speaker": str(item.get("speaker") or "A")})
+    # Inline bleep: if a short [NOISE]/[SOUND] is between words, keep it inline as [BLEEP]
+    for i, tok in enumerate(out):
+        tag = (tok.get("text") or "").strip().upper()
+        if tag not in {"[NOISE]", "[SOUND]"}:
+            continue
+        dur = tok["end_ms"] - tok["start_ms"]
+        if dur > 350:
+            continue
+        prev_is_word = i > 0 and not token_is_sound(out[i - 1].get("text", ""))
+        next_is_word = i + 1 < len(out) and not token_is_sound(out[i + 1].get("text", ""))
+        if prev_is_word and next_is_word:
+            tok["text"] = "[BLEEP]"
     out.sort(key=lambda x: (x["start_ms"], x["end_ms"]))
     return out
 
@@ -241,6 +359,35 @@ def token_match_word(text: str) -> str:
 
 def join_tokens(tokens: Sequence[Dict[str, Any]]) -> str:
     return normalize_space(" ".join(t["text"] for t in tokens))
+
+
+def apply_italics(text: str, phrases: Sequence[str]) -> str:
+    if not text or not phrases:
+        return text
+
+    def italics_segment(seg: str) -> str:
+        if "<i>" in seg or "</i>" in seg:
+            return seg
+        out = seg
+        for phrase in phrases:
+            if not phrase:
+                continue
+            pattern = re.compile(rf"\\b{re.escape(phrase)}\\b", re.I)
+
+            def wrap(m: re.Match) -> str:
+                return f"<i>{m.group(0)}</i>"
+
+            out = pattern.sub(wrap, out)
+        return out
+
+    parts: List[str] = []
+    last = 0
+    for m in TAG_RE.finditer(text):
+        parts.append(italics_segment(text[last:m.start()]))
+        parts.append(m.group(0))
+        last = m.end()
+    parts.append(italics_segment(text[last:]))
+    return "".join(parts)
 
 
 def strip_non_dialogue_tags(text: str) -> str:
@@ -299,25 +446,9 @@ def repair_continuing_punctuation(text: str) -> str:
     text = normalize_space(text)
     if not text:
         return text
-    # Only period->comma for continuing thought (broadcast). Never comma->period. No phrase-specific rules.
-    # Period before continuation words/phrases -> comma (broadcast: no period when thought continues)
-    text = re.sub(
-        r"\. (?=(?:right|okay|ok|speaking|please|because|which|who|where|when|while|though|that|if|but|and|or|so|then|now|listen|well|hey|oh|mean|know|this is|this was|it is|it was|everybody|really|it's|that's|what's|there's|here's|we're|they're)\b)",
-        ", ",
-        text,
-        flags=re.I,
-    )
-    text = re.sub(r"\b(Yes|No)\. (?=(?:yes|no)\b)", r"\1, ", text)
-    text = re.sub(r"\b([A-Z][a-z]*)\. (?=(?:welcome|speaking|wearing|thank|please|because|and|but|or|so|then|now|the|that|this|they|we|you|I)\b)", r"\1, ", text, flags=re.I)
-    text = re.sub(r"\b(everybody|host|else|tonight)\. (?=[a-z])", r"\1, ", text, flags=re.I)
+    # Only period->comma for continuing thought (broadcast). Never comma->period.
     # If a period is followed by a lowercase word, treat as continuing phrase.
-    text = re.sub(r"(?<![A-Z])\. (?=[a-z])", ", ", text)
-    # Explicit period + continuation word -> comma + lowercase (broadcast: no false sentence breaks)
-    for word in ("It's", "But", "So", "And", "Well", "Now", "This", "That", "They", "We", "He", "She", "Because", "Which", "Then", "Or", "If", "Oh", "Really", "Wow", "There", "Hey", "OK", "Okay"):
-        text = re.sub(r"\.\s+" + word + r"\b", ", " + word.lower(), text)
-    # Period before "I " or "And " (continuation) -> comma so next phrase isn't treated as new sentence
-    text = re.sub(r"\.\s+I\s+", ", I ", text)
-    text = re.sub(r"\.\s+And\s+", ", and ", text, flags=re.I)
+    text = re.sub(r"\.\s+(?=[a-z])", ", ", text)
     # Comma then capital (mid-sentence continuation): lowercase so not sentence start (broadcast spec).
     for word in (
         "You", "She", "He", "They", "This", "That", "What", "When", "Where", "Which", "Who", "How",
@@ -498,7 +629,11 @@ def normalize_sound_label(text: str) -> str:
     parts = [p.strip() for p in re.split(r"\s+AND\s+|\s*,\s*|\s*/\s*", inner) if p.strip()]
     labels: List[str] = []
     for part in parts:
-        if part in {"NOISE", "SOUND", "VOICE", "SPEAKER", "PAUSE", "TALKING", "CROSSTALK"}:
+        if part in {"NOISE", "SOUND", "SFX", "FX", "VOICE", "SPEAKER", "PAUSE", "TALKING", "CROSSTALK"}:
+            if part in {"NOISE", "SOUND", "SFX", "FX"}:
+                label = "[SFX]"
+                if label not in labels:
+                    labels.append(label)
             continue
         if part.startswith("MUSIC") or part == "SONG":
             label = "[MUSIC]"
@@ -710,7 +845,7 @@ def can_two_speaker(runs: List[Dict[str, Any]]) -> bool:
         return False
     if runs[1]["end_ms"] - runs[0]["start_ms"] > MAX_TWO_SPEAKER_WINDOW_MS:
         return False
-    return all(len(normalize_space(r["text"])) <= MAX_CHARS - 2 and text_word_count(normalize_space(r["text"])) <= 8 for r in runs)
+    return all(_visible_len(normalize_space(r["text"])) <= MAX_CHARS - 2 and text_word_count(normalize_space(r["text"])) <= 8 for r in runs)
 
 
 def make_atom(runs: List[Dict[str, Any]], two_speaker: bool, win: Dict[str, Any]) -> Dict[str, Any]:
@@ -765,7 +900,7 @@ def pack_adjacent_two_speaker(atoms: List[Dict[str, Any]]) -> List[Dict[str, Any
             if not atom["meta"].get("two_speaker") and not nxt["meta"].get("two_speaker") and len(ar) == len(nr) == 1 and ar[0]["speaker"] != nr[0]["speaker"]:
                 left = normalize_space(ar[0]["text"])
                 right = normalize_space(nr[0]["text"])
-                if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2 and text_word_count(left) <= 8 and text_word_count(right) <= 8 and nxt["start_ms"] - atom["end_ms"] <= TWO_SPEAKER_GAP_MS and nxt["end_ms"] - atom["start_ms"] <= MAX_TWO_SPEAKER_WINDOW_MS:
+                if _visible_len(left) <= MAX_CHARS - 2 and _visible_len(right) <= MAX_CHARS - 2 and text_word_count(left) <= 8 and text_word_count(right) <= 8 and nxt["start_ms"] - atom["end_ms"] <= TWO_SPEAKER_GAP_MS and nxt["end_ms"] - atom["start_ms"] <= MAX_TWO_SPEAKER_WINDOW_MS:
                     packed.append({
                         "idx": 0,
                         "start_ms": atom["start_ms"],
@@ -790,13 +925,13 @@ def format_dialogue_atom(atom: Dict[str, Any], protected: List[str]) -> List[Dic
         right = normalize_space(runs[1]["text"])
         duration_ms = atom["end_ms"] - atom["start_ms"]
         duration_s = max(duration_ms / 1000.0, 0.001)
-        total_chars = len(left) + len(right) + 4  # "- " per line
+        total_chars = _visible_len(left) + _visible_len(right) + 4  # "- " per line
         cps = total_chars / duration_s
         # Short exchange (e.g. "Thank you." / "Who made this?"): keep as one two-line cue so min duration applies once.
         # Only split when CPS is high and (duration long or text long) so we don't create sub-second single-line cues.
         if cps > MAX_CPS and (duration_s >= 2.0 or total_chars > 45):
             return [format_dialogue_atom(make_atom([run], False, atom), protected)[0] for run in runs]
-        if len(left) <= MAX_CHARS - 2 and len(right) <= MAX_CHARS - 2:
+        if _visible_len(left) <= MAX_CHARS - 2 and _visible_len(right) <= MAX_CHARS - 2:
             out = atom.copy()
             out["lines"] = [f"- {left}", f"- {right}"]
             return [out]
@@ -936,9 +1071,9 @@ def maybe_best_layout(text: str, protected: List[str]) -> Optional[List[str]]:
     if not text:
         return None
     # Broadcast: if it fits in one line (≤32 chars), use one line; 2 lines is max, not required
-    if len(text) <= MAX_CHARS:
+    if _visible_len(text) <= MAX_CHARS:
         return [text]
-    if len(text) > MAX_CUE_CHARS:
+    if _visible_len(text) > MAX_CUE_CHARS:
         return None
     return best_two_line_split(text, protected)
 
@@ -950,25 +1085,38 @@ def best_layout(text: str, protected: List[str]) -> List[str]:
     words = text.split()
     if not words:
         return []
-    best = [words[0][:MAX_CHARS]]
+    best = [_truncate_visible(words[0], MAX_CHARS)]
     if len(words) > 1:
         remainder = normalize_space(" ".join(words[1:]))
         if remainder:
-            best.append(remainder[:MAX_CHARS].rstrip())
+            best.append(_truncate_visible(remainder, MAX_CHARS).rstrip())
     return best[:MAX_LINES]
 
 
 def best_two_line_split(text: str, protected: List[str]) -> Optional[List[str]]:
     words = text.split()
     candidates: List[Tuple[float, List[str]]] = []
+    protected_blocked: List[Tuple[float, List[str]]] = []
     for i in range(1, len(words)):
         left = normalize_space(" ".join(words[:i]))
         right = normalize_space(" ".join(words[i:]))
-        if len(left) > MAX_CHARS or len(right) > MAX_CHARS:
+        if _visible_len(left) > MAX_CHARS or _visible_len(right) > MAX_CHARS:
             continue
         lines = [left, right]
+        if boundary_splits_protected(left, right, protected):
+            protected_blocked.append((split_layout_score(lines, protected) + 60, lines))
+            continue
+        # Avoid weak function words at end/start unless unavoidable
+        left_last = sanitize_last_word(left).lower()
+        right_first = right.split()[0].lower() if right.split() else ""
+        if left_last in WEAK_ENDS or right_first in WEAK_STARTS:
+            protected_blocked.append((split_layout_score(lines, protected) + 40, lines))
+            continue
         candidates.append((split_layout_score(lines, protected), lines))
     if not candidates:
+        if protected_blocked:
+            protected_blocked.sort(key=lambda x: x[0])
+            return protected_blocked[0][1]
         return None
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
@@ -976,7 +1124,7 @@ def best_two_line_split(text: str, protected: List[str]) -> Optional[List[str]]:
 
 def split_layout_score(lines: List[str], protected: List[str]) -> float:
     left, right = lines
-    score = abs(len(left) - len(right)) * 0.7
+    score = abs(_visible_len(left) - _visible_len(right)) * 0.7
     # Prefer splitting at sentence boundary so full sentence starts on new line (broadcast)
     if re.search(r"[.!?]$", left):
         score -= 14
@@ -992,9 +1140,9 @@ def split_layout_score(lines: List[str], protected: List[str]) -> float:
         score += 50
     if len(left.split()) == 1:
         score += 28
-    if len(right) < 8:
+    if _visible_len(right) < 8:
         score += 12
-    if len(left) < 8:
+    if _visible_len(left) < 8:
         score += 10
     if boundary_splits_protected(left, right, protected):
         score += 40
@@ -1279,7 +1427,7 @@ def resolve_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for cue in cues:
         cue = dict(cue)
-        cue["lines"] = [normalize_space(line)[:MAX_CHARS] for line in cue.get("lines", []) if normalize_space(line)]
+        cue["lines"] = [_truncate_visible(normalize_space(line), MAX_CHARS) for line in cue.get("lines", []) if normalize_space(line)]
         if not cue["lines"]:
             continue
         if not out:
@@ -1348,7 +1496,7 @@ def _split_at_em_dash_segment(text: str) -> Optional[Tuple[str, str]]:
         return None
     # Keep dash on first line; both parts must fit line length
     left = left + "—"
-    if len(left) > MAX_CHARS - 2 or len(right) > MAX_CHARS - 2:
+    if _visible_len(left) > MAX_CHARS - 2 or _visible_len(right) > MAX_CHARS - 2:
         return None
     return (left, right)
 
@@ -1381,7 +1529,7 @@ def _fix_weak_second_line(cues: List[Dict[str, Any]], protected: List[str]) -> L
             continue
         # Second line is weak (e.g. "Well." "Still." "Yeah."). Try merge with next or fold.
         combined_one_line = normalize_space(f"{lines[0]} {second}")
-        if len(combined_one_line) <= MAX_CHARS:
+        if _visible_len(combined_one_line) <= MAX_CHARS:
             c = dict(c)
             c["lines"] = [combined_one_line]
             if c.get("meta"):
@@ -1485,6 +1633,9 @@ def _cross_cue_period_to_comma(cues: List[Dict[str, Any]]) -> List[Dict[str, Any
         words = first_line.split()
         if not words or words[0].lower() not in CONTINUATION_STARTERS:
             continue
+        # Only treat as continuation if the word is already lowercase in the cue
+        if words[0][:1].isupper():
+            continue
         # Replace period with comma on previous cue's last line
         cur["lines"][-1] = cur["lines"][-1].rstrip()
         if cur["lines"][-1].endswith("."):
@@ -1549,33 +1700,36 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
         if cue.get("meta", {}).get("two_speaker") and len(runs) == 2:
             left = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[0]["text"])))
             right = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[1]["text"])))
+            left = apply_italics(left, ITALICIZE_PHRASES)
+            right = apply_italics(right, ITALICIZE_PHRASES)
             duration_ms = cue["end_ms"] - cue["start_ms"]
             duration_s = max(duration_ms / 1000.0, 0.001)
-            total_chars = len(left) + len(right) + 4
+            total_chars = _visible_len(left) + _visible_len(right) + 4
             cps = total_chars / duration_s
             # Keep short multi-speaker exchanges as one cue (two lines); only split when CPS high and not a quick back-and-forth.
             split_for_cps = cps > MAX_CPS and (duration_s >= 2.0 or total_chars > 45)
-            if split_for_cps or len(left) > MAX_CHARS - 2 or len(right) > MAX_CHARS - 2:
+            if split_for_cps or _visible_len(left) > MAX_CHARS - 2 or _visible_len(right) > MAX_CHARS - 2:
                 out.extend(format_dialogue_atom(make_atom([runs[0]], False, cue), protected))
                 out.extend(format_dialogue_atom(make_atom([runs[1]], False, cue), protected))
                 continue
             cue["lines"] = [f"- {left}", f"- {right}"]
             cue["lines"] = [
-                capitalize_i_pronoun(repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS])
+                capitalize_i_pronoun(_truncate_visible(repair_continuing_punctuation(normalize_space(x)), MAX_CHARS))
                 for x in cue["lines"] if repair_continuing_punctuation(normalize_space(x))
             ]
         else:
             text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
+            text = apply_italics(text, ITALICIZE_PHRASES)
             cue["meta"]["dialogue_text"] = text
             # If transcript uses em dash as segment/speaker separator, two lines each with dash
             split = _split_at_em_dash_segment(text)
             if split:
                 left, right = split
-                cue["lines"] = [f"- {left}"[:MAX_CHARS], f"- {right}"[:MAX_CHARS]]
+                cue["lines"] = [_truncate_visible(f"- {left}", MAX_CHARS), _truncate_visible(f"- {right}", MAX_CHARS)]
             else:
                 cue["lines"] = best_layout(text, protected)
         cue["lines"] = [
-            capitalize_i_pronoun(repair_continuing_punctuation(normalize_space(x))[:MAX_CHARS])
+            capitalize_i_pronoun(_truncate_visible(repair_continuing_punctuation(normalize_space(x)), MAX_CHARS))
             for x in cue.get("lines", []) if repair_continuing_punctuation(normalize_space(x))
         ]
         if cue["lines"]:
@@ -1610,6 +1764,36 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
             else:
                 c["speaker"] = str(runs[0].get("speaker") or "A") if runs else None
     return final
+
+
+def apply_timecode_offset(cues: List[Dict[str, Any]], offset_ms: int) -> List[Dict[str, Any]]:
+    if not offset_ms:
+        return cues
+    out: List[Dict[str, Any]] = []
+    for c in cues:
+        nc = dict(c)
+        nc["start_ms"] = max(0, int(c["start_ms"]) + offset_ms)
+        nc["end_ms"] = max(0, int(c["end_ms"]) + offset_ms)
+        out.append(nc)
+    return out
+
+
+def apply_alignment_tags(cues: List[Dict[str, Any]], offset_ms: int) -> List[Dict[str, Any]]:
+    if ALIGNMENT_DEFAULT.lower() == "none":
+        return cues
+    out: List[Dict[str, Any]] = []
+    for c in cues:
+        nc = dict(c)
+        lines = list(nc.get("lines", []))
+        if lines:
+            align = _alignment_for_cue(nc["start_ms"], nc["end_ms"])
+            if align:
+                tag = f"{{\\{align}}}"
+                if not STYLE_TAG_RE.match(lines[0]):
+                    lines[0] = tag + lines[0]
+        nc["lines"] = lines
+        out.append(nc)
+    return out
 
 if __name__ == "__main__":
     import sys
