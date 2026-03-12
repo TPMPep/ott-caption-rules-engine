@@ -7,6 +7,9 @@ MAX_LINES = 2
 MAX_CHARS = 32
 
 _WORD_RE = re.compile(r"\b[\w']+\b")
+_STYLE_TAG_RE = re.compile(r"\{\\+an\d\}")
+_ITALIC_TAG_RE = re.compile(r"</?i>")
+_WEAK_ENDS = {"a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for", "that"}
 
 
 def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
@@ -65,7 +68,8 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
                 "two_speaker_lines_must_start_with_dash": True,
                 "preserve_words_exactly": True,
                 "fix_punctuation_and_capitalization_only": True,
-                "prefer_phrase_and_punctuation_boundaries": True
+                "prefer_phrase_and_punctuation_boundaries": True,
+                "avoid_weak_function_word_line_endings": True
             }
         }
 
@@ -76,10 +80,12 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             "Capitalization: capitalize only the first word of a true sentence and proper nouns (names, titles, I). "
             "Do not capitalize a word just because it follows a comma or starts a new caption line. "
             "Punctuation (critical): use commas where the sentence or thought continues; use periods only at a real sentence stop. "
-            "If this caption ends with a period but next_dialogue is provided and clearly continues the same thought (e.g. next starts with it's, well, then, and, but, so, really, where), change the period to a comma. "
-            "If this caption starts with a word that continues prev_dialogue (e.g. It's, Well, And, But, So, Then, Where, Really), output that word lowercased. "
+            "Only change a period to a comma when the next dialogue clearly continues the same thought (e.g. next starts with a lowercase continuation word). "
+            "If this caption starts with a word that continues prev_dialogue (e.g. it's, well, and, but, so, then, where, really), output that word lowercased. "
             "When splitting into two lines, avoid a single word on the second line unless it is a brief response (Yes, No, OK, Yeah, Right). "
             "Prefer splitting at phrase or clause boundaries. "
+            "Do not split protected phrases across lines. "
+            "Avoid ending a line with weak function words (a, an, the, of, to, and, or, but, with, from, in, on, at, for, that) unless unavoidable. "
             "If there are exactly two speaker runs, you MUST output exactly two lines and begin each line with '- ' (dash space). "
             "If text fits in one line (≤32 characters), output one line only; two lines is the max, not required. "
             "Return JSON only with the shape "
@@ -114,7 +120,7 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             refined.append(cue)
             continue
 
-        if len(ai_lines) > MAX_LINES or any(len(line) > MAX_CHARS for line in ai_lines):
+        if len(ai_lines) > MAX_LINES or any(_visible_len(line) > MAX_CHARS for line in ai_lines):
             refined.append(cue)
             continue
 
@@ -152,3 +158,9 @@ def _normalize_lines(lines: List[str]) -> List[str]:
         if line:
             out.append(line)
     return out[:MAX_LINES]
+
+
+def _visible_len(text: str) -> int:
+    text = _STYLE_TAG_RE.sub("", text or "")
+    text = _ITALIC_TAG_RE.sub("", text or "")
+    return len(text)
