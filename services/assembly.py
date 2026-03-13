@@ -98,6 +98,34 @@ def wait_for_transcription_result(transcript_id: str) -> Dict[str, Any]:
     )
 
 
+def fetch_transcript_result(transcript_id: str, require_completed: bool = True) -> Dict[str, Any]:
+    response = requests.get(
+        f"{ASSEMBLYAI_BASE_URL}/transcript/{transcript_id}",
+        headers=_headers(),
+        timeout=120,
+    )
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"AssemblyAI fetch failed ({response.status_code}): {response.text}"
+        )
+
+    data = response.json()
+    status = data.get("status")
+
+    if status == "error":
+        raise RuntimeError(
+            f"AssemblyAI transcription failed: {data.get('error', 'Unknown error')}"
+        )
+
+    if require_completed and status != "completed":
+        raise RuntimeError(
+            f"AssemblyAI transcript not completed (status={status})"
+        )
+
+    return data
+
+
 def build_caption_inputs_from_assembly_result(
     assembly_result: Dict[str, Any]
 ) -> Tuple[str, List[Dict[str, Any]]]:
