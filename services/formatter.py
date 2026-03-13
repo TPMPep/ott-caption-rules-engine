@@ -742,6 +742,7 @@ def process_caption_job(
         formatted_dialogue.extend(format_dialogue_atom(atom, protected))
     formatted_dialogue = merge_fragment_dialogue_cues(formatted_dialogue, protected)
     formatted_dialogue = merge_dash_split_pairs(formatted_dialogue)
+    formatted_dialogue = merge_leading_fragment_into_dash_pairs(formatted_dialogue)
 
     token_sound_events = build_sound_events_from_tokens(tokens)
     merged_sound = merge_sound_events(sound_events + leading_sound_events + token_sound_events)
@@ -2157,6 +2158,59 @@ def merge_dash_split_pairs(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                             continue
         out.append(cur)
         i += 1
+    return out
+
+
+def merge_leading_fragment_into_dash_pairs(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    If a short single-speaker fragment immediately precedes a two-speaker dash cue,
+    fold that fragment into the first dash line when it fits.
+    """
+    if not cues:
+        return []
+    out: List[Dict[str, Any]] = []
+    for cue in cues:
+        if not out:
+            out.append(cue)
+            continue
+        prev = out[-1]
+        cur = cue
+        if (
+            prev.get("type") == "dialogue"
+            and cur.get("type") == "dialogue"
+            and not prev.get("meta", {}).get("two_speaker")
+            and cur.get("meta", {}).get("two_speaker")
+            and cur.get("lines")
+            and len(cur.get("lines", [])) == 2
+        ):
+            gap = cur["start_ms"] - prev["end_ms"]
+            if gap <= 900:
+                prev_text = repair_continuing_punctuation(normalize_space(prev.get("meta", {}).get("dialogue_text", " ".join(prev.get("lines", [])))))
+                # Only merge if previous looks like a fragment (no sentence-ending punctuation)
+                if prev_text and not re.search(r"[.!?]$", prev_text):
+                    left_line = cur["lines"][0]
+                    right_line = cur["lines"][1]
+                    left_text = left_line[2:].lstrip() if left_line.startswith("- ") else left_line
+                    right_text = right_line[2:].lstrip() if right_line.startswith("- ") else right_line
+                    combined_left = normalize_space(f"{prev_text} {left_text}")
+                    if _visible_len(f"- {combined_left}") <= MAX_CHARS and _visible_len(f"- {right_text}") <= MAX_CHARS:
+                        new = dict(cur)
+                        new["start_ms"] = prev["start_ms"]
+                        new["lines"] = [f"- {combined_left}", f"- {right_text}"]
+                        runs = (cur.get("meta", {}).get("runs", []) or [])
+                        prev_runs = (prev.get("meta", {}).get("runs", []) or [])
+                        if len(runs) == 2 and prev_runs:
+                            left_run = dict(runs[0])
+                            left_run["text"] = combined_left
+                            left_run["start_ms"] = prev["start_ms"]
+                            left_run["tokens"] = (prev_runs[0].get("tokens", []) or []) + (runs[0].get("tokens", []) or [])
+                            right_run = runs[1]
+                            new["meta"] = dict(cur.get("meta", {}))
+                            new["meta"]["runs"] = [left_run, right_run]
+                            new["meta"]["dialogue_text"] = normalize_space(f"{combined_left} {right_text}")
+                        out[-1] = new
+                        continue
+        out.append(cur)
     return out
 
 def build_sound_events_from_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
