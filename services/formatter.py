@@ -9,9 +9,14 @@ try:
     from services.assembly import normalize_tokens as _normalize_tokens, is_sound_token as _is_sound_token
 except Exception:
     def _normalize_tokens(timestamps: Any) -> List[Dict[str, Any]]:
-        source = []
+        source: List[Dict[str, Any]] = []
         if isinstance(timestamps, dict):
-            source = timestamps.get("words") or []
+            if isinstance(timestamps.get("words"), list):
+                source = list(timestamps.get("words") or [])
+            elif isinstance(timestamps.get("utterances"), list):
+                for utt in timestamps.get("utterances") or []:
+                    if isinstance(utt, dict) and isinstance(utt.get("words"), list):
+                        source.extend(utt.get("words") or [])
         elif isinstance(timestamps, list):
             source = timestamps
         out = []
@@ -296,8 +301,23 @@ SAME_SPEAKER_HARD_GAP_MS = 3200
 SOUND_CLUSTER_GAP_MS = 200
 TWO_SPEAKER_GAP_MS = 900
 MAX_TWO_SPEAKER_WINDOW_MS = 4500
-# Inline tags allowed to remain within dialogue (not treated as sound cues)
-INLINE_DIALOGUE_TAGS = {"[INAUDIBLE]", "[UNINTELLIGIBLE]"}
+# Inline tags allowed to remain within dialogue (not treated as sound cues).
+# For NBCU profile we force this to empty (no inline tags allowed).
+DEFAULT_INLINE_DIALOGUE_TAGS = {"[INAUDIBLE]", "[UNINTELLIGIBLE]"}
+INLINE_DIALOGUE_TAGS_RAW = os.getenv("INLINE_DIALOGUE_TAGS", "").strip()
+INLINE_DIALOGUE_TAGS = set(DEFAULT_INLINE_DIALOGUE_TAGS)
+if INLINE_DIALOGUE_TAGS_RAW:
+    INLINE_DIALOGUE_TAGS = set()
+    for part in INLINE_DIALOGUE_TAGS_RAW.split(","):
+        tag = part.strip()
+        if not tag:
+            continue
+        tag = tag.upper()
+        if not tag.startswith("["):
+            tag = f"[{tag}]"
+        if not tag.endswith("]"):
+            tag = f"{tag}]"
+        INLINE_DIALOGUE_TAGS.add(tag)
 FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for",
     "that", "this", "these", "those", "is", "are", "was", "were", "be", "been", "being", "it", "i",
@@ -307,6 +327,7 @@ WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that",
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
 ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]", "[BLEEP]"}
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5, "[BLEEP]": 6}
+MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
 ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
 # Words that must not be the only content on a second line (broadcast: no one-word weak second lines)
@@ -477,6 +498,9 @@ def _reduce_high_cps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _sound_trim_budget_ms() -> int:
+    # NBCU: never trim dialogue to make room for sound cues.
+    if CAPTION_PROFILE == "nbcu":
+        return 0
     if SOUND_DENSITY == "aggressive":
         return 700
     if SOUND_DENSITY == "balanced":
@@ -533,6 +557,7 @@ def _apply_profile_settings() -> None:
     global MIN_DISPLAY_MS, MIN_SOUND_DISPLAY_MS, MIN_SOUND_MS, SOUND_CLUSTER_GAP_MS, MERGE_GAP_MS
     global SPEAKER_LABEL_MODE, SPEAKER_LABEL_SINGLE, SPEAKER_LABEL_FORMAT, SOUND_LABEL_STYLE, ALIGNMENT_DEFAULT
     global SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
+    global INLINE_DIALOGUE_TAGS, ALLOWED_SOUND
     # NBCU profile locks
     if CAPTION_PROFILE == "nbcu":
         MAX_LINES = 2
@@ -551,6 +576,9 @@ def _apply_profile_settings() -> None:
         SOUND_LABEL_STYLE = "simple"
         ALIGNMENT_DEFAULT = "none"
         SOUND_DENSITY = "conservative"
+        INLINE_DIALOGUE_TAGS = set()
+        # NBCU: reactions + music only (music must be long; filtered later)
+        ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]", "[MUSIC]"}
         VALIDATE_TTML = "1" if VALIDATE_TTML == "" else VALIDATE_TTML
         FAIL_ON_TTML_VALIDATION = "1" if FAIL_ON_TTML_VALIDATION == "" else FAIL_ON_TTML_VALIDATION
     elif CAPTION_PROFILE == "custom":
@@ -616,6 +644,7 @@ def process_caption_job(
 
     token_sound_events = build_sound_events_from_tokens(tokens)
     merged_sound = merge_sound_events(sound_events + leading_sound_events + token_sound_events)
+    merged_sound = filter_sound_events(merged_sound)
     sound_cues = place_sound_events(merged_sound, formatted_dialogue)
 
     cues = formatted_dialogue + sound_cues
@@ -668,13 +697,17 @@ def normalize_tokens(timestamps: Any) -> List[Dict[str, Any]]:
 
 
 def token_is_sound(text: str) -> bool:
-    tag = (text or "").strip().upper()
-    if tag in INLINE_DIALOGUE_TAGS:
+    raw = (text or "").strip()
+    tag = raw
+    if re.match(r"^\[[^\]]+\][\.,!?]+$", raw):
+        tag = re.sub(r"[\.,!?]+$", "", raw)
+    tag_upper = tag.upper()
+    if tag_upper in INLINE_DIALOGUE_TAGS:
         return False
     try:
-        return bool(_is_sound_token(text)) and tag not in INLINE_DIALOGUE_TAGS
+        return bool(_is_sound_token(tag)) and tag_upper not in INLINE_DIALOGUE_TAGS
     except Exception:
-        return tag.startswith("[") and tag.endswith("]") and tag not in INLINE_DIALOGUE_TAGS
+        return tag.startswith("[") and tag.endswith("]") and tag_upper not in INLINE_DIALOGUE_TAGS
 
 
 def normalize_space(text: str) -> str:
@@ -1096,6 +1129,9 @@ def split_sound_and_dialogue(raw_text: str) -> Tuple[List[str], str, List[str]]:
 
 def normalize_sound_labels(text: str) -> List[str]:
     tag = normalize_space(text).upper()
+    # Allow bracketed tags with trailing punctuation (e.g. "[NOISE].")
+    if re.match(r"^\[[^\]]+\][\.,!?]+$", tag):
+        tag = re.sub(r"[\.,!?]+$", "", tag)
     if not (tag.startswith("[") and tag.endswith("]")):
         return []
     inner = tag[1:-1].strip().replace("♪", "MUSIC")
@@ -1770,6 +1806,22 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             current = ev.copy()
     merged.append(current)
     return merged
+
+
+def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not events:
+        return []
+    if CAPTION_PROFILE != "nbcu":
+        return events
+    out: List[Dict[str, Any]] = []
+    for ev in events:
+        label = ev.get("label")
+        if label not in ALLOWED_SOUND:
+            continue
+        if label == "[MUSIC]" and (ev["end_ms"] - ev["start_ms"]) < MUSIC_LONG_ONLY_MS:
+            continue
+        out.append(ev)
+    return out
 
 
 def expand_sound_sequence(labels: List[str], start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
