@@ -330,17 +330,23 @@ def _parse_inline_dialogue_tags(raw: str) -> set:
 
 
 INLINE_DIALOGUE_TAGS = _parse_inline_dialogue_tags(INLINE_DIALOGUE_TAGS_RAW)
+# NBCU guidance: avoid ending lines with weak function words when possible.
 FUNCTION_WORDS = {
-    "a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for",
-    "that", "this", "these", "those", "is", "are", "was", "were", "be", "been", "being", "it", "i",
+    "a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for", "that",
 }
 WEAK_ENDS = FUNCTION_WORDS | {"who", "what", "which", "when", "where", "why", "how", "well", "still"}
 WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that", "this", "these", "those"}
+DETERMINER_ENDS = {"a", "an", "the", "this", "that", "these", "those", "my", "your", "his", "her", "our", "their", "its"}
+PREPOSITION_STARTS = {"of", "for", "to", "about", "into", "from", "with", "in", "on", "at", "by", "over", "under", "after", "before", "between", "through", "without"}
+PREPOSITION_ENDS = set(PREPOSITION_STARTS)
+AUX_ENDS = {"i'm", "i've", "i'd", "you're", "you've", "you'd", "we're", "we've", "we'd", "they're", "they've", "they'd", "he's", "she's", "it's"}
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
 DEFAULT_ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]", "[BLEEP]"}
 ALLOWED_SOUND = set(DEFAULT_ALLOWED_SOUND)
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5, "[BLEEP]": 6}
 MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
+PAUSE_ELLIPSIS = os.getenv("PAUSE_ELLIPSIS", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+PAUSE_ELLIPSIS_MS = int(os.getenv("PAUSE_ELLIPSIS_MS", "1500") or 1500)
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
 ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
 # Words that must not be the only content on a second line (broadcast: no one-word weak second lines)
@@ -625,6 +631,7 @@ def _reload_config_from_env() -> None:
     global SOUND_LABEL_STYLE, TTML_TIMEBASE, TTML_FRAME_RATE, TTML_FRAME_RATE_MULTIPLIER, TTML_TEXT_ALIGN
     global OUTPUT_FORMATS_ENV, CAPTION_PROFILE, SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
     global INLINE_DIALOGUE_TAGS_RAW, INLINE_DIALOGUE_TAGS, ITALICIZE_PHRASES, SPEAKER_NAME_MAP, MUSIC_LONG_ONLY_MS
+    global PAUSE_ELLIPSIS, PAUSE_ELLIPSIS_MS
     global EM_DASH_SPLIT_RAW, EM_DASH_SPLIT
 
     TIMECODE_OFFSET_MS = int(os.getenv("TIMECODE_OFFSET_MS", "0") or 0)
@@ -656,6 +663,8 @@ def _reload_config_from_env() -> None:
     EM_DASH_SPLIT = EM_DASH_SPLIT_RAW.lower() in {"1", "true", "yes", "y", "on"}
     INLINE_DIALOGUE_TAGS = _parse_inline_dialogue_tags(INLINE_DIALOGUE_TAGS_RAW)
     MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
+    PAUSE_ELLIPSIS = os.getenv("PAUSE_ELLIPSIS", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    PAUSE_ELLIPSIS_MS = int(os.getenv("PAUSE_ELLIPSIS_MS", "1500") or 1500)
 
     _apply_profile_settings()
     ITALICIZE_PHRASES = _parse_italicize_phrases()
@@ -799,6 +808,41 @@ def normalize_space(text: str) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     text = re.sub(r"\s+([,.;:?!])", r"\1", text)
     return text.strip()
+
+
+def apply_pause_ellipsis(text: str, tokens: List[Dict[str, Any]]) -> str:
+    """
+    Insert ellipsis when there is a long pause inside a single-speaker cue
+    and the segment is an incomplete sentence.
+    """
+    if not PAUSE_ELLIPSIS or not tokens:
+        return text
+    words = [t.get("text", "") for t in tokens if t.get("text")]
+    if len(words) < 2:
+        return text
+    inserts: List[int] = []
+    for i in range(len(tokens) - 1):
+        gap = int(tokens[i + 1]["start_ms"]) - int(tokens[i]["end_ms"])
+        if gap < PAUSE_ELLIPSIS_MS:
+            continue
+        segment = normalize_space(" ".join(words[: i + 1]))
+        if not segment:
+            continue
+        if segment.endswith("...") or segment.endswith("…"):
+            continue
+        if re.search(r"[.!?]$", segment):
+            continue
+        inserts.append(i + 1)
+    if not inserts:
+        return text
+    insert_set = set(inserts)
+    new_words: List[str] = []
+    for idx, w in enumerate(words):
+        if idx + 1 in insert_set and not w.endswith("...") and not w.endswith("…"):
+            new_words.append(w.rstrip(".") + "...")
+        else:
+            new_words.append(w)
+    return normalize_space(" ".join(new_words))
 
 
 def flatten_words(text: str) -> List[str]:
@@ -1800,6 +1844,24 @@ def best_layout(text: str, protected: List[str]) -> List[str]:
 
 def best_two_line_split(text: str, protected: List[str]) -> Optional[List[str]]:
     words = text.split()
+    ellipsis_idx: Optional[int] = None
+    for i, w in enumerate(words):
+        if "..." in w or "…" in w:
+            ellipsis_idx = i
+            break
+    ellipsis_split_ok = False
+    ellipsis_left: Optional[str] = None
+    ellipsis_right: Optional[str] = None
+    if ellipsis_idx is not None and ellipsis_idx + 1 < len(words):
+        left = normalize_space(" ".join(words[:ellipsis_idx + 1]))
+        right = normalize_space(" ".join(words[ellipsis_idx + 1:]))
+        if left and right and _visible_len(left) <= MAX_CHARS and _visible_len(right) <= MAX_CHARS:
+            ellipsis_split_ok = True
+            ellipsis_left = left
+            ellipsis_right = right
+    # If pause ellipsis creates a very short lead-in, prefer breaking right after it.
+    if ellipsis_split_ok and ellipsis_left and ellipsis_right and _visible_len(ellipsis_left) <= 10:
+        return [ellipsis_left, ellipsis_right]
     candidates: List[Tuple[float, List[str]]] = []
     protected_blocked: List[Tuple[float, List[str]]] = []
     for i in range(1, len(words)):
@@ -1809,15 +1871,15 @@ def best_two_line_split(text: str, protected: List[str]) -> Optional[List[str]]:
             continue
         lines = [left, right]
         if boundary_splits_protected(left, right, protected):
-            protected_blocked.append((split_layout_score(lines, protected) + 60, lines))
+            score = split_layout_score(lines, protected) + 60
+            if ellipsis_split_ok and ellipsis_idx is not None and i != ellipsis_idx + 1:
+                score += 28
+            protected_blocked.append((score, lines))
             continue
-        # Avoid weak function words at end/start unless unavoidable
-        left_last = sanitize_last_word(left).lower()
-        right_first = right.split()[0].lower() if right.split() else ""
-        if left_last in WEAK_ENDS or right_first in WEAK_STARTS:
-            protected_blocked.append((split_layout_score(lines, protected) + 40, lines))
-            continue
-        candidates.append((split_layout_score(lines, protected), lines))
+        score = split_layout_score(lines, protected)
+        if ellipsis_split_ok and ellipsis_idx is not None and i != ellipsis_idx + 1:
+            score += 28
+        candidates.append((score, lines))
     if not candidates:
         if protected_blocked:
             protected_blocked.sort(key=lambda x: x[0])
@@ -1832,19 +1894,49 @@ def split_layout_score(lines: List[str], protected: List[str]) -> float:
     score = abs(_visible_len(left) - _visible_len(right)) * 0.7
     # Prefer splitting at sentence boundary so full sentence starts on new line (broadcast)
     if re.search(r"[.!?]$", left):
-        score -= 14
+        score -= 20
     elif re.search(r"[,;:]$", left):
-        score -= 6
+        score -= 8
     else:
         score += 6
     if sanitize_last_word(left) in WEAK_ENDS:
-        score += 18
-    if right.split() and right.split()[0].lower() in WEAK_STARTS:
-        score += 12
+        score += 26
+    right_first = right.split()[0].lower() if right.split() else ""
+    left_last = sanitize_last_word(left).lower() if left.split() else ""
+    if right_first in WEAK_STARTS:
+        score += 14
+    if left_last in DETERMINER_ENDS:
+        score += 26
+    if left_last in PREPOSITION_ENDS:
+        score += 16
+    if right_first in PREPOSITION_STARTS:
+        score += 16
+    if left_last in AUX_ENDS:
+        score += 14
+    # Avoid splitting quantifiers from "of" (e.g., "all of", "some of", "most of")
+    if right_first == "of" and left_last in {"all", "some", "most", "none", "one", "any", "many", "few"}:
+        score += 24
+    # Avoid determiners directly followed by "one/ones"
+    if left_last in DETERMINER_ENDS and right_first in {"one", "ones"}:
+        score += 22
     if len(right.split()) == 1:
         score += 50
     if len(left.split()) == 1:
         score += 28
+    # Favor splits right after ellipsis when it marks a pause
+    if left.endswith("...") or left.endswith("…"):
+        score -= 10
+    # Strong penalty for highly unbalanced lines
+    min_len = min(_visible_len(left), _visible_len(right))
+    max_len = max(_visible_len(left), _visible_len(right))
+    if min_len <= 8 and max_len >= 20:
+        score += 26
+    elif min_len <= 10 and max_len >= 22:
+        score += 18
+    if _visible_len(right) < 10:
+        score += 8
+    if _visible_len(left) < 10:
+        score += 8
     if _visible_len(right) < 8:
         score += 12
     if _visible_len(left) < 8:
@@ -2592,6 +2684,9 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str], italic_ph
             ]
         else:
             text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
+            runs = cue.get("meta", {}).get("runs", [])
+            if not cue.get("meta", {}).get("two_speaker") and len(runs) == 1:
+                text = apply_pause_ellipsis(text, runs[0].get("tokens") or [])
             text = apply_italics(text, italic_phrases)
             cue["meta"]["dialogue_text"] = text
             # If transcript uses em dash as segment/speaker separator, two lines each with dash
