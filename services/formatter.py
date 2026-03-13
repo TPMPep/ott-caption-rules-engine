@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Project imports with local fallbacks for robustness/testability.
@@ -30,7 +31,13 @@ except Exception:
         return text.startswith("[") and text.endswith("]")
 
 try:
-    from services.exporters import parse_srt as _parse_srt, export_srt as _export_srt, export_vtt as _export_vtt, export_scc as _export_scc
+    from services.exporters import (
+        parse_srt as _parse_srt,
+        export_srt as _export_srt,
+        export_vtt as _export_vtt,
+        export_scc as _export_scc,
+        export_ttml as _export_ttml,
+    )
 except Exception:
     def _ms_to_srt(ms: int) -> str:
         ms = max(0, int(ms))
@@ -82,6 +89,190 @@ except Exception:
     def _export_scc(cues: List[Dict[str, Any]]) -> Optional[str]:
         return None
 
+def _export_ttml(cues: List[Dict[str, Any]], frame_rate: str, frame_rate_multiplier: str, time_base: str, align: str) -> str:
+        # Minimal IMSC-1.1 TTML text profile export
+        def ms_to_ttml(ms: int) -> str:
+            ms = max(0, int(ms))
+            hh, rem = divmod(ms, 3600000)
+            mm, rem = divmod(rem, 60000)
+            ss, rem = divmod(rem, 1000)
+            return f"{hh:02d}:{mm:02d}:{ss:02d}.{rem:03d}"
+
+        def strip_tags(s: str) -> str:
+            s = STYLE_TAG_RE.sub("", s or "")
+            return s
+
+        def to_ttml_text(lines: List[str]) -> str:
+            # convert <i> to <span tts:fontStyle="italic">
+            def convert_italics(text: str) -> str:
+                out = []
+                parts = re.split(r"(<i>|</i>)", text)
+                italic = False
+                for part in parts:
+                    if part == "<i>":
+                        italic = True
+                        continue
+                    if part == "</i>":
+                        italic = False
+                        continue
+                    if italic:
+                        out.append(f'<span tts:fontStyle="italic">{part}</span>')
+                    else:
+                        out.append(part)
+                return "".join(out)
+
+            safe_lines = [convert_italics(strip_tags(l)) for l in lines]
+            if not safe_lines:
+                return ""
+            if len(safe_lines) == 1:
+                return safe_lines[0]
+            return "<br/>".join(safe_lines)
+
+        # Build TTML
+        ttml_lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<tt xmlns="http://www.w3.org/ns/ttml"',
+            '    xmlns:ttp="http://www.w3.org/ns/ttml#parameter"',
+            '    xmlns:tts="http://www.w3.org/ns/ttml#style"',
+            '    ttp:timeBase="%s"' % time_base,
+            '    ttp:frameRate="%s"' % frame_rate,
+            '    ttp:frameRateMultiplier="%s">' % frame_rate_multiplier,
+            '  <head>',
+            '    <styling>',
+            '      <style xml:id="s0"',
+            '             tts:fontFamily="proportionalSansSerif"',
+            '             tts:fontSize="80%"',
+            '             tts:color="#ebebeb"',
+            '             tts:backgroundColor="transparent"',
+            '             tts:textOutline="3% #101010"',
+            '             tts:textAlign="%s"' % align,
+            '             tts:luminanceGain="1.5"/>',
+            '    </styling>',
+            '    <layout>',
+            '      <region xml:id="r0" tts:origin="2.5% 15%" tts:extent="95% 70%"/>',
+            '    </layout>',
+            '  </head>',
+            '  <body region="r0" style="s0">',
+            '    <div>',
+        ]
+        for cue in cues:
+            text = to_ttml_text(cue.get("lines", []))
+            if not text:
+                continue
+            ttml_lines.append(
+                f'      <p begin="{ms_to_ttml(cue["start_ms"])}" end="{ms_to_ttml(cue["end_ms"])}">{text}</p>'
+            )
+        ttml_lines += ['    </div>', '  </body>', '</tt>']
+        return "\n".join(ttml_lines)
+
+
+def _validate_ttml(ttml_text: str, protected: List[str]) -> List[str]:
+    errors: List[str] = []
+    if not ttml_text:
+        return ["TTML is empty"]
+    try:
+        root = ET.fromstring(ttml_text)
+    except Exception as e:
+        return [f"TTML XML parse error: {e}"]
+
+    ns = {"tt": "http://www.w3.org/ns/ttml", "ttp": "http://www.w3.org/ns/ttml#parameter", "tts": "http://www.w3.org/ns/ttml#style"}
+    # root checks
+    if not root.tag.endswith("tt"):
+        errors.append("Root element is not <tt>")
+    # timeBase / frame rate
+    time_base = root.attrib.get("{http://www.w3.org/ns/ttml#parameter}timeBase")
+    if time_base != "media":
+        errors.append(f"ttp:timeBase must be 'media' (got {time_base})")
+    frame_rate = root.attrib.get("{http://www.w3.org/ns/ttml#parameter}frameRate")
+    if not frame_rate:
+        errors.append("Missing ttp:frameRate")
+    frame_mult = root.attrib.get("{http://www.w3.org/ns/ttml#parameter}frameRateMultiplier")
+    if not frame_mult:
+        errors.append("Missing ttp:frameRateMultiplier")
+
+    # style checks
+    style = root.find(".//tt:styling/tt:style", ns)
+    if style is None:
+        errors.append("Missing <style> element")
+    else:
+        if style.attrib.get("{http://www.w3.org/ns/ttml#style}color") != "#ebebeb":
+            errors.append("tts:color must be #ebebeb")
+        if style.attrib.get("{http://www.w3.org/ns/ttml#style}backgroundColor") != "transparent":
+            errors.append("tts:backgroundColor must be transparent")
+        if style.attrib.get("{http://www.w3.org/ns/ttml#style}fontFamily") != "proportionalSansSerif":
+            errors.append("tts:fontFamily must be proportionalSansSerif")
+        if style.attrib.get("{http://www.w3.org/ns/ttml#style}fontSize") != "80%":
+            errors.append("tts:fontSize must be 80%")
+        if style.attrib.get("{http://www.w3.org/ns/ttml#style}textOutline") != "3% #101010":
+            errors.append("tts:textOutline must be 3% #101010")
+        if style.attrib.get("{http://www.w3.org/ns/ttml#style}luminanceGain") != "1.5":
+            errors.append("tts:luminanceGain must be 1.5")
+
+    region = root.find(".//tt:layout/tt:region", ns)
+    if region is None:
+        errors.append("Missing <region> element")
+    else:
+        if region.attrib.get("{http://www.w3.org/ns/ttml#style}origin") != "2.5% 15%":
+            errors.append("tts:origin must be 2.5% 15%")
+        if region.attrib.get("{http://www.w3.org/ns/ttml#style}extent") != "95% 70%":
+            errors.append("tts:extent must be 95% 70%")
+
+    # Validate cues
+    def parse_time(val: str) -> Optional[int]:
+        m = re.match(r"^(\d\d):(\d\d):(\d\d)\.(\d\d\d)$", val or "")
+        if not m:
+            return None
+        hh, mm, ss, ms = map(int, m.groups())
+        return ((hh * 60 + mm) * 60 + ss) * 1000 + ms
+
+    prev_end = -1
+    for p in root.findall(".//tt:body/tt:div/tt:p", ns):
+        begin = p.attrib.get("begin")
+        end = p.attrib.get("end")
+        b_ms = parse_time(begin or "")
+        e_ms = parse_time(end or "")
+        if b_ms is None or e_ms is None:
+            errors.append(f"Invalid time format on <p> begin/end: {begin} / {end}")
+            continue
+        if e_ms <= b_ms:
+            errors.append(f"Non-positive duration: {begin} -> {end}")
+        if b_ms < prev_end:
+            errors.append(f"Overlap detected at {begin}")
+        prev_end = e_ms
+
+        # Extract visible lines
+        # Keep <br/> splits
+        text_fragments = []
+        for node in p.iter():
+            if node.tag.endswith("br"):
+                text_fragments.append("\n")
+            elif node is p:
+                if node.text:
+                    text_fragments.append(node.text)
+            else:
+                if node.text:
+                    text_fragments.append(node.text)
+                if node.tail:
+                    text_fragments.append(node.tail)
+        raw_text = "".join(text_fragments)
+        lines = [ln.strip() for ln in raw_text.split("\n") if ln.strip() != ""]
+        if len(lines) > 2:
+            errors.append(f">2 lines in cue at {begin}")
+        for line in lines:
+            if len(line) > MAX_CHARS:
+                errors.append(f"Line exceeds {MAX_CHARS} chars at {begin}: {line}")
+        # sound cue mixed with dialogue
+        for line in lines:
+            if re.search(r"\[[^\]]+\]", line) and re.search(r"[A-Za-z]", re.sub(r"\[[^\]]+\]", "", line)):
+                errors.append(f"Sound cue mixed with dialogue at {begin}: {line}")
+        # protected phrase split across lines
+        if len(lines) == 2:
+            left, right = lines
+            if boundary_splits_protected(left, right, protected):
+                errors.append(f"Protected phrase split across lines at {begin}: {left} / {right}")
+
+    return errors
+
 try:
     from services.qc import qc_report as _qc_report
 except Exception:
@@ -96,16 +287,17 @@ MAX_CPS = 45.0
 MIN_DIALOGUE_MS = 800
 MIN_DISPLAY_MS = 800  # Broadcast: minimum on-screen time so captions are readable
 MIN_SOUND_DISPLAY_MS = 800  # Minimum on-screen time for sound cues (broadcast)
-MIN_SOUND_MS = 700
+MIN_SOUND_MS = 400
 TARGET_SOUND_MS = 1800
 MAX_SOUND_MS = 3500
 MERGE_GAP_MS = 650
 WINDOW_PAD_MS = 700
 SAME_SPEAKER_HARD_GAP_MS = 3200
-SOUND_CLUSTER_GAP_MS = 700
+SOUND_CLUSTER_GAP_MS = 200
 TWO_SPEAKER_GAP_MS = 900
 MAX_TWO_SPEAKER_WINDOW_MS = 4500
-INLINE_DIALOGUE_TAGS = {"[INAUDIBLE]", "[UNINTELLIGIBLE]", "[BLEEP]", "[BLEEPED]"}
+# Inline tags allowed to remain within dialogue (not treated as sound cues)
+INLINE_DIALOGUE_TAGS = {"[INAUDIBLE]", "[UNINTELLIGIBLE]"}
 FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for",
     "that", "this", "these", "those", "is", "are", "was", "were", "be", "been", "being", "it", "i",
@@ -113,8 +305,8 @@ FUNCTION_WORDS = {
 WEAK_ENDS = FUNCTION_WORDS | {"who", "what", "which", "when", "where", "why", "how", "well", "still"}
 WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that", "this", "these", "those"}
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
-ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]"}
-SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5}
+ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]", "[BLEEP]"}
+SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5, "[BLEEP]": 6}
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
 ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
 # Words that must not be the only content on a second line (broadcast: no one-word weak second lines)
@@ -138,6 +330,26 @@ ITALIC_TAG_RE = re.compile(r"</?i>")
 TIMECODE_OFFSET_MS = int(os.getenv("TIMECODE_OFFSET_MS", "0") or 0)
 ALIGNMENT_DEFAULT = os.getenv("ALIGNMENT_DEFAULT", "an2")  # an2/an8/none
 ITALICIZE_PHRASES_RAW = os.getenv("ITALICIZE_PHRASES", "").strip()
+ITALICIZE_TITLES = os.getenv("ITALICIZE_TITLES", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+ITALICIZE_TITLES_MIN_WORDS = int(os.getenv("ITALICIZE_TITLES_MIN_WORDS", "3") or 3)
+
+SPEAKER_LABEL_MODE = os.getenv("SPEAKER_LABEL_MODE", "dash").strip().lower()  # dash|alpha|generic|named
+SPEAKER_LABEL_SINGLE = os.getenv("SPEAKER_LABEL_SINGLE", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+SPEAKER_GENERIC_PREFIX = os.getenv("SPEAKER_GENERIC_PREFIX", "SPEAKER").strip() or "SPEAKER"
+SPEAKER_NAME_MAP_RAW = os.getenv("SPEAKER_NAME_MAP", "").strip()
+SPEAKER_LABEL_FORMAT = os.getenv("SPEAKER_LABEL_FORMAT", "prefix").strip().lower()  # prefix|bracket
+
+SOUND_LABEL_STYLE = os.getenv("SOUND_LABEL_STYLE", "simple").strip().lower()  # simple|descriptive
+
+TTML_TIMEBASE = os.getenv("TTML_TIMEBASE", "media").strip() or "media"
+TTML_FRAME_RATE = os.getenv("TTML_FRAME_RATE", "30").strip() or "30"
+TTML_FRAME_RATE_MULTIPLIER = os.getenv("TTML_FRAME_RATE_MULTIPLIER", "1000 1001").strip() or "1000 1001"
+TTML_TEXT_ALIGN = os.getenv("TTML_TEXT_ALIGN", "center").strip().lower() or "center"
+OUTPUT_FORMATS_ENV = os.getenv("OUTPUT_FORMATS", "").strip()
+CAPTION_PROFILE = os.getenv("CAPTION_PROFILE", "nbcu").strip().lower()  # nbcu|custom
+SOUND_DENSITY = os.getenv("SOUND_DENSITY", "conservative").strip().lower()  # conservative|balanced|aggressive
+VALIDATE_TTML = os.getenv("VALIDATE_TTML", "").strip().lower()
+FAIL_ON_TTML_VALIDATION = os.getenv("FAIL_ON_TTML_VALIDATION", "").strip().lower()
 
 
 def _parse_timecode(tc: str) -> Optional[int]:
@@ -226,6 +438,51 @@ def _truncate_visible(text: str, max_chars: int) -> str:
         out += "</i>"
     return out.rstrip()
 
+
+def _cue_visible_text(cue: Dict[str, Any]) -> str:
+    return " ".join(_strip_style_tags(line) for line in cue.get("lines", []))
+
+
+def _reduce_high_cps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Try to reduce extreme CPS by extending cue duration into nearby gaps when possible."""
+    if not cues:
+        return cues
+    cues = sorted(cues, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c.get("type") == "dialogue" else 1))
+    for i, c in enumerate(cues):
+        if c.get("type") != "dialogue":
+            continue
+        text_len = _visible_len(_cue_visible_text(c))
+        if text_len == 0:
+            continue
+        dur = max(1, c["end_ms"] - c["start_ms"])
+        cps = text_len / (dur / 1000.0)
+        if cps <= MAX_CPS:
+            continue
+        target_dur = int((text_len / MAX_CPS) * 1000)
+        extra = min(500, max(0, target_dur - dur))
+        if extra <= 0:
+            continue
+        next_cue = cues[i + 1] if i + 1 < len(cues) else None
+        gap = (next_cue["start_ms"] - c["end_ms"]) if next_cue else extra
+        if gap >= extra:
+            c["end_ms"] += extra
+            continue
+        if next_cue and next_cue.get("type") == "dialogue":
+            slack_next = max(0, (next_cue["end_ms"] - next_cue["start_ms"]) - MIN_DIALOGUE_MS)
+            take = min(slack_next, extra - gap)
+            if take > 0:
+                c["end_ms"] += extra
+                next_cue["start_ms"] += take
+    return cues
+
+
+def _sound_trim_budget_ms() -> int:
+    if SOUND_DENSITY == "aggressive":
+        return 700
+    if SOUND_DENSITY == "balanced":
+        return 400
+    return 200
+
 def _parse_italicize_phrases() -> List[str]:
     if not ITALICIZE_PHRASES_RAW:
         return []
@@ -236,6 +493,84 @@ def _parse_italicize_phrases() -> List[str]:
 ITALICIZE_PHRASES = _parse_italicize_phrases()
 
 
+def _parse_speaker_name_map() -> Dict[str, str]:
+    if not SPEAKER_NAME_MAP_RAW:
+        return {}
+    try:
+        data = json.loads(SPEAKER_NAME_MAP_RAW)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        return {}
+    return {}
+
+
+SPEAKER_NAME_MAP = _parse_speaker_name_map()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _apply_profile_settings() -> None:
+    global MAX_LINES, MAX_CHARS, MAX_CUE_CHARS, TARGET_CPS, MAX_CPS
+    global MIN_DISPLAY_MS, MIN_SOUND_DISPLAY_MS, MIN_SOUND_MS, SOUND_CLUSTER_GAP_MS, MERGE_GAP_MS
+    global SPEAKER_LABEL_MODE, SPEAKER_LABEL_SINGLE, SPEAKER_LABEL_FORMAT, SOUND_LABEL_STYLE, ALIGNMENT_DEFAULT
+    global SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
+    # NBCU profile locks
+    if CAPTION_PROFILE == "nbcu":
+        MAX_LINES = 2
+        MAX_CHARS = 32
+        TARGET_CPS = 27.0
+        MAX_CPS = 45.0
+        MIN_DISPLAY_MS = 800
+        MIN_SOUND_DISPLAY_MS = 800
+        MIN_SOUND_MS = 400
+        SOUND_CLUSTER_GAP_MS = 200
+        MERGE_GAP_MS = 650
+        # NBCU forbids speaker labels beyond dash
+        SPEAKER_LABEL_MODE = "dash"
+        SPEAKER_LABEL_SINGLE = False
+        SPEAKER_LABEL_FORMAT = "prefix"
+        SOUND_LABEL_STYLE = "simple"
+        ALIGNMENT_DEFAULT = "none"
+        SOUND_DENSITY = "conservative"
+        VALIDATE_TTML = "1" if VALIDATE_TTML == "" else VALIDATE_TTML
+        FAIL_ON_TTML_VALIDATION = "1" if FAIL_ON_TTML_VALIDATION == "" else FAIL_ON_TTML_VALIDATION
+    elif CAPTION_PROFILE == "custom":
+        MAX_LINES = _env_int("CUSTOM_MAX_LINES", MAX_LINES)
+        MAX_CHARS = _env_int("CUSTOM_MAX_CHARS", MAX_CHARS)
+        TARGET_CPS = _env_float("CUSTOM_TARGET_CPS", TARGET_CPS)
+        MAX_CPS = _env_float("CUSTOM_MAX_CPS", MAX_CPS)
+        MIN_DISPLAY_MS = _env_int("CUSTOM_MIN_DISPLAY_MS", MIN_DISPLAY_MS)
+        MIN_SOUND_DISPLAY_MS = _env_int("CUSTOM_MIN_SOUND_DISPLAY_MS", MIN_SOUND_DISPLAY_MS)
+        MIN_SOUND_MS = _env_int("CUSTOM_MIN_SOUND_MS", MIN_SOUND_MS)
+        SOUND_CLUSTER_GAP_MS = _env_int("CUSTOM_SOUND_CLUSTER_GAP_MS", SOUND_CLUSTER_GAP_MS)
+        MERGE_GAP_MS = _env_int("CUSTOM_MERGE_GAP_MS", MERGE_GAP_MS)
+        VALIDATE_TTML = "0" if VALIDATE_TTML == "" else VALIDATE_TTML
+        FAIL_ON_TTML_VALIDATION = "0" if FAIL_ON_TTML_VALIDATION == "" else FAIL_ON_TTML_VALIDATION
+    MAX_CUE_CHARS = MAX_LINES * MAX_CHARS
+
+
+_apply_profile_settings()
+
+
 def process_caption_job(
     backbone_srt_text: str,
     timestamps: Any,
@@ -243,11 +578,17 @@ def process_caption_job(
     output_formats: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     protected_phrases = protected_phrases or []
-    output_formats = output_formats or ["srt"]
+    if output_formats is None:
+        if OUTPUT_FORMATS_ENV:
+            output_formats = [f.strip().lower() for f in OUTPUT_FORMATS_ENV.split(",") if f.strip()]
+        else:
+            output_formats = ["ttml"]
 
     backbone = _parse_srt(backbone_srt_text)
     tokens = normalize_tokens(timestamps)
     protected = build_runtime_protected_phrases(backbone, tokens, protected_phrases)
+    italic_phrases = build_italic_phrases(protected)
+    speaker_map = build_speaker_label_map(tokens)
 
     dialogue_windows, sound_events = build_windows_from_backbone(backbone)
     dialogue_windows = merge_dialogue_windows(dialogue_windows, protected)
@@ -279,7 +620,8 @@ def process_caption_job(
 
     cues = formatted_dialogue + sound_cues
     cues = resolve_overlaps(cues)
-    cues = final_qc_cleanup(cues, protected)
+    cues = final_qc_cleanup(cues, protected, italic_phrases)
+    cues = apply_speaker_labels(cues, speaker_map, SPEAKER_LABEL_SINGLE)
     cues.sort(key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     for i, cue in enumerate(cues, 1):
         cue["idx"] = i
@@ -287,11 +629,24 @@ def process_caption_job(
     cues_for_export = apply_timecode_offset(cues, TIMECODE_OFFSET_MS)
     cues_for_export = apply_alignment_tags(cues_for_export, TIMECODE_OFFSET_MS)
 
-    srt_out = _export_srt(cues_for_export)
+    srt_out = _export_srt(cues_for_export) if "srt" in output_formats else None
     vtt_out = _export_vtt(cues_for_export) if "vtt" in output_formats else None
     scc_out = _export_scc(cues_for_export) if "scc" in output_formats else None
+    ttml_out = _export_ttml(
+        cues_for_export,
+        frame_rate=TTML_FRAME_RATE,
+        frame_rate_multiplier=TTML_FRAME_RATE_MULTIPLIER,
+        time_base=TTML_TIMEBASE,
+        align=TTML_TEXT_ALIGN,
+    ) if "ttml" in output_formats else None
     qc = _qc_report(len(backbone), cues, protected)
-    return {"srt": srt_out, "vtt": vtt_out, "scc": scc_out, "qc": qc}
+    if ttml_out and VALIDATE_TTML in {"1", "true", "yes", "y", "on"}:
+        errors = _validate_ttml(ttml_out, protected)
+        qc["ttml_validation_errors"] = errors
+        qc["ttml_valid"] = len(errors) == 0
+        if errors and FAIL_ON_TTML_VALIDATION in {"1", "true", "yes", "y", "on"}:
+            raise ValueError("TTML validation failed: " + "; ".join(errors[:5]))
+    return {"srt": srt_out, "vtt": vtt_out, "scc": scc_out, "ttml": ttml_out, "qc": qc}
 
 
 # ------------ text helpers ------------
@@ -308,18 +663,6 @@ def normalize_tokens(timestamps: Any) -> List[Dict[str, Any]]:
         if end <= start:
             end = start + 1
         out.append({"text": text, "start_ms": start, "end_ms": end, "speaker": str(item.get("speaker") or "A")})
-    # Inline bleep: if a short [NOISE]/[SOUND] is between words, keep it inline as [BLEEP]
-    for i, tok in enumerate(out):
-        tag = (tok.get("text") or "").strip().upper()
-        if tag not in {"[NOISE]", "[SOUND]"}:
-            continue
-        dur = tok["end_ms"] - tok["start_ms"]
-        if dur > 350:
-            continue
-        prev_is_word = i > 0 and not token_is_sound(out[i - 1].get("text", ""))
-        next_is_word = i + 1 < len(out) and not token_is_sound(out[i + 1].get("text", ""))
-        if prev_is_word and next_is_word:
-            tok["text"] = "[BLEEP]"
     out.sort(key=lambda x: (x["start_ms"], x["end_ms"]))
     return out
 
@@ -388,6 +731,136 @@ def apply_italics(text: str, phrases: Sequence[str]) -> str:
         last = m.end()
     parts.append(italics_segment(text[last:]))
     return "".join(parts)
+
+
+def build_italic_phrases(protected: List[str]) -> List[str]:
+    phrases = list(ITALICIZE_PHRASES)
+    if ITALICIZE_TITLES:
+        for phrase in protected:
+            if text_word_count(phrase) >= ITALICIZE_TITLES_MIN_WORDS:
+                phrases.append(phrase)
+    # de-dup, prefer longer phrases
+    uniq: List[str] = []
+    seen = set()
+    for p in sorted(phrases, key=len, reverse=True):
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
+
+
+def format_sound_label(label: str) -> str:
+    label = normalize_sound_label(label)
+    if not label:
+        return ""
+    if SOUND_LABEL_STYLE != "descriptive":
+        return label
+    mapping = {
+        "[APPLAUSE]": "[AUDIENCE APPLAUDS]",
+        "[LAUGHTER]": "[AUDIENCE LAUGHS]",
+        "[CHEERING]": "[CROWD CHEERS]",
+        "[MUSIC]": "[MUSIC PLAYING]",
+        "[SFX]": "[SOUND EFFECTS]",
+        "[BLEEP]": "[BLEEP]",
+    }
+    return mapping.get(label, label)
+
+
+def build_speaker_label_map(tokens: List[Dict[str, Any]]) -> Dict[str, str]:
+    if SPEAKER_LABEL_MODE == "dash":
+        return {}
+    speakers: List[str] = []
+    for tok in tokens:
+        sp = str(tok.get("speaker") or "A")
+        if sp not in speakers:
+            speakers.append(sp)
+    if SPEAKER_LABEL_MODE == "alpha":
+        return {sp: sp for sp in speakers}
+    if SPEAKER_LABEL_MODE == "generic":
+        return {sp: f"{SPEAKER_GENERIC_PREFIX} {i+1}" for i, sp in enumerate(speakers)}
+    if SPEAKER_LABEL_MODE == "named":
+        return {sp: (SPEAKER_NAME_MAP.get(sp) or sp) for sp in speakers}
+    return {}
+
+
+def _fit_speaker_label(line: str, label: str) -> str:
+    base = line
+    if base.startswith("- "):
+        base = base[2:]
+    if SPEAKER_LABEL_FORMAT == "bracket":
+        candidates = [
+            f"-[{label}] {base}",
+            f"- [{label}] {base}",
+        ]
+    else:
+        candidates = [
+            f"- {label}: {base}",
+            f"- {label} {base}",
+        ]
+    # fallback short label
+    short = label
+    m = re.match(r"^SPEAKER\\s*(\\d+)$", label, re.I)
+    if m:
+        short = f"S{m.group(1)}"
+    elif " " in label:
+        short = label.split()[0]
+    if SPEAKER_LABEL_FORMAT == "bracket":
+        candidates.append(f"-[{short}] {base}")
+        candidates.append(f"- [{short}] {base}")
+    else:
+        candidates.append(f"- {short}: {base}")
+        candidates.append(f"- {short} {base}")
+    for cand in candidates:
+        if _visible_len(cand) <= MAX_CHARS:
+            return cand
+    return line
+
+
+def apply_speaker_labels(cues: List[Dict[str, Any]], speaker_map: Dict[str, str], label_single: bool) -> List[Dict[str, Any]]:
+    if not speaker_map:
+        return cues
+    out: List[Dict[str, Any]] = []
+    for c in cues:
+        if c.get("type") != "dialogue":
+            out.append(c)
+            continue
+        runs = c.get("meta", {}).get("runs", [])
+        lines = list(c.get("lines", []))
+        if c.get("meta", {}).get("two_speaker") and len(runs) == 2 and len(lines) == 2:
+            new_lines = []
+            for line, run in zip(lines, runs):
+                label = speaker_map.get(str(run.get("speaker") or "A"))
+                if label:
+                    line = _fit_speaker_label(line, label)
+                new_lines.append(line)
+            c = dict(c)
+            c["lines"] = new_lines
+            out.append(c)
+            continue
+        if label_single and runs and lines:
+            label = speaker_map.get(str(runs[0].get("speaker") or "A"))
+            if label:
+                line = lines[0]
+                if SPEAKER_LABEL_FORMAT == "bracket":
+                    prefixed = f"[{label}] {line}"
+                else:
+                    prefixed = f"{label}: {line}"
+                if _visible_len(prefixed) <= MAX_CHARS:
+                    lines[0] = prefixed
+                else:
+                    # try short label
+                    short = label.split()[0]
+                    if SPEAKER_LABEL_FORMAT == "bracket":
+                        prefixed = f"[{short}] {line}"
+                    else:
+                        prefixed = f"{short}: {line}"
+                    if _visible_len(prefixed) <= MAX_CHARS:
+                        lines[0] = prefixed
+            c = dict(c)
+            c["lines"] = lines
+        out.append(c)
+    return out
 
 
 def strip_non_dialogue_tags(text: str) -> str:
@@ -579,22 +1052,21 @@ def build_windows_from_backbone(backbone: List[Dict[str, Any]]) -> Tuple[List[Di
                 "end_ms": end_ms,
                 "raw_text": raw_text,
                 "dialogue_text": apply_asr_corrections(repair_continuing_punctuation(dialogue_text)),
-                "leading_sound": dominant_sound_label(leading, prefer_first_reaction=True),
+                "leading_sound": leading,
                 "tokens": [],
                 "runs": [],
             })
         else:
-            label = dominant_sound_label(all_labels, prefer_first_reaction=True)
-            if label:
-                # extend a pure sound cue to the next cue start if the next cue begins with the same sound label.
+            labels = [l for l in all_labels if l in ALLOWED_SOUND]
+            if labels:
                 next_start = end_ms
                 if idx + 1 < len(backbone):
                     next_raw = normalize_space(" ".join(backbone[idx + 1].get("lines", [])))
                     next_lead, next_dialogue, _ = split_sound_and_dialogue(next_raw)
                     next_label = dominant_sound_label(next_lead)
-                    if next_dialogue and next_label == label:
+                    if next_dialogue and next_label in labels:
                         next_start = int(backbone[idx + 1]["start_ms"])
-                sound.append({"label": label, "start_ms": start_ms, "end_ms": max(end_ms, next_start)})
+                sound.extend(expand_sound_sequence(labels, start_ms, max(end_ms, next_start)))
     return dialogue, sound
 
 
@@ -611,20 +1083,21 @@ def split_sound_and_dialogue(raw_text: str) -> Tuple[List[str], str, List[str]]:
         between = raw_text[pos:m.start()].strip()
         if between:
             leading_phase = False
-        label = normalize_sound_label(m.group(0))
-        if label:
-            all_labels.append(label)
-            if leading_phase:
-                leading.append(label)
+        labels = normalize_sound_labels(m.group(0))
+        for label in labels:
+            if label:
+                all_labels.append(label)
+                if leading_phase:
+                    leading.append(label)
         pos = m.end()
     dialogue = strip_non_dialogue_tags(raw_text)
     return leading, dialogue, all_labels
 
 
-def normalize_sound_label(text: str) -> str:
+def normalize_sound_labels(text: str) -> List[str]:
     tag = normalize_space(text).upper()
     if not (tag.startswith("[") and tag.endswith("]")):
-        return ""
+        return []
     inner = tag[1:-1].strip().replace("♪", "MUSIC")
     parts = [p.strip() for p in re.split(r"\s+AND\s+|\s*,\s*|\s*/\s*", inner) if p.strip()]
     labels: List[str] = []
@@ -643,10 +1116,17 @@ def normalize_sound_label(text: str) -> str:
             label = "[LAUGHTER]"
         elif part.startswith("CHEER"):
             label = "[CHEERING]"
+        elif "BLEEP" in part:
+            label = "[BLEEP]"
         else:
             label = ""
         if label and label not in labels:
             labels.append(label)
+    return labels
+
+
+def normalize_sound_label(text: str) -> str:
+    labels = normalize_sound_labels(text)
     return dominant_sound_label(labels)
 
 
@@ -667,8 +1147,9 @@ def dominant_sound_label(labels: Sequence[str], prefer_first_reaction: bool = Fa
 def build_leading_sound_events(windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     for win in windows:
-        label = win.get("leading_sound")
-        if label not in ALLOWED_SOUND:
+        labels = win.get("leading_sound") or []
+        labels = [l for l in labels if l in ALLOWED_SOUND]
+        if not labels:
             continue
         toks = win.get("tokens") or []
         if toks:
@@ -677,8 +1158,10 @@ def build_leading_sound_events(windows: List[Dict[str, Any]]) -> List[Dict[str, 
             end_ms = min(win["end_ms"], win["start_ms"] + TARGET_SOUND_MS)
         start_ms = win["start_ms"]
         if end_ms - start_ms < MIN_SOUND_MS:
+            end_ms = min(win["end_ms"], start_ms + MIN_SOUND_MS)
+        if end_ms - start_ms < MIN_SOUND_MS:
             continue
-        events.append({"label": label, "start_ms": start_ms, "end_ms": end_ms})
+        events.extend(expand_sound_sequence(labels, start_ms, end_ms))
     return events
 
 
@@ -1278,44 +1761,55 @@ def merge_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return []
     events.sort(key=lambda e: (e["start_ms"], e["end_ms"]))
     merged: List[Dict[str, Any]] = []
-    cluster: List[Dict[str, Any]] = [events[0].copy()]
-
-    def flush_cluster(cluster_events: List[Dict[str, Any]]) -> None:
-        if not cluster_events:
-            return
-        if len(cluster_events) == 1:
-            merged.append(cluster_events[0].copy())
-            return
-        labels = [e["label"] for e in cluster_events]
-        first = labels[0]
-        start = cluster_events[0]["start_ms"]
-        end = max(e["end_ms"] for e in cluster_events)
-        if first in {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]"}:
-            music_events = [e for e in cluster_events if e["label"] == "[MUSIC]" and e["start_ms"] > cluster_events[0]["end_ms"]]
-            if music_events:
-                reaction_end = max(cluster_events[0]["end_ms"], min(end, start + 1200))
-                merged.append({"label": first, "start_ms": start, "end_ms": reaction_end})
-                music_start = music_events[0]["start_ms"]
-                if end - music_start >= 250:
-                    merged.append({"label": "[MUSIC]", "start_ms": music_start, "end_ms": end})
-                return
-            merged.append({"label": first, "start_ms": start, "end_ms": end})
-            return
-        counts: Dict[str, int] = {}
-        for lab in labels:
-            counts[lab] = counts.get(lab, 0) + 1
-        label = sorted(counts.items(), key=lambda kv: (kv[1], SOUND_PRIORITY.get(kv[0], 0)), reverse=True)[0][0]
-        merged.append({"label": label, "start_ms": start, "end_ms": end})
-
+    current = events[0].copy()
     for ev in events[1:]:
-        prev = cluster[-1]
-        if ev["start_ms"] - prev["end_ms"] <= SOUND_CLUSTER_GAP_MS:
-            cluster.append(ev.copy())
+        if ev["label"] == current["label"] and ev["start_ms"] - current["end_ms"] <= SOUND_CLUSTER_GAP_MS:
+            current["end_ms"] = max(current["end_ms"], ev["end_ms"])
         else:
-            flush_cluster(cluster)
-            cluster = [ev.copy()]
-    flush_cluster(cluster)
+            merged.append(current)
+            current = ev.copy()
+    merged.append(current)
     return merged
+
+
+def expand_sound_sequence(labels: List[str], start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
+    labels = [l for l in labels if l in ALLOWED_SOUND]
+    if not labels:
+        return []
+    # de-dup while preserving order
+    seen = set()
+    ordered: List[str] = []
+    for l in labels:
+        if l not in seen:
+            seen.add(l)
+            ordered.append(l)
+    if len(ordered) == 1:
+        return [{"label": ordered[0], "start_ms": start_ms, "end_ms": end_ms}]
+
+    # Reaction + music pattern: give reaction a short head, music remainder.
+    reactions = [l for l in ordered if l in {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]"}]
+    if reactions and "[MUSIC]" in ordered:
+        reaction = reactions[0]
+        reaction_end = min(end_ms, start_ms + 1200)
+        events = [{"label": reaction, "start_ms": start_ms, "end_ms": reaction_end}]
+        if end_ms - reaction_end >= MIN_SOUND_MS:
+            events.append({"label": "[MUSIC]", "start_ms": reaction_end, "end_ms": end_ms})
+        return events
+
+    # Otherwise split evenly across labels.
+    total = end_ms - start_ms
+    if total < MIN_SOUND_MS * len(ordered):
+        # Not enough time: just use the first label.
+        return [{"label": ordered[0], "start_ms": start_ms, "end_ms": end_ms}]
+    slice_len = max(MIN_SOUND_MS, total // len(ordered))
+    events = []
+    cur = start_ms
+    for idx, label in enumerate(ordered):
+        seg_end = end_ms if idx == len(ordered) - 1 else min(end_ms, cur + slice_len)
+        if seg_end - cur >= MIN_SOUND_MS:
+            events.append({"label": label, "start_ms": cur, "end_ms": seg_end})
+        cur = seg_end
+    return events
 
 
 def place_sound_events(events: List[Dict[str, Any]], dialogue_cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1345,8 +1839,33 @@ def place_sound_event(ev: Dict[str, Any], dialogue: List[Dict[str, Any]]) -> Opt
             break
     gap_start = prev["end_ms"] if prev else ev["start_ms"]
     gap_end = nxt["start_ms"] if nxt else max(ev["end_ms"], ev["start_ms"] + TARGET_SOUND_MS)
+
+    # If there is no room, try to create a gap by trimming neighboring dialogue cues.
     if gap_end - gap_start < MIN_SOUND_MS:
-        return None
+        needed = MIN_SOUND_MS - (gap_end - gap_start)
+        budget = _sound_trim_budget_ms()
+        # trim previous cue if possible
+        take_prev = 0
+        if prev and prev.get("type") == "dialogue":
+            slack_prev = max(0, (prev["end_ms"] - prev["start_ms"]) - MIN_DIALOGUE_MS)
+            take_prev = min(slack_prev, needed, budget)
+            if take_prev > 0:
+                prev["end_ms"] -= take_prev
+                gap_start = prev["end_ms"]
+                needed -= take_prev
+                budget -= take_prev
+        # trim next cue if possible
+        take_next = 0
+        if needed > 0 and budget > 0 and nxt and nxt.get("type") == "dialogue":
+            slack_next = max(0, (nxt["end_ms"] - nxt["start_ms"]) - MIN_DIALOGUE_MS)
+            take_next = min(slack_next, needed, budget)
+            if take_next > 0:
+                nxt["start_ms"] += take_next
+                gap_end = nxt["start_ms"]
+                needed -= take_next
+                budget -= take_next
+        if gap_end - gap_start < MIN_SOUND_MS:
+            return None
     # In long dead-air gaps, bridge earlier instead of pinning the cue right on top of dialogue.
     if ev["start_ms"] - gap_start >= 1000 and gap_end - gap_start >= LONG_GAP_BRIDGE_MS:
         start = gap_start + BRIDGE_PAD_MS
@@ -1356,7 +1875,7 @@ def place_sound_event(ev: Dict[str, Any], dialogue: List[Dict[str, Any]]) -> Opt
     end_cap = gap_end - lead_out
     if end_cap <= start:
         return None
-    desired_len = TARGET_SOUND_MS if ev["label"] == "[MUSIC]" else max(MIN_SOUND_MS, 1200)
+    desired_len = TARGET_SOUND_MS if ev["label"] == "[MUSIC]" else max(MIN_SOUND_MS, 900)
     desired_end = min(end_cap, start + desired_len, max(ev["end_ms"], start + MIN_SOUND_MS))
     if desired_end - start < MIN_SOUND_MS:
         desired_end = min(end_cap, start + MIN_SOUND_MS)
@@ -1478,6 +1997,7 @@ def _apply_sound_min_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 # Em dash or hyphen used in transcripts as speaker/segment separator (not content-specific)
 _EM_DASH_SEPARATOR = re.compile(r"\s*[—\-]\s+", re.U)
+EM_DASH_SPLIT = os.getenv("EM_DASH_SPLIT", "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _split_at_em_dash_segment(text: str) -> Optional[Tuple[str, str]]:
@@ -1486,6 +2006,8 @@ def _split_at_em_dash_segment(text: str) -> Optional[Tuple[str, str]]:
     is a different speaker/segment. Put each on its own line with leading dash (broadcast).
     Rule is structure-based only: no phrase or content matching.
     """
+    if not EM_DASH_SPLIT:
+        return None
     text = normalize_space(text)
     parts = _EM_DASH_SEPARATOR.split(text, 1)
     if len(parts) != 2:
@@ -1687,11 +2209,12 @@ def _resolve_dialogue_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any
     return cues
 
 
-def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[Dict[str, Any]]:
+def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str], italic_phrases: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    italic_phrases = italic_phrases or []
     for cue in cues:
         if cue["type"] == "sound":
-            label = normalize_sound_label(cue["lines"][0])
+            label = format_sound_label(cue["lines"][0])
             if label:
                 cue["lines"] = [label]
                 out.append(cue)
@@ -1700,8 +2223,8 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
         if cue.get("meta", {}).get("two_speaker") and len(runs) == 2:
             left = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[0]["text"])))
             right = apply_asr_corrections(repair_continuing_punctuation(normalize_space(runs[1]["text"])))
-            left = apply_italics(left, ITALICIZE_PHRASES)
-            right = apply_italics(right, ITALICIZE_PHRASES)
+            left = apply_italics(left, italic_phrases)
+            right = apply_italics(right, italic_phrases)
             duration_ms = cue["end_ms"] - cue["start_ms"]
             duration_s = max(duration_ms / 1000.0, 0.001)
             total_chars = _visible_len(left) + _visible_len(right) + 4
@@ -1709,8 +2232,37 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
             # Keep short multi-speaker exchanges as one cue (two lines); only split when CPS high and not a quick back-and-forth.
             split_for_cps = cps > MAX_CPS and (duration_s >= 2.0 or total_chars > 45)
             if split_for_cps or _visible_len(left) > MAX_CHARS - 2 or _visible_len(right) > MAX_CHARS - 2:
-                out.extend(format_dialogue_atom(make_atom([runs[0]], False, cue), protected))
-                out.extend(format_dialogue_atom(make_atom([runs[1]], False, cue), protected))
+                # Split into two cues using run timing to preserve monotonic timecodes
+                r1, r2 = runs[0], runs[1]
+                s1 = int(r1.get("start_ms") or cue["start_ms"])
+                e1 = int(r1.get("end_ms") or cue["start_ms"])
+                s2 = int(r2.get("start_ms") or cue["end_ms"])
+                e2 = int(r2.get("end_ms") or cue["end_ms"])
+                # Ensure monotonic ordering
+                if e1 <= s1:
+                    e1 = min(cue["end_ms"], s1 + MIN_DIALOGUE_MS)
+                if s2 < e1:
+                    s2 = e1
+                if e2 <= s2:
+                    e2 = min(cue["end_ms"], s2 + MIN_DIALOGUE_MS)
+                c1 = {
+                    "idx": 0,
+                    "start_ms": s1,
+                    "end_ms": e1,
+                    "lines": [],
+                    "type": "dialogue",
+                    "meta": {"dialogue_text": r1["text"], "runs": [r1], "two_speaker": False},
+                }
+                c2 = {
+                    "idx": 0,
+                    "start_ms": s2,
+                    "end_ms": e2,
+                    "lines": [],
+                    "type": "dialogue",
+                    "meta": {"dialogue_text": r2["text"], "runs": [r2], "two_speaker": False},
+                }
+                out.extend(format_dialogue_atom(c1, protected))
+                out.extend(format_dialogue_atom(c2, protected))
                 continue
             cue["lines"] = [f"- {left}", f"- {right}"]
             cue["lines"] = [
@@ -1719,7 +2271,7 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
             ]
         else:
             text = apply_asr_corrections(repair_continuing_punctuation(normalize_space(cue.get("meta", {}).get("dialogue_text", " ".join(cue.get("lines", []))))))
-            text = apply_italics(text, ITALICIZE_PHRASES)
+            text = apply_italics(text, italic_phrases)
             cue["meta"]["dialogue_text"] = text
             # If transcript uses em dash as segment/speaker separator, two lines each with dash
             split = _split_at_em_dash_segment(text)
@@ -1746,8 +2298,12 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str]) -> List[D
     dialogue = _fix_weak_second_line(dialogue, protected)
     final = sorted(dialogue + sounds, key=lambda c: (c["start_ms"], c["end_ms"], 0 if c["type"] == "dialogue" else 1))
     # Broadcast: enforce minimum display duration so short cues are readable
+    for _ in range(2):
+        final = _apply_minimum_display_duration(final)
+        final = _apply_sound_min_duration(final)
+        final = _resolve_dialogue_overlaps(final)
+    final = _reduce_high_cps(final)
     final = _apply_minimum_display_duration(final)
-    final = _apply_sound_min_duration(final)
     final = _resolve_dialogue_overlaps(final)
     final = _lowercase_continuation_at_cue_start(final)
     final = _cross_cue_period_to_comma(final)
@@ -1803,4 +2359,7 @@ if __name__ == "__main__":
         with open(sys.argv[2]) as f:
             raw = json.load(f)
         result = process_caption_job(srt_text, raw, [])
-        print(result["srt"])
+        if result.get("srt"):
+            print(result["srt"])
+        elif result.get("ttml"):
+            print(result["ttml"])
