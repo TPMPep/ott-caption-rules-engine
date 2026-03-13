@@ -686,7 +686,7 @@ def process_caption_job(
         if OUTPUT_FORMATS_ENV:
             output_formats = [f.strip().lower() for f in OUTPUT_FORMATS_ENV.split(",") if f.strip()]
         else:
-            output_formats = ["ttml"]
+            output_formats = ["ttml", "srt"]
 
     backbone = _parse_srt(backbone_srt_text)
     tokens = normalize_tokens(timestamps)
