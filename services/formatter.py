@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Project imports with local fallbacks for robustness/testability.
 try:
-    from services.assembly import normalize_tokens as _normalize_tokens, is_sound_token as _is_sound_token
+    from .assembly import normalize_tokens as _normalize_tokens, is_sound_token as _is_sound_token
 except Exception:
     def _normalize_tokens(timestamps: Any) -> List[Dict[str, Any]]:
         source: List[Dict[str, Any]] = []
@@ -36,7 +36,7 @@ except Exception:
         return text.startswith("[") and text.endswith("]")
 
 try:
-    from services.exporters import (
+    from .exporters import (
         parse_srt as _parse_srt,
         export_srt as _export_srt,
         export_vtt as _export_vtt,
@@ -279,7 +279,7 @@ def _validate_ttml(ttml_text: str, protected: List[str]) -> List[str]:
     return errors
 
 try:
-    from services.qc import qc_report as _qc_report
+    from .qc import qc_report as _qc_report
 except Exception:
     def _qc_report(cues_in: int, cues_out: List[Dict[str, Any]], protected_phrases: List[str]) -> Dict[str, Any]:
         return {"input_cues": cues_in, "output_cues": len(cues_out), "protected_phrases": protected_phrases}
@@ -305,19 +305,26 @@ MAX_TWO_SPEAKER_WINDOW_MS = 4500
 # For NBCU profile we force this to empty (no inline tags allowed).
 DEFAULT_INLINE_DIALOGUE_TAGS = {"[INAUDIBLE]", "[UNINTELLIGIBLE]"}
 INLINE_DIALOGUE_TAGS_RAW = os.getenv("INLINE_DIALOGUE_TAGS", "").strip()
-INLINE_DIALOGUE_TAGS = set(DEFAULT_INLINE_DIALOGUE_TAGS)
-if INLINE_DIALOGUE_TAGS_RAW:
-    INLINE_DIALOGUE_TAGS = set()
-    for part in INLINE_DIALOGUE_TAGS_RAW.split(","):
-        tag = part.strip()
-        if not tag:
-            continue
-        tag = tag.upper()
-        if not tag.startswith("["):
-            tag = f"[{tag}]"
-        if not tag.endswith("]"):
-            tag = f"{tag}]"
-        INLINE_DIALOGUE_TAGS.add(tag)
+
+
+def _parse_inline_dialogue_tags(raw: str) -> set:
+    if raw:
+        tags = set()
+        for part in raw.split(","):
+            tag = part.strip()
+            if not tag:
+                continue
+            tag = tag.upper()
+            if not tag.startswith("["):
+                tag = f"[{tag}]"
+            if not tag.endswith("]"):
+                tag = f"{tag}]"
+            tags.add(tag)
+        return tags
+    return set(DEFAULT_INLINE_DIALOGUE_TAGS)
+
+
+INLINE_DIALOGUE_TAGS = _parse_inline_dialogue_tags(INLINE_DIALOGUE_TAGS_RAW)
 FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for",
     "that", "this", "these", "those", "is", "are", "was", "were", "be", "been", "being", "it", "i",
@@ -325,7 +332,8 @@ FUNCTION_WORDS = {
 WEAK_ENDS = FUNCTION_WORDS | {"who", "what", "which", "when", "where", "why", "how", "well", "still"}
 WEAK_STARTS = {"and", "or", "but", "to", "of", "for", "with", "because", "that", "this", "these", "those"}
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
-ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]", "[BLEEP]"}
+DEFAULT_ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]", "[BLEEP]"}
+ALLOWED_SOUND = set(DEFAULT_ALLOWED_SOUND)
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5, "[BLEEP]": 6}
 MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
@@ -593,10 +601,73 @@ def _apply_profile_settings() -> None:
         MERGE_GAP_MS = _env_int("CUSTOM_MERGE_GAP_MS", MERGE_GAP_MS)
         VALIDATE_TTML = "0" if VALIDATE_TTML == "" else VALIDATE_TTML
         FAIL_ON_TTML_VALIDATION = "0" if FAIL_ON_TTML_VALIDATION == "" else FAIL_ON_TTML_VALIDATION
+        INLINE_DIALOGUE_TAGS = _parse_inline_dialogue_tags(INLINE_DIALOGUE_TAGS_RAW)
+        ALLOWED_SOUND = set(DEFAULT_ALLOWED_SOUND)
     MAX_CUE_CHARS = MAX_LINES * MAX_CHARS
 
 
 _apply_profile_settings()
+
+
+def _reload_config_from_env() -> None:
+    global TIMECODE_OFFSET_MS, ALIGNMENT_DEFAULT, ITALICIZE_PHRASES_RAW, ITALICIZE_TITLES, ITALICIZE_TITLES_MIN_WORDS
+    global SPEAKER_LABEL_MODE, SPEAKER_LABEL_SINGLE, SPEAKER_GENERIC_PREFIX, SPEAKER_NAME_MAP_RAW, SPEAKER_LABEL_FORMAT
+    global SOUND_LABEL_STYLE, TTML_TIMEBASE, TTML_FRAME_RATE, TTML_FRAME_RATE_MULTIPLIER, TTML_TEXT_ALIGN
+    global OUTPUT_FORMATS_ENV, CAPTION_PROFILE, SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
+    global INLINE_DIALOGUE_TAGS_RAW, INLINE_DIALOGUE_TAGS, ITALICIZE_PHRASES, SPEAKER_NAME_MAP, MUSIC_LONG_ONLY_MS
+
+    TIMECODE_OFFSET_MS = int(os.getenv("TIMECODE_OFFSET_MS", "0") or 0)
+    ALIGNMENT_DEFAULT = os.getenv("ALIGNMENT_DEFAULT", "an2")
+    ITALICIZE_PHRASES_RAW = os.getenv("ITALICIZE_PHRASES", "").strip()
+    ITALICIZE_TITLES = os.getenv("ITALICIZE_TITLES", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    ITALICIZE_TITLES_MIN_WORDS = int(os.getenv("ITALICIZE_TITLES_MIN_WORDS", "3") or 3)
+
+    SPEAKER_LABEL_MODE = os.getenv("SPEAKER_LABEL_MODE", "dash").strip().lower()
+    SPEAKER_LABEL_SINGLE = os.getenv("SPEAKER_LABEL_SINGLE", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    SPEAKER_GENERIC_PREFIX = os.getenv("SPEAKER_GENERIC_PREFIX", "SPEAKER").strip() or "SPEAKER"
+    SPEAKER_NAME_MAP_RAW = os.getenv("SPEAKER_NAME_MAP", "").strip()
+    SPEAKER_LABEL_FORMAT = os.getenv("SPEAKER_LABEL_FORMAT", "prefix").strip().lower()
+
+    SOUND_LABEL_STYLE = os.getenv("SOUND_LABEL_STYLE", "simple").strip().lower()
+    TTML_TIMEBASE = os.getenv("TTML_TIMEBASE", "media").strip() or "media"
+    TTML_FRAME_RATE = os.getenv("TTML_FRAME_RATE", "30").strip() or "30"
+    TTML_FRAME_RATE_MULTIPLIER = os.getenv("TTML_FRAME_RATE_MULTIPLIER", "1000 1001").strip() or "1000 1001"
+    TTML_TEXT_ALIGN = os.getenv("TTML_TEXT_ALIGN", "center").strip().lower() or "center"
+
+    OUTPUT_FORMATS_ENV = os.getenv("OUTPUT_FORMATS", "").strip()
+    CAPTION_PROFILE = os.getenv("CAPTION_PROFILE", "nbcu").strip().lower() or "nbcu"
+    SOUND_DENSITY = os.getenv("SOUND_DENSITY", "conservative").strip().lower() or "conservative"
+    VALIDATE_TTML = os.getenv("VALIDATE_TTML", "").strip().lower()
+    FAIL_ON_TTML_VALIDATION = os.getenv("FAIL_ON_TTML_VALIDATION", "").strip().lower()
+
+    INLINE_DIALOGUE_TAGS_RAW = os.getenv("INLINE_DIALOGUE_TAGS", "").strip()
+    INLINE_DIALOGUE_TAGS = _parse_inline_dialogue_tags(INLINE_DIALOGUE_TAGS_RAW)
+    MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
+
+    _apply_profile_settings()
+    ITALICIZE_PHRASES = _parse_italicize_phrases()
+    SPEAKER_NAME_MAP = _parse_speaker_name_map()
+
+
+def apply_env_overrides(env: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    if not env:
+        return {}
+    snapshot = {k: os.environ.get(k) for k in env.keys()}
+    for key, value in env.items():
+        os.environ[str(key)] = str(value)
+    _reload_config_from_env()
+    return snapshot
+
+
+def restore_env_overrides(snapshot: Dict[str, Optional[str]]) -> None:
+    if not snapshot:
+        return
+    for key, value in snapshot.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    _reload_config_from_env()
 
 
 def process_caption_job(
