@@ -1,17 +1,18 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 import uuid
 import traceback
 
-from services.assembly import (
+from Services.assembly import (
     submit_transcription_job,
     wait_for_transcription_result,
+    fetch_transcript_result,
     build_caption_inputs_from_assembly_result,
 )
-from services.formatter import process_caption_job
+from Services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
 
 app = FastAPI(title="OTT Caption Rules Engine", version="3.1.1")
 
@@ -44,11 +45,17 @@ class CaptionRules(BaseModel):
 
 
 class CreateJobRequest(BaseModel):
-    mediaUrl: HttpUrl
+    mediaUrl: Optional[HttpUrl] = None
+    transcript_id: Optional[str] = None
+    reformat_only: bool = False
     speakerLabels: bool = True
     languageDetection: bool = True
     allowHttp: bool = True
     captionRules: Optional[CaptionRules] = None
+    captionOptions: Optional[Dict[str, Any]] = None
+    env: Optional[Dict[str, Any]] = None
+    output_formats: Optional[List[str]] = None
+    protected_phrases: Optional[List[str]] = None
 
 
 # -----------------------------
@@ -57,6 +64,17 @@ class CreateJobRequest(BaseModel):
 
 def utc_now() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+
+def parse_output_formats(payload: Dict[str, Any]) -> Optional[List[str]]:
+    if isinstance(payload.get("output_formats"), list) and payload.get("output_formats"):
+        return [str(f).strip().lower() for f in payload["output_formats"] if str(f).strip()]
+    env = payload.get("env") or {}
+    if isinstance(env, dict):
+        raw = env.get("OUTPUT_FORMATS")
+        if raw:
+            return [f.strip().lower() for f in str(raw).split(",") if f.strip()]
+    return None
 
 
 def run_caption_job(job_id: str, payload: Dict[str, Any]):
@@ -70,31 +88,48 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
     4. Run caption formatter / cleanup
     5. Store final result
     """
+    env_snapshot = None
     try:
         print(f"[{job_id}] Starting caption job")
         print(f"[{job_id}] Input payload: {payload}")
 
-        JOBS[job_id]["status"] = "transcribing"
-        JOBS[job_id]["updated_at"] = utc_now()
+        env_snapshot = apply_env_overrides(payload.get("env") or {})
+        output_formats = parse_output_formats(payload)
+        protected_phrases = payload.get("protected_phrases") or []
 
-        media_url = str(payload["mediaUrl"])
-        speaker_labels = payload.get("speakerLabels", True)
-        language_detection = payload.get("languageDetection", True)
+        if payload.get("reformat_only"):
+            transcript_id = payload.get("transcript_id")
+            if not transcript_id:
+                raise ValueError("transcript_id is required when reformat_only=true")
 
-        print(f"[{job_id}] Submitting to AssemblyAI: {media_url}")
-        transcript_id = submit_transcription_job(
-            media_url=media_url,
-            speaker_labels=speaker_labels,
-            language_detection=language_detection,
-        )
+            JOBS[job_id]["status"] = "processing"
+            JOBS[job_id]["updated_at"] = utc_now()
+            JOBS[job_id]["assemblyai_transcript_id"] = transcript_id
 
-        print(f"[{job_id}] AssemblyAI transcript id: {transcript_id}")
-        JOBS[job_id]["assemblyai_transcript_id"] = transcript_id
-        JOBS[job_id]["status"] = "processing"
-        JOBS[job_id]["updated_at"] = utc_now()
+            print(f"[{job_id}] Reformat-only: fetching AssemblyAI transcript {transcript_id}")
+            assembly_result = fetch_transcript_result(transcript_id, require_completed=True)
+        else:
+            JOBS[job_id]["status"] = "transcribing"
+            JOBS[job_id]["updated_at"] = utc_now()
 
-        print(f"[{job_id}] Waiting for AssemblyAI result...")
-        assembly_result = wait_for_transcription_result(transcript_id)
+            media_url = str(payload["mediaUrl"])
+            speaker_labels = payload.get("speakerLabels", True)
+            language_detection = payload.get("languageDetection", True)
+
+            print(f"[{job_id}] Submitting to AssemblyAI: {media_url}")
+            transcript_id = submit_transcription_job(
+                media_url=media_url,
+                speaker_labels=speaker_labels,
+                language_detection=language_detection,
+            )
+
+            print(f"[{job_id}] AssemblyAI transcript id: {transcript_id}")
+            JOBS[job_id]["assemblyai_transcript_id"] = transcript_id
+            JOBS[job_id]["status"] = "processing"
+            JOBS[job_id]["updated_at"] = utc_now()
+
+            print(f"[{job_id}] Waiting for AssemblyAI result...")
+            assembly_result = wait_for_transcription_result(transcript_id)
 
         print(f"[{job_id}] AssemblyAI transcription completed")
         print(f"[{job_id}] Building formatter inputs from AssemblyAI result")
@@ -106,8 +141,8 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
         caption_result = process_caption_job(
             backbone_srt_text=backbone_srt_text,
             timestamps=timestamps_json,
-            protected_phrases=[],
-            output_formats=["srt"],
+            protected_phrases=protected_phrases,
+            output_formats=output_formats,
         )
 
         print(f"[{job_id}] Caption job completed successfully")
@@ -127,6 +162,9 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
             "message": str(e),
             "trace": traceback.format_exc(),
         }
+    finally:
+        if env_snapshot is not None:
+            restore_env_overrides(env_snapshot)
 
 
 # -----------------------------
@@ -154,6 +192,13 @@ def create_job(payload: CreateJobRequest, background_tasks: BackgroundTasks):
     print(f"[{job_id}] Job created")
 
     payload_data = payload.model_dump(mode="json")
+
+    if payload_data.get("reformat_only"):
+        if not payload_data.get("transcript_id"):
+            raise HTTPException(status_code=400, detail="transcript_id is required when reformat_only=true")
+    else:
+        if not payload_data.get("mediaUrl"):
+            raise HTTPException(status_code=400, detail="mediaUrl is required for new transcription jobs")
 
     JOBS[job_id] = {
         "id": job_id,
