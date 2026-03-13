@@ -6,13 +6,13 @@ from datetime import datetime
 import uuid
 import traceback
 
-from Services.assembly import (
+from services.assembly import (
     submit_transcription_job,
     wait_for_transcription_result,
     fetch_transcript_result,
     build_caption_inputs_from_assembly_result,
 )
-from Services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
+from services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
 
 app = FastAPI(title="OTT Caption Rules Engine", version="3.1.1")
 
