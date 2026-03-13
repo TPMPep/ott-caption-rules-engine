@@ -340,12 +340,15 @@ DETERMINER_ENDS = {"a", "an", "the", "this", "that", "these", "those", "my", "yo
 PREPOSITION_STARTS = {"of", "for", "to", "about", "into", "from", "with", "in", "on", "at", "by", "over", "under", "after", "before", "between", "through", "without"}
 PREPOSITION_ENDS = set(PREPOSITION_STARTS)
 AUX_ENDS = {"i'm", "i've", "i'd", "you're", "you've", "you'd", "we're", "we've", "we'd", "they're", "they've", "they'd", "he's", "she's", "it's"}
+PRONOUN_STARTS = {"i", "you", "he", "she", "it", "we", "they", "i'm", "i've", "i'd", "you're", "you've", "you'd", "we're", "we've", "we'd", "they're", "they've", "they'd", "he's", "she's", "it's"}
+INTERJECTION_STARTS = {"oh", "yeah", "yep", "no", "yes", "okay", "ok", "well", "wow", "uh", "um", "ah", "hey", "sorry", "thanks", "thank"}
 CONNECTORS = {"of", "the", "and", "a", "an", "to", "for", "with", "vs", "v", "de", "du", "la", "le", "von"}
 DEFAULT_ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[SFX]", "[BLEEP]"}
 ALLOWED_SOUND = set(DEFAULT_ALLOWED_SOUND)
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5, "[BLEEP]": 6}
 MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
-PAUSE_ELLIPSIS = os.getenv("PAUSE_ELLIPSIS", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+PAUSE_ELLIPSIS_RAW = os.getenv("PAUSE_ELLIPSIS", "").strip()
+PAUSE_ELLIPSIS = PAUSE_ELLIPSIS_RAW.lower() in {"1", "true", "yes", "y", "on"}
 PAUSE_ELLIPSIS_MS = int(os.getenv("PAUSE_ELLIPSIS_MS", "1500") or 1500)
 # Single-word dialogue cues allowed to stay as their own cue (not merged with previous)
 ALLOWED_STANDALONE_WORDS = {"yes", "no", "ok", "okay", "right", "correct", "wrong", "maybe", "sure", "absolutely", "exactly", "never"}
@@ -578,7 +581,7 @@ def _apply_profile_settings() -> None:
     global MIN_DISPLAY_MS, MIN_SOUND_DISPLAY_MS, MIN_SOUND_MS, SOUND_CLUSTER_GAP_MS, MERGE_GAP_MS
     global SPEAKER_LABEL_MODE, SPEAKER_LABEL_SINGLE, SPEAKER_LABEL_FORMAT, SOUND_LABEL_STYLE, ALIGNMENT_DEFAULT
     global SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
-    global INLINE_DIALOGUE_TAGS, ALLOWED_SOUND, EM_DASH_SPLIT
+    global INLINE_DIALOGUE_TAGS, ALLOWED_SOUND, EM_DASH_SPLIT, PAUSE_ELLIPSIS
     # NBCU profile locks
     if CAPTION_PROFILE == "nbcu":
         MAX_LINES = 2
@@ -603,6 +606,9 @@ def _apply_profile_settings() -> None:
         # NBCU: enable em-dash speaker splitting unless explicitly disabled
         if not EM_DASH_SPLIT_RAW:
             EM_DASH_SPLIT = True
+        # NBCU: enable pause ellipsis unless explicitly disabled
+        if not PAUSE_ELLIPSIS_RAW:
+            PAUSE_ELLIPSIS = True
         VALIDATE_TTML = "1" if VALIDATE_TTML == "" else VALIDATE_TTML
         FAIL_ON_TTML_VALIDATION = "1" if FAIL_ON_TTML_VALIDATION == "" else FAIL_ON_TTML_VALIDATION
     elif CAPTION_PROFILE == "custom":
@@ -631,7 +637,7 @@ def _reload_config_from_env() -> None:
     global SOUND_LABEL_STYLE, TTML_TIMEBASE, TTML_FRAME_RATE, TTML_FRAME_RATE_MULTIPLIER, TTML_TEXT_ALIGN
     global OUTPUT_FORMATS_ENV, CAPTION_PROFILE, SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
     global INLINE_DIALOGUE_TAGS_RAW, INLINE_DIALOGUE_TAGS, ITALICIZE_PHRASES, SPEAKER_NAME_MAP, MUSIC_LONG_ONLY_MS
-    global PAUSE_ELLIPSIS, PAUSE_ELLIPSIS_MS
+    global PAUSE_ELLIPSIS_RAW, PAUSE_ELLIPSIS, PAUSE_ELLIPSIS_MS
     global EM_DASH_SPLIT_RAW, EM_DASH_SPLIT
 
     TIMECODE_OFFSET_MS = int(os.getenv("TIMECODE_OFFSET_MS", "0") or 0)
@@ -663,7 +669,8 @@ def _reload_config_from_env() -> None:
     EM_DASH_SPLIT = EM_DASH_SPLIT_RAW.lower() in {"1", "true", "yes", "y", "on"}
     INLINE_DIALOGUE_TAGS = _parse_inline_dialogue_tags(INLINE_DIALOGUE_TAGS_RAW)
     MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
-    PAUSE_ELLIPSIS = os.getenv("PAUSE_ELLIPSIS", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    PAUSE_ELLIPSIS_RAW = os.getenv("PAUSE_ELLIPSIS", "").strip()
+    PAUSE_ELLIPSIS = PAUSE_ELLIPSIS_RAW.lower() in {"1", "true", "yes", "y", "on"}
     PAUSE_ELLIPSIS_MS = int(os.getenv("PAUSE_ELLIPSIS_MS", "1500") or 1500)
 
     _apply_profile_settings()
@@ -1502,6 +1509,17 @@ def _split_tokens_on_dash(tokens: List[Dict[str, Any]]) -> Optional[Tuple[List[D
         right = tokens[split_idx + 1:]
     if not left or not right:
         return None
+    right_text = normalize_space(join_tokens(right))
+    right_first = right_text.split()[0].lower() if right_text.split() else ""
+    # Be conservative: only treat dash as speaker turn when the right side looks like an interjection
+    # or a short question/exclamation. Otherwise, assume it's the same speaker continuing.
+    if right_first in PRONOUN_STARTS or right_first in DETERMINER_ENDS:
+        return None
+    if right_first in INTERJECTION_STARTS:
+        return left, right
+    if len(right_text.split()) <= 5 and re.search(r"[!?]$", right_text):
+        return left, right
+    return None
     return left, right
 
 
@@ -1725,6 +1743,43 @@ def segment_single_speaker_atom(atom: Dict[str, Any], run: Dict[str, Any], prote
             "meta": {"dialogue_text": text, "runs": [{"speaker": run["speaker"], "text": text, "tokens": chunk, "start_ms": start_ms, "end_ms": end_ms}], "two_speaker": False, "force_break": force_break},
         })
         i = end
+
+    # If the last cue is a single-word fragment, try to rebalance by moving a few words from the previous cue.
+    if len(out) >= 2:
+        last = out[-1]
+        prev = out[-2]
+        last_text = last.get("meta", {}).get("dialogue_text", "")
+        if last_text:
+            last_words = last_text.split()
+            last_word = sanitize_last_word(last_text).lower()
+            if len(last_words) == 1 and last_word not in ALLOWED_STANDALONE_WORDS:
+                prev_runs = prev.get("meta", {}).get("runs", [])
+                last_runs = last.get("meta", {}).get("runs", [])
+                if prev_runs and last_runs:
+                    prev_tokens = prev_runs[0].get("tokens", [])
+                    last_tokens = last_runs[0].get("tokens", [])
+                    if prev_tokens and last_tokens and len(prev_tokens) > MIN_FRAGMENT_WORDS:
+                        max_move = min(4, len(prev_tokens) - MIN_FRAGMENT_WORDS)
+                        for k in range(1, max_move + 1):
+                            new_prev_tokens = prev_tokens[:-k]
+                            new_last_tokens = prev_tokens[-k:] + last_tokens
+                            prev_text = apply_asr_corrections(repair_continuing_punctuation(join_tokens(new_prev_tokens)))
+                            last_text_new = apply_asr_corrections(repair_continuing_punctuation(join_tokens(new_last_tokens)))
+                            if maybe_best_layout(prev_text, protected) is None or maybe_best_layout(last_text_new, protected) is None:
+                                continue
+                            prev["meta"]["runs"][0]["tokens"] = new_prev_tokens
+                            prev["meta"]["runs"][0]["text"] = prev_text
+                            prev["meta"]["dialogue_text"] = prev_text
+                            prev["lines"] = best_layout(prev_text, protected)
+                            prev["end_ms"] = new_prev_tokens[-1]["end_ms"]
+
+                            last["meta"]["runs"][0]["tokens"] = new_last_tokens
+                            last["meta"]["runs"][0]["text"] = last_text_new
+                            last["meta"]["dialogue_text"] = last_text_new
+                            last["lines"] = best_layout(last_text_new, protected)
+                            last["start_ms"] = new_last_tokens[0]["start_ms"]
+                            last["end_ms"] = new_last_tokens[-1]["end_ms"]
+                            break
 
     # Merge any leftover micro-fragments created by timing gaps.
     merged: List[Dict[str, Any]] = []
@@ -2078,6 +2133,11 @@ def merge_dash_split_pairs(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     left = re.sub(r"[—\-]\\s*$", "—", cur_text).strip()
                     right = nxt_text.strip()
                     if left and right:
+                        right_first = right.split()[0].lower() if right.split() else ""
+                        if right_first in PRONOUN_STARTS or right_first in DETERMINER_ENDS:
+                            out.append(cur)
+                            i += 1
+                            continue
                         if _visible_len(left) <= MAX_CHARS - 2 and _visible_len(right) <= MAX_CHARS - 2 and text_word_count(left) <= 8 and text_word_count(right) <= 8:
                             runs = (cur.get("meta", {}).get("runs", []) or []) + (nxt.get("meta", {}).get("runs", []) or [])
                             out.append({
@@ -2476,12 +2536,12 @@ def _capitalize_cue_starts(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for i, c in enumerate(cues):
         if c.get("type") != "dialogue" or not c.get("lines"):
             continue
-        # Skip if previous cue ended with comma (this cue is continuation; keep lowercase)
+        # Skip if previous cue did NOT end a sentence (continuation; keep lowercase)
         if i > 0:
             prev = cues[i - 1]
             if prev.get("type") == "dialogue" and prev.get("lines"):
                 last_prev = (prev["lines"][-1] or "").strip()
-                if last_prev and last_prev[-1] == ",":
+                if last_prev and not re.search(r"[.!?]$", last_prev):
                     continue
         line = c["lines"][0]
         if not line:
@@ -2552,7 +2612,7 @@ def _cross_cue_period_to_comma(cues: List[Dict[str, Any]]) -> List[Dict[str, Any
 
 
 def _lowercase_continuation_at_cue_start(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Only when previous cue ended with a COMMA (mid-sentence): lowercase continuation word at cue start. Never after period (new sentence)."""
+    """If previous cue did NOT end a sentence, lowercase the next cue's first word (unless it's 'I' or all-caps)."""
     for i in range(1, len(cues)):
         c = cues[i]
         if c.get("type") != "dialogue" or not c.get("lines"):
@@ -2561,7 +2621,10 @@ def _lowercase_continuation_at_cue_start(cues: List[Dict[str, Any]]) -> List[Dic
         if prev.get("type") != "dialogue" or not prev.get("lines"):
             continue
         last_prev = (prev["lines"][-1] or "").strip()
-        if not last_prev or last_prev[-1] != ",":
+        if not last_prev:
+            continue
+        # If previous cue ended a sentence, keep capitalization.
+        if re.search(r"[.!?]$", last_prev):
             continue
         first_line = (c["lines"][0] or "").strip()
         if not first_line:
@@ -2570,9 +2633,13 @@ def _lowercase_continuation_at_cue_start(cues: List[Dict[str, Any]]) -> List[Dic
         if first_line.startswith("- "):
             prefix, first_line = "- ", first_line[2:].lstrip()
         words = first_line.split()
-        if not words or words[0].lower() not in CONTINUATION_STARTERS:
+        if not words:
             continue
-        words[0] = words[0].lower()
+        first = words[0]
+        # Keep proper 'I' pronoun and all-caps tokens
+        if first in {"I", "I'm", "I've", "I'd", "I'll", "I’m", "I’ve", "I’d", "I’ll"} or (len(first) > 1 and first.isupper()):
+            continue
+        words[0] = first.lower()
         c["lines"][0] = prefix + " ".join(words)
     return cues
 
