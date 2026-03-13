@@ -384,6 +384,8 @@ CAPTION_PROFILE = os.getenv("CAPTION_PROFILE", "nbcu").strip().lower()  # nbcu|c
 SOUND_DENSITY = os.getenv("SOUND_DENSITY", "conservative").strip().lower()  # conservative|balanced|aggressive
 VALIDATE_TTML = os.getenv("VALIDATE_TTML", "").strip().lower()
 FAIL_ON_TTML_VALIDATION = os.getenv("FAIL_ON_TTML_VALIDATION", "").strip().lower()
+EM_DASH_SPLIT_RAW = os.getenv("EM_DASH_SPLIT", "").strip()
+EM_DASH_SPLIT = EM_DASH_SPLIT_RAW.lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _parse_timecode(tc: str) -> Optional[int]:
@@ -570,7 +572,7 @@ def _apply_profile_settings() -> None:
     global MIN_DISPLAY_MS, MIN_SOUND_DISPLAY_MS, MIN_SOUND_MS, SOUND_CLUSTER_GAP_MS, MERGE_GAP_MS
     global SPEAKER_LABEL_MODE, SPEAKER_LABEL_SINGLE, SPEAKER_LABEL_FORMAT, SOUND_LABEL_STYLE, ALIGNMENT_DEFAULT
     global SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
-    global INLINE_DIALOGUE_TAGS, ALLOWED_SOUND
+    global INLINE_DIALOGUE_TAGS, ALLOWED_SOUND, EM_DASH_SPLIT
     # NBCU profile locks
     if CAPTION_PROFILE == "nbcu":
         MAX_LINES = 2
@@ -592,6 +594,9 @@ def _apply_profile_settings() -> None:
         INLINE_DIALOGUE_TAGS = set(DEFAULT_INLINE_DIALOGUE_TAGS)
         # NBCU: reactions + music only (music must be long; filtered later)
         ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]", "[MUSIC]"}
+        # NBCU: enable em-dash speaker splitting unless explicitly disabled
+        if not EM_DASH_SPLIT_RAW:
+            EM_DASH_SPLIT = True
         VALIDATE_TTML = "1" if VALIDATE_TTML == "" else VALIDATE_TTML
         FAIL_ON_TTML_VALIDATION = "1" if FAIL_ON_TTML_VALIDATION == "" else FAIL_ON_TTML_VALIDATION
     elif CAPTION_PROFILE == "custom":
@@ -620,6 +625,7 @@ def _reload_config_from_env() -> None:
     global SOUND_LABEL_STYLE, TTML_TIMEBASE, TTML_FRAME_RATE, TTML_FRAME_RATE_MULTIPLIER, TTML_TEXT_ALIGN
     global OUTPUT_FORMATS_ENV, CAPTION_PROFILE, SOUND_DENSITY, VALIDATE_TTML, FAIL_ON_TTML_VALIDATION
     global INLINE_DIALOGUE_TAGS_RAW, INLINE_DIALOGUE_TAGS, ITALICIZE_PHRASES, SPEAKER_NAME_MAP, MUSIC_LONG_ONLY_MS
+    global EM_DASH_SPLIT_RAW, EM_DASH_SPLIT
 
     TIMECODE_OFFSET_MS = int(os.getenv("TIMECODE_OFFSET_MS", "0") or 0)
     ALIGNMENT_DEFAULT = os.getenv("ALIGNMENT_DEFAULT", "an2")
@@ -646,6 +652,8 @@ def _reload_config_from_env() -> None:
     FAIL_ON_TTML_VALIDATION = os.getenv("FAIL_ON_TTML_VALIDATION", "").strip().lower()
 
     INLINE_DIALOGUE_TAGS_RAW = os.getenv("INLINE_DIALOGUE_TAGS", "").strip()
+    EM_DASH_SPLIT_RAW = os.getenv("EM_DASH_SPLIT", "").strip()
+    EM_DASH_SPLIT = EM_DASH_SPLIT_RAW.lower() in {"1", "true", "yes", "y", "on"}
     INLINE_DIALOGUE_TAGS = _parse_inline_dialogue_tags(INLINE_DIALOGUE_TAGS_RAW)
     MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
 
@@ -717,6 +725,7 @@ def process_caption_job(
     for atom in dialogue_atoms:
         formatted_dialogue.extend(format_dialogue_atom(atom, protected))
     formatted_dialogue = merge_fragment_dialogue_cues(formatted_dialogue, protected)
+    formatted_dialogue = merge_dash_split_pairs(formatted_dialogue)
 
     token_sound_events = build_sound_events_from_tokens(tokens)
     merged_sound = merge_sound_events(sound_events + leading_sound_events + token_sound_events)
@@ -930,6 +939,7 @@ def apply_speaker_labels(cues: List[Dict[str, Any]], speaker_map: Dict[str, str]
     if not speaker_map:
         return cues
     out: List[Dict[str, Any]] = []
+    force_break = bool(run.get("force_break"))
     for c in cues:
         if c.get("type") != "dialogue":
             out.append(c)
@@ -1381,25 +1391,30 @@ def build_runs_from_tokens(tokens: List[Dict[str, Any]], fallback_text: str) -> 
         return [{"speaker": "A", "text": text, "start_ms": 0, "end_ms": 0, "tokens": []}]
     # Use AssemblyAI token text as-is (only normalize + universal ASR fixes); preserve punctuation
     token_text = normalize_space(join_tokens(tokens))
+    runs: List[Dict[str, Any]] = []
     if len({(t.get("speaker") or "A") for t in tokens}) == 1:
-        return [{
+        runs = [{
             "speaker": tokens[0].get("speaker") or "A",
             "text": apply_asr_corrections(token_text or text),
             "start_ms": tokens[0]["start_ms"],
             "end_ms": tokens[-1]["end_ms"],
             "tokens": tokens,
         }]
-    runs: List[Dict[str, Any]] = []
-    current = [tokens[0]]
-    for tok in tokens[1:]:
-        prev = current[-1]
-        if tok["speaker"] != prev["speaker"] or tok["start_ms"] - prev["end_ms"] > SAME_SPEAKER_HARD_GAP_MS:
-            runs.append(run_from_tokens(current))
-            current = [tok]
-        else:
-            current.append(tok)
-    runs.append(run_from_tokens(current))
-    return [r for r in runs if r["text"]]
+    else:
+        current = [tokens[0]]
+        for tok in tokens[1:]:
+            prev = current[-1]
+            if tok["speaker"] != prev["speaker"] or tok["start_ms"] - prev["end_ms"] > SAME_SPEAKER_HARD_GAP_MS:
+                runs.append(run_from_tokens(current))
+                current = [tok]
+            else:
+                current.append(tok)
+        runs.append(run_from_tokens(current))
+
+    if EM_DASH_SPLIT:
+        runs = _split_runs_on_dash(runs)
+    return [r for r in runs if r.get("text")]
+    # (runs built above)
 
 
 def run_from_tokens(tokens: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1411,6 +1426,79 @@ def run_from_tokens(tokens: List[Dict[str, Any]]) -> Dict[str, Any]:
         "end_ms": tokens[-1]["end_ms"],
         "tokens": tokens,
     }
+
+
+def _split_tokens_on_dash(tokens: List[Dict[str, Any]]) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+    """Split tokens into two segments when an em dash/hyphen indicates a speaker change."""
+    split_idx: Optional[int] = None
+    split_mode: Optional[str] = None
+    for i, tok in enumerate(tokens):
+        text = (tok.get("text") or "").strip()
+        if not text:
+            continue
+        if text in {"-", "—"}:
+            split_idx = i
+            split_mode = "token"
+            break
+        if text.endswith("—") or text.endswith("-"):
+            split_idx = i
+            split_mode = "end"
+            break
+        if text.startswith("—") or text.startswith("-"):
+            split_idx = i
+            split_mode = "start"
+            break
+    if split_idx is None:
+        return None
+    if split_mode == "start":
+        left = tokens[:split_idx]
+        right = tokens[split_idx:]
+    else:
+        left = tokens[:split_idx + 1]
+        right = tokens[split_idx + 1:]
+    if not left or not right:
+        return None
+    return left, right
+
+
+def _split_runs_on_dash(runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not runs:
+        return runs
+    out: List[Dict[str, Any]] = []
+    for run in runs:
+        tokens = run.get("tokens") or []
+        split = _split_tokens_on_dash(tokens) if tokens else None
+        if not split:
+            out.append(run)
+            continue
+        left_tokens, right_tokens = split
+        left_text = apply_asr_corrections(repair_continuing_punctuation(join_tokens(left_tokens)))
+        right_text = apply_asr_corrections(repair_continuing_punctuation(join_tokens(right_tokens)))
+        left_text = re.sub(r"[—\-]\s*$", "", left_text).strip()
+        right_text = re.sub(r"^[—\-]\s*", "", right_text).strip()
+        if not left_text or not right_text:
+            out.append(run)
+            continue
+        speaker_id = run.get("speaker") or (tokens[0].get("speaker") if tokens else "A")
+        out.append({
+            "speaker": speaker_id or "A",
+            "text": left_text,
+            "start_ms": left_tokens[0]["start_ms"],
+            "end_ms": left_tokens[-1]["end_ms"],
+            "tokens": left_tokens,
+            "dash_split": True,
+            "force_break": True,
+        })
+        out.append({
+            "speaker": speaker_id or "A",
+            "text": right_text,
+            "start_ms": right_tokens[0]["start_ms"],
+            "end_ms": right_tokens[-1]["end_ms"],
+            "tokens": right_tokens,
+            "dash_split": True,
+            "force_break": True,
+        })
+    return out
 
 
 # ------------ dialogue atoms ------------
@@ -1452,7 +1540,12 @@ def make_atom(runs: List[Dict[str, Any]], two_speaker: bool, win: Dict[str, Any]
         "end_ms": max(end, start + 1),
         "lines": [],
         "type": "dialogue",
-        "meta": {"dialogue_text": repair_continuing_punctuation(normalize_space(" ".join(r["text"] for r in runs))), "runs": runs, "two_speaker": two_speaker},
+        "meta": {
+            "dialogue_text": repair_continuing_punctuation(normalize_space(" ".join(r["text"] for r in runs))),
+            "runs": runs,
+            "two_speaker": two_speaker,
+            "force_break": any(r.get("force_break") for r in runs),
+        },
     }
 
 
@@ -1463,6 +1556,9 @@ def merge_same_speaker_atoms(atoms: List[Dict[str, Any]], protected: List[str]) 
     for atom in atoms[1:]:
         prev = merged[-1]
         if prev["meta"].get("two_speaker") or atom["meta"].get("two_speaker"):
+            merged.append(atom)
+            continue
+        if prev["meta"].get("force_break") or atom["meta"].get("force_break"):
             merged.append(atom)
             continue
         pruns = prev["meta"].get("runs", [])
@@ -1492,20 +1588,28 @@ def pack_adjacent_two_speaker(atoms: List[Dict[str, Any]]) -> List[Dict[str, Any
             nxt = atoms[i + 1]
             ar = atom["meta"].get("runs", [])
             nr = nxt["meta"].get("runs", [])
-            if not atom["meta"].get("two_speaker") and not nxt["meta"].get("two_speaker") and len(ar) == len(nr) == 1 and ar[0]["speaker"] != nr[0]["speaker"]:
-                left = normalize_space(ar[0]["text"])
-                right = normalize_space(nr[0]["text"])
-                if _visible_len(left) <= MAX_CHARS - 2 and _visible_len(right) <= MAX_CHARS - 2 and text_word_count(left) <= 8 and text_word_count(right) <= 8 and nxt["start_ms"] - atom["end_ms"] <= TWO_SPEAKER_GAP_MS and nxt["end_ms"] - atom["start_ms"] <= MAX_TWO_SPEAKER_WINDOW_MS:
-                    packed.append({
-                        "idx": 0,
-                        "start_ms": atom["start_ms"],
-                        "end_ms": nxt["end_ms"],
-                        "lines": [],
-                        "type": "dialogue",
-                        "meta": {"dialogue_text": repair_continuing_punctuation(normalize_space(f"{left} {right}")), "runs": ar + nr, "two_speaker": True},
-                    })
-                    i += 2
-                    continue
+            if not atom["meta"].get("two_speaker") and not nxt["meta"].get("two_speaker") and len(ar) == len(nr) == 1:
+                dash_pair = bool(ar[0].get("dash_split") and nr[0].get("dash_split"))
+                speaker_diff = ar[0]["speaker"] != nr[0]["speaker"]
+                if dash_pair or speaker_diff:
+                    left = normalize_space(ar[0]["text"])
+                    right = normalize_space(nr[0]["text"])
+                    if can_two_speaker([ar[0], nr[0]]) and _visible_len(left) <= MAX_CHARS - 2 and _visible_len(right) <= MAX_CHARS - 2:
+                        packed.append({
+                            "idx": 0,
+                            "start_ms": atom["start_ms"],
+                            "end_ms": nxt["end_ms"],
+                            "lines": [],
+                            "type": "dialogue",
+                            "meta": {
+                                "dialogue_text": repair_continuing_punctuation(normalize_space(f"{left} {right}")),
+                                "runs": ar + nr,
+                                "two_speaker": True,
+                                "force_break": dash_pair or atom["meta"].get("force_break") or nxt["meta"].get("force_break"),
+                            },
+                        })
+                        i += 2
+                        continue
         packed.append(atom)
         i += 1
     return packed
@@ -1548,8 +1652,11 @@ def segment_single_speaker_atom(atom: Dict[str, Any], run: Dict[str, Any], prote
     tokens = run.get("tokens") or []
     if not tokens:
         out = atom.copy()
+        if "meta" in out and isinstance(out["meta"], dict):
+            out["meta"]["force_break"] = bool(run.get("force_break"))
         out["lines"] = best_layout(normalize_space(run["text"]), protected)
         return [out]
+    force_break = bool(run.get("force_break"))
     out: List[Dict[str, Any]] = []
     i = 0
     while i < len(tokens):
@@ -1571,7 +1678,7 @@ def segment_single_speaker_atom(atom: Dict[str, Any], run: Dict[str, Any], prote
             "end_ms": max(end_ms, start_ms + 1),
             "lines": lines,
             "type": "dialogue",
-            "meta": {"dialogue_text": text, "runs": [{"speaker": run["speaker"], "text": text, "tokens": chunk, "start_ms": start_ms, "end_ms": end_ms}], "two_speaker": False},
+            "meta": {"dialogue_text": text, "runs": [{"speaker": run["speaker"], "text": text, "tokens": chunk, "start_ms": start_ms, "end_ms": end_ms}], "two_speaker": False, "force_break": force_break},
         })
         i = end
 
@@ -1581,6 +1688,9 @@ def segment_single_speaker_atom(atom: Dict[str, Any], run: Dict[str, Any], prote
         text = cue["meta"]["dialogue_text"]
         if merged and cue["start_ms"] - merged[-1]["end_ms"] <= 900:
             prev = merged[-1]
+            if prev.get("meta", {}).get("force_break") or cue.get("meta", {}).get("force_break"):
+                merged.append(cue)
+                continue
             prev_text = prev["meta"]["dialogue_text"]
             combined = repair_continuing_punctuation(normalize_space(f"{prev_text} {text}"))
             if (is_ultra_fragment(text) or is_fragment(text) or is_fragment(prev_text)) and len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
@@ -1759,6 +1869,8 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
     def can_merge(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         if a["type"] != "dialogue" or b["type"] != "dialogue":
             return False
+        if a.get("meta", {}).get("force_break") or b.get("meta", {}).get("force_break"):
+            return False
         if a.get("meta", {}).get("two_speaker") or b.get("meta", {}).get("two_speaker"):
             return False
         aruns = a.get("meta", {}).get("runs", [])
@@ -1845,6 +1957,55 @@ def merge_fragment_dialogue_cues(cues: List[Dict[str, Any]], protected: List[str
             i += 1
         working = out
     return working
+
+
+def merge_dash_split_pairs(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    If an em dash at the end of a cue indicates a speaker turn, combine that cue
+    with the next cue into a two-speaker, two-line cue with leading dashes.
+    """
+    if not cues:
+        return []
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(cues):
+        cur = cues[i]
+        if (
+            i + 1 < len(cues)
+            and cur.get("type") == "dialogue"
+            and cues[i + 1].get("type") == "dialogue"
+            and not cur.get("meta", {}).get("two_speaker")
+            and not cues[i + 1].get("meta", {}).get("two_speaker")
+        ):
+            nxt = cues[i + 1]
+            gap = nxt["start_ms"] - cur["end_ms"]
+            if gap <= TWO_SPEAKER_GAP_MS:
+                cur_text = repair_continuing_punctuation(normalize_space(cur.get("meta", {}).get("dialogue_text", " ".join(cur.get("lines", [])))))
+                nxt_text = repair_continuing_punctuation(normalize_space(nxt.get("meta", {}).get("dialogue_text", " ".join(nxt.get("lines", [])))))
+                if cur_text.rstrip().endswith(("—", "-")):
+                    left = re.sub(r"[—\-]\\s*$", "—", cur_text).strip()
+                    right = nxt_text.strip()
+                    if left and right:
+                        if _visible_len(left) <= MAX_CHARS - 2 and _visible_len(right) <= MAX_CHARS - 2 and text_word_count(left) <= 8 and text_word_count(right) <= 8:
+                            runs = (cur.get("meta", {}).get("runs", []) or []) + (nxt.get("meta", {}).get("runs", []) or [])
+                            out.append({
+                                "idx": 0,
+                                "start_ms": cur["start_ms"],
+                                "end_ms": nxt["end_ms"],
+                                "lines": [f"- {left}", f"- {right}"],
+                                "type": "dialogue",
+                                "meta": {
+                                    "dialogue_text": repair_continuing_punctuation(normalize_space(f"{left} {right}")),
+                                    "runs": runs,
+                                    "two_speaker": True,
+                                    "force_break": True,
+                                },
+                            })
+                            i += 2
+                            continue
+        out.append(cur)
+        i += 1
+    return out
 
 def build_sound_events_from_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
@@ -2038,29 +2199,31 @@ def repair_global_fragments(cues: List[Dict[str, Any]], protected: List[str]) ->
                 nxt = cues[i + 1]
                 nxt_runs = nxt.get("meta", {}).get("runs", [])
                 if nxt["type"] == "dialogue" and len(nxt_runs) == 1 and nxt_runs[0].get("speaker") == cur_runs[0].get("speaker") and nxt["start_ms"] - cur["end_ms"] <= 1000:
-                    combined = repair_continuing_punctuation(normalize_space(f"{cur_text} {cue_text(nxt)}"))
-                    if len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
-                        new = dict(cur)
-                        new["end_ms"] = nxt["end_ms"]
-                        new["meta"] = dict(cur.get("meta", {}))
-                        new["meta"]["dialogue_text"] = combined
-                        new["meta"]["runs"] = [{**cur_runs[0], "text": combined, "end_ms": nxt["end_ms"], "tokens": cur_runs[0].get("tokens", []) + nxt_runs[0].get("tokens", [])}]
-                        new["lines"] = best_layout(combined, protected)
-                        out.append(new)
-                        i += 2
-                        merged = True
+                    if not (cur.get("meta", {}).get("force_break") or nxt.get("meta", {}).get("force_break")):
+                        combined = repair_continuing_punctuation(normalize_space(f"{cur_text} {cue_text(nxt)}"))
+                        if len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
+                            new = dict(cur)
+                            new["end_ms"] = nxt["end_ms"]
+                            new["meta"] = dict(cur.get("meta", {}))
+                            new["meta"]["dialogue_text"] = combined
+                            new["meta"]["runs"] = [{**cur_runs[0], "text": combined, "end_ms": nxt["end_ms"], "tokens": cur_runs[0].get("tokens", []) + nxt_runs[0].get("tokens", [])}]
+                            new["lines"] = best_layout(combined, protected)
+                            out.append(new)
+                            i += 2
+                            merged = True
             if not merged and out:
                 prev = out[-1]
                 prev_runs = prev.get("meta", {}).get("runs", []) if isinstance(prev.get("meta"), dict) else []
                 if prev.get("type") == "dialogue" and len(prev_runs) == 1 and prev_runs[0].get("speaker") == cur_runs[0].get("speaker") and cur["start_ms"] - prev["end_ms"] <= 1000:
-                    combined = repair_continuing_punctuation(normalize_space(f"{cue_text(prev)} {cur_text}"))
-                    if len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
-                        prev["end_ms"] = cur["end_ms"]
-                        prev["meta"]["dialogue_text"] = combined
-                        prev["meta"]["runs"] = [{**prev_runs[0], "text": combined, "end_ms": cur["end_ms"], "tokens": prev_runs[0].get("tokens", []) + cur_runs[0].get("tokens", [])}]
-                        prev["lines"] = best_layout(combined, protected)
-                        i += 1
-                        merged = True
+                    if not (prev.get("meta", {}).get("force_break") or cur.get("meta", {}).get("force_break")):
+                        combined = repair_continuing_punctuation(normalize_space(f"{cue_text(prev)} {cur_text}"))
+                        if len(combined) <= MAX_CUE_CHARS and maybe_best_layout(combined, protected) is not None:
+                            prev["end_ms"] = cur["end_ms"]
+                            prev["meta"]["dialogue_text"] = combined
+                            prev["meta"]["runs"] = [{**prev_runs[0], "text": combined, "end_ms": cur["end_ms"], "tokens": prev_runs[0].get("tokens", []) + cur_runs[0].get("tokens", [])}]
+                            prev["lines"] = best_layout(combined, protected)
+                            i += 1
+                            merged = True
         if not merged:
             out.append(cur)
             i += 1
@@ -2124,8 +2287,8 @@ def _apply_sound_min_duration(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 # Em dash or hyphen used in transcripts as speaker/segment separator (not content-specific)
-_EM_DASH_SEPARATOR = re.compile(r"\s*[—\-]\s+", re.U)
-EM_DASH_SPLIT = os.getenv("EM_DASH_SPLIT", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+# Require whitespace before dash so we don't split hyphenated words (e.g., "co-founder").
+_EM_DASH_SEPARATOR = re.compile(r"\s+[—\-]\s*", re.U)
 
 
 def _split_at_em_dash_segment(text: str) -> Optional[Tuple[str, str]]:
@@ -2357,10 +2520,11 @@ def _clamp_cues_to_token_bounds(cues: List[Dict[str, Any]]) -> List[Dict[str, An
                     ends.append(int(run.get("end_ms")))
         if not starts or not ends:
             continue
-        token_start = max(cue["start_ms"], min(starts))
-        token_end = min(cue["end_ms"], max(ends))
+        # Clamp directly to token span to preserve timing accuracy and avoid speaker bleed.
+        token_start = min(starts)
+        token_end = max(ends)
         if token_end <= token_start:
-            token_end = max(token_start + 1, token_end)
+            token_end = token_start + 1
         cue["start_ms"] = token_start
         cue["end_ms"] = token_end
     return cues
