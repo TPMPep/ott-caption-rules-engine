@@ -266,9 +266,14 @@ def _validate_ttml(ttml_text: str, protected: List[str]) -> List[str]:
         for line in lines:
             if len(line) > MAX_CHARS:
                 errors.append(f"Line exceeds {MAX_CHARS} chars at {begin}: {line}")
-        # sound cue mixed with dialogue
+        # sound cue mixed with dialogue (ignore inline dialogue tags like [INAUDIBLE])
         for line in lines:
-            if re.search(r"\[[^\]]+\]", line) and re.search(r"[A-Za-z]", re.sub(r"\[[^\]]+\]", "", line)):
+            def _strip_inline(m: re.Match) -> str:
+                tag = m.group(0).upper()
+                return "" if tag in INLINE_DIALOGUE_TAGS else m.group(0)
+
+            filtered = re.sub(r"\[[^\]]+\]", _strip_inline, line)
+            if re.search(r"\[[^\]]+\]", filtered) and re.search(r"[A-Za-z]", re.sub(r"\[[^\]]+\]", "", filtered)):
                 errors.append(f"Sound cue mixed with dialogue at {begin}: {line}")
         # protected phrase split across lines
         if len(lines) == 2:
@@ -584,7 +589,7 @@ def _apply_profile_settings() -> None:
         SOUND_LABEL_STYLE = "simple"
         ALIGNMENT_DEFAULT = "none"
         SOUND_DENSITY = "conservative"
-        INLINE_DIALOGUE_TAGS = set()
+        INLINE_DIALOGUE_TAGS = set(DEFAULT_INLINE_DIALOGUE_TAGS)
         # NBCU: reactions + music only (music must be long; filtered later)
         ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]", "[MUSIC]"}
         VALIDATE_TTML = "1" if VALIDATE_TTML == "" else VALIDATE_TTML
@@ -2332,6 +2337,35 @@ def _resolve_dialogue_overlaps(cues: List[Dict[str, Any]]) -> List[Dict[str, Any
     return cues
 
 
+def _clamp_cues_to_token_bounds(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Clamp dialogue cue timing to the actual token span to avoid speaker bleed."""
+    for cue in cues:
+        if cue.get("type") != "dialogue":
+            continue
+        runs = cue.get("meta", {}).get("runs", []) or []
+        starts: List[int] = []
+        ends: List[int] = []
+        for run in runs:
+            tokens = run.get("tokens") or []
+            if tokens:
+                starts.append(int(tokens[0].get("start_ms", run.get("start_ms", cue["start_ms"])) or cue["start_ms"]))
+                ends.append(int(tokens[-1].get("end_ms", run.get("end_ms", cue["end_ms"])) or cue["end_ms"]))
+            else:
+                if run.get("start_ms") is not None:
+                    starts.append(int(run.get("start_ms")))
+                if run.get("end_ms") is not None:
+                    ends.append(int(run.get("end_ms")))
+        if not starts or not ends:
+            continue
+        token_start = max(cue["start_ms"], min(starts))
+        token_end = min(cue["end_ms"], max(ends))
+        if token_end <= token_start:
+            token_end = max(token_start + 1, token_end)
+        cue["start_ms"] = token_start
+        cue["end_ms"] = token_end
+    return cues
+
+
 def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str], italic_phrases: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     italic_phrases = italic_phrases or []
@@ -2432,6 +2466,9 @@ def final_qc_cleanup(cues: List[Dict[str, Any]], protected: List[str], italic_ph
     final = _cross_cue_period_to_comma(final)
     final = _capitalize_cue_starts(final)
     final = _capitalize_after_question(final)
+    # Clamp to token spans after timing smoothing so we don't spill into other speakers.
+    final = _clamp_cues_to_token_bounds(final)
+    final = _resolve_dialogue_overlaps(final)
     # Populate speaker on each cue for output JSON (from AssemblyAI runs)
     for c in final:
         if c.get("type") == "dialogue":
