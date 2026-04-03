@@ -8,8 +8,8 @@ import requests
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2"
 
-POLL_INTERVAL_SECONDS = 3
-POLL_TIMEOUT_SECONDS = 60 * 15  # 15 minutes
+POLL_INTERVAL_SECONDS = int(os.getenv("ASSEMBLY_POLL_INTERVAL_SECONDS", "5") or 5)
+POLL_TIMEOUT_SECONDS = int(os.getenv("ASSEMBLY_POLL_TIMEOUT_SECONDS", str(60 * 60 * 8)) or (60 * 60 * 8))
 
 BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 
