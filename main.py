@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+import threading
 import uuid
 import traceback
 
@@ -26,6 +27,7 @@ app.add_middleware(
 
 # In-memory job store
 JOBS: Dict[str, Dict[str, Any]] = {}
+JOBS_LOCK = threading.Lock()
 
 
 # -----------------------------
@@ -77,6 +79,25 @@ def parse_output_formats(payload: Dict[str, Any]) -> Optional[List[str]]:
     return None
 
 
+def update_job(job_id: str, **fields: Any) -> None:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(fields)
+        job["updated_at"] = utc_now()
+
+
+def start_job_worker(job_id: str, payload: Dict[str, Any]) -> None:
+    worker = threading.Thread(
+        target=run_caption_job,
+        args=(job_id, payload),
+        daemon=True,
+        name=f"caption-job-{job_id[:8]}",
+    )
+    worker.start()
+
+
 def run_caption_job(job_id: str, payload: Dict[str, Any]):
     """
     Background job runner.
@@ -97,41 +118,37 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
         output_formats = parse_output_formats(payload)
         protected_phrases = payload.get("protected_phrases") or []
 
+        transcript_id = JOBS.get(job_id, {}).get("assemblyai_transcript_id") or payload.get("transcript_id")
+
         if payload.get("reformat_only"):
-            transcript_id = payload.get("transcript_id")
             if not transcript_id:
                 raise ValueError("transcript_id is required when reformat_only=true")
 
-            JOBS[job_id]["status"] = "processing"
-            JOBS[job_id]["updated_at"] = utc_now()
-            JOBS[job_id]["assemblyai_transcript_id"] = transcript_id
+            update_job(
+                job_id,
+                status="processing",
+                stage="fetching_transcript",
+                assemblyai_transcript_id=transcript_id,
+            )
 
             print(f"[{job_id}] Reformat-only: fetching AssemblyAI transcript {transcript_id}")
             assembly_result = fetch_transcript_result(transcript_id, require_completed=True)
         else:
-            JOBS[job_id]["status"] = "transcribing"
-            JOBS[job_id]["updated_at"] = utc_now()
+            if not transcript_id:
+                raise ValueError("assemblyai_transcript_id is required before starting transcription worker")
 
-            media_url = str(payload["mediaUrl"])
-            speaker_labels = payload.get("speakerLabels", True)
-            language_detection = payload.get("languageDetection", True)
-
-            print(f"[{job_id}] Submitting to AssemblyAI: {media_url}")
-            transcript_id = submit_transcription_job(
-                media_url=media_url,
-                speaker_labels=speaker_labels,
-                language_detection=language_detection,
+            update_job(
+                job_id,
+                status="processing",
+                stage="waiting_for_transcription",
+                assemblyai_transcript_id=transcript_id,
             )
-
-            print(f"[{job_id}] AssemblyAI transcript id: {transcript_id}")
-            JOBS[job_id]["assemblyai_transcript_id"] = transcript_id
-            JOBS[job_id]["status"] = "processing"
-            JOBS[job_id]["updated_at"] = utc_now()
 
             print(f"[{job_id}] Waiting for AssemblyAI result...")
             assembly_result = wait_for_transcription_result(transcript_id)
 
         print(f"[{job_id}] AssemblyAI transcription completed")
+        update_job(job_id, status="processing", stage="formatting")
         print(f"[{job_id}] Building formatter inputs from AssemblyAI result")
         backbone_srt_text, timestamps_json = build_caption_inputs_from_assembly_result(
             assembly_result
@@ -146,22 +163,29 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
         )
 
         print(f"[{job_id}] Caption job completed successfully")
-        JOBS[job_id]["status"] = "completed"
-        JOBS[job_id]["updated_at"] = utc_now()
-        JOBS[job_id]["result"] = caption_result
-        JOBS[job_id]["error"] = None
+        update_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            result=caption_result,
+            error=None,
+            assemblyai_transcript_id=assembly_result.get("id") or transcript_id,
+        )
 
     except Exception as e:
         print(f"[{job_id}] Caption job FAILED: {e}")
         print(traceback.format_exc())
 
-        JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["updated_at"] = utc_now()
-        JOBS[job_id]["result"] = None
-        JOBS[job_id]["error"] = {
-            "message": str(e),
-            "trace": traceback.format_exc(),
-        }
+        update_job(
+            job_id,
+            status="failed",
+            stage="failed",
+            result=None,
+            error={
+                "message": str(e),
+                "trace": traceback.format_exc(),
+            },
+        )
     finally:
         if env_snapshot is not None:
             restore_env_overrides(env_snapshot)
@@ -181,7 +205,7 @@ def health():
 
 
 @app.post("/v1/jobs")
-def create_job(payload: CreateJobRequest, background_tasks: BackgroundTasks):
+def create_job(payload: CreateJobRequest):
     """
     Base44-compatible job creation endpoint.
     Accepts JSON payload with mediaUrl and caption settings.
@@ -200,30 +224,84 @@ def create_job(payload: CreateJobRequest, background_tasks: BackgroundTasks):
         if not payload_data.get("mediaUrl"):
             raise HTTPException(status_code=400, detail="mediaUrl is required for new transcription jobs")
 
-    JOBS[job_id] = {
-        "id": job_id,
-        "status": "queued",
-        "created_at": utc_now(),
-        "updated_at": utc_now(),
-        "input": payload_data,
-        "assemblyai_transcript_id": None,
-        "result": None,
-        "error": None,
-    }
+    created_at = utc_now()
+    initial_stage = "queued"
+    assemblyai_transcript_id = payload_data.get("transcript_id")
 
-    background_tasks.add_task(run_caption_job, job_id, payload_data)
-    print(f"[{job_id}] Background task dispatched")
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "stage": initial_stage,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "input": payload_data,
+            "assemblyai_transcript_id": assemblyai_transcript_id,
+            "result": None,
+            "error": None,
+        }
 
+    if payload_data.get("reformat_only"):
+        update_job(
+            job_id,
+            status="processing",
+            stage="fetching_transcript",
+            assemblyai_transcript_id=assemblyai_transcript_id,
+        )
+        start_job_worker(job_id, payload_data)
+        print(f"[{job_id}] Reformat worker dispatched")
+    else:
+        media_url = str(payload_data["mediaUrl"])
+        speaker_labels = payload_data.get("speakerLabels", True)
+        language_detection = payload_data.get("languageDetection", True)
+
+        try:
+            print(f"[{job_id}] Submitting to AssemblyAI: {media_url}")
+            assemblyai_transcript_id = submit_transcription_job(
+                media_url=media_url,
+                speaker_labels=speaker_labels,
+                language_detection=language_detection,
+            )
+        except Exception as exc:
+            print(f"[{job_id}] AssemblyAI submit FAILED: {exc}")
+            update_job(
+                job_id,
+                status="failed",
+                stage="failed",
+                error={"message": str(exc)},
+            )
+            return {
+                "id": job_id,
+                "status": "failed",
+                "stage": "failed",
+                "created_at": created_at,
+                "assemblyai_transcript_id": None,
+                "error": {"message": str(exc)},
+            }
+
+        update_job(
+            job_id,
+            status="processing",
+            stage="waiting_for_transcription",
+            assemblyai_transcript_id=assemblyai_transcript_id,
+        )
+        start_job_worker(job_id, payload_data)
+        print(f"[{job_id}] Background worker dispatched with transcript {assemblyai_transcript_id}")
+
+    job = JOBS[job_id]
     return {
         "id": job_id,
-        "status": JOBS[job_id]["status"],
-        "created_at": JOBS[job_id]["created_at"],
+        "status": job["status"],
+        "stage": job.get("stage"),
+        "created_at": job["created_at"],
+        "assemblyai_transcript_id": job.get("assemblyai_transcript_id"),
     }
 
 
 @app.get("/v1/jobs/{job_id}")
 def get_job(job_id: str):
-    job = JOBS.get(job_id)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
