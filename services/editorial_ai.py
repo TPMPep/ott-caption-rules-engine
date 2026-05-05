@@ -3,13 +3,26 @@ import os
 import re
 from typing import Any, Dict, List
 
-MAX_LINES = 2
-MAX_CHARS = 32
-
 _WORD_RE = re.compile(r"\b[\w']+\b")
 _STYLE_TAG_RE = re.compile(r"\{\\+an\d\}")
 _ITALIC_TAG_RE = re.compile(r"</?i>")
 _WEAK_ENDS = {"a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for", "that"}
+
+
+def _caption_profile() -> str:
+    return (os.getenv("CAPTION_PROFILE", "") or "").strip().lower()
+
+
+def _max_lines() -> int:
+    if _caption_profile() == "custom":
+        return int(os.getenv("CUSTOM_MAX_LINES", "2") or 2)
+    return 2
+
+
+def _max_chars() -> int:
+    if _caption_profile() == "custom":
+        return int(os.getenv("CUSTOM_MAX_CHARS", "32") or 32)
+    return 32
 
 
 def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
@@ -36,6 +49,8 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
 
     refined: List[Dict[str, Any]] = []
     total = len(cues)
+    max_lines = _max_lines()
+    max_chars = _max_chars()
 
     for idx, cue in enumerate(cues):
         if cue.get("type") != "dialogue":
@@ -63,8 +78,8 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             "next_dialogue": next_text,
             "protected_phrases": protected_phrases[:50],
             "rules": {
-                "max_lines": MAX_LINES,
-                "max_chars_per_line": MAX_CHARS,
+                "max_lines": max_lines,
+                "max_chars_per_line": max_chars,
                 "two_speaker_lines_must_start_with_dash": True,
                 "preserve_words_exactly": True,
                 "fix_punctuation_and_capitalization_only": True,
@@ -87,7 +102,7 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             "Do not split protected phrases across lines. "
             "Avoid ending a line with weak function words (a, an, the, of, to, and, or, but, with, from, in, on, at, for, that) unless unavoidable. "
             "If there are exactly two speaker runs, you MUST output exactly two lines and begin each line with '- ' (dash space). "
-            "If text fits in one line (≤32 characters), output one line only; two lines is the max, not required. "
+            f"If text fits in one line (≤{max_chars} characters), output one line only; {max_lines} lines is the max, not required. "
             "Return JSON only with the shape "
             '{"lines":["...","..."]}.'
         )
@@ -120,7 +135,7 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             refined.append(cue)
             continue
 
-        if len(ai_lines) > MAX_LINES or any(_visible_len(line) > MAX_CHARS for line in ai_lines):
+        if len(ai_lines) > max_lines or any(_visible_len(line) > max_chars for line in ai_lines):
             refined.append(cue)
             continue
 
@@ -157,7 +172,7 @@ def _normalize_lines(lines: List[str]) -> List[str]:
         line = re.sub(r"\s+", " ", line).strip()
         if line:
             out.append(line)
-    return out[:MAX_LINES]
+    return out[:_max_lines()]
 
 
 def _visible_len(text: str) -> int:
