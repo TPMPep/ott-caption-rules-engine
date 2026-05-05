@@ -23,13 +23,51 @@ def _headers() -> Dict[str, str]:
     }
 
 
+def _upload_media_to_assemblyai(media_url: str) -> str:
+    """Download media from source URL and upload directly to AssemblyAI.
+    Returns the AAI-hosted upload_url to use for transcription.
+    This bypasses any access restrictions on the original URL."""
+
+    print(f"[ASSEMBLY] Downloading media from: {media_url}")
+
+    download_resp = requests.get(media_url, stream=True, timeout=300)
+    download_resp.raise_for_status()
+
+    content_length = download_resp.headers.get("content-length")
+    if content_length:
+        print(f"[ASSEMBLY] File size: {int(content_length) / (1024*1024):.1f} MB")
+
+    print("[ASSEMBLY] Uploading to AssemblyAI...")
+    upload_resp = requests.post(
+        f"{ASSEMBLYAI_BASE_URL}/upload",
+        headers={"authorization": ASSEMBLYAI_API_KEY},
+        data=download_resp.iter_content(chunk_size=8192),
+        timeout=600,
+    )
+
+    if upload_resp.status_code >= 400:
+        raise RuntimeError(
+            f"AssemblyAI upload failed ({upload_resp.status_code}): {upload_resp.text}"
+        )
+
+    upload_url = upload_resp.json().get("upload_url")
+    if not upload_url:
+        raise RuntimeError(f"AssemblyAI upload did not return upload_url: {upload_resp.json()}")
+
+    print(f"[ASSEMBLY] Upload complete: {upload_url}")
+    return upload_url
+
+
 def submit_transcription_job(
     media_url: str,
     speaker_labels: bool = True,
     language_detection: bool = True,
 ) -> str:
+    # Upload media to AAI first to bypass any source URL access restrictions
+    aai_url = _upload_media_to_assemblyai(media_url)
+
     payload: Dict[str, Any] = {
-        "audio_url": media_url,
+        "audio_url": aai_url,
         "speech_models": ["universal-3-pro"],
         "speaker_labels": speaker_labels,
         "format_text": True,
