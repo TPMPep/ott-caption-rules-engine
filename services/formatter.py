@@ -347,6 +347,7 @@ DEFAULT_ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[MUSIC]", "[CHEERING]", "[
 ALLOWED_SOUND = set(DEFAULT_ALLOWED_SOUND)
 SOUND_PRIORITY = {"[MUSIC]": 1, "[CHEERING]": 2, "[LAUGHTER]": 3, "[APPLAUSE]": 4, "[SFX]": 5, "[BLEEP]": 6}
 MUSIC_LONG_ONLY_MS = int(os.getenv("MUSIC_LONG_ONLY_MS", "2500") or 2500)
+NBCU_SOUND_CLUSTER_GAP_MS = 1200
 PAUSE_ELLIPSIS_RAW = os.getenv("PAUSE_ELLIPSIS", "").strip()
 PAUSE_ELLIPSIS = PAUSE_ELLIPSIS_RAW.lower() in {"1", "true", "yes", "y", "on"}
 PAUSE_ELLIPSIS_MS = int(os.getenv("PAUSE_ELLIPSIS_MS", "1500") or 1500)
@@ -600,7 +601,7 @@ def _apply_profile_settings() -> None:
         SOUND_LABEL_STYLE = "simple"
         ALIGNMENT_DEFAULT = "none"
         SOUND_DENSITY = "conservative"
-        INLINE_DIALOGUE_TAGS = set(DEFAULT_INLINE_DIALOGUE_TAGS)
+        INLINE_DIALOGUE_TAGS = set()
         # NBCU: reactions + music only (music must be long; filtered later)
         ALLOWED_SOUND = {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]", "[MUSIC]"}
         # NBCU: enable em-dash speaker splitting unless explicitly disabled
@@ -744,8 +745,13 @@ def process_caption_job(
     formatted_dialogue = merge_dash_split_pairs(formatted_dialogue)
     formatted_dialogue = merge_leading_fragment_into_dash_pairs(formatted_dialogue)
 
-    token_sound_events = build_sound_events_from_tokens(tokens)
-    merged_sound = merge_sound_events(sound_events + leading_sound_events + token_sound_events)
+    trailing_sound_events = build_trailing_sound_events(dialogue_windows)
+    # For NBCU we prefer backbone-derived sound timing and use token-derived
+    # events only as a last resort when the backbone contains no usable sound.
+    token_sound_events: List[Dict[str, Any]] = []
+    if CAPTION_PROFILE != "nbcu" or not (sound_events or leading_sound_events or trailing_sound_events):
+        token_sound_events = build_sound_events_from_tokens(tokens)
+    merged_sound = merge_sound_events(sound_events + leading_sound_events + trailing_sound_events + token_sound_events)
     merged_sound = filter_sound_events(merged_sound)
     sound_cues = place_sound_events(merged_sound, formatted_dialogue)
 
@@ -1224,6 +1230,7 @@ def build_windows_from_backbone(backbone: List[Dict[str, Any]]) -> Tuple[List[Di
                 "raw_text": raw_text,
                 "dialogue_text": apply_asr_corrections(repair_continuing_punctuation(dialogue_text)),
                 "leading_sound": leading,
+                "trailing_sound": all_labels[len(leading):],
                 "tokens": [],
                 "runs": [],
             })
@@ -1333,6 +1340,25 @@ def build_leading_sound_events(windows: List[Dict[str, Any]]) -> List[Dict[str, 
         start_ms = win["start_ms"]
         if end_ms - start_ms < MIN_SOUND_MS:
             end_ms = min(win["end_ms"], start_ms + MIN_SOUND_MS)
+        if end_ms - start_ms < MIN_SOUND_MS:
+            continue
+        events.extend(expand_sound_sequence(labels, start_ms, end_ms))
+    return events
+
+
+def build_trailing_sound_events(windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for win in windows:
+        labels = win.get("trailing_sound") or []
+        labels = [l for l in labels if l in ALLOWED_SOUND]
+        if not labels:
+            continue
+        toks = win.get("tokens") or []
+        if toks:
+            start_ms = min(win["end_ms"], max(win["start_ms"], toks[-1]["end_ms"]))
+        else:
+            start_ms = max(win["start_ms"], win["end_ms"] - TARGET_SOUND_MS)
+        end_ms = win["end_ms"]
         if end_ms - start_ms < MIN_SOUND_MS:
             continue
         events.extend(expand_sound_sequence(labels, start_ms, end_ms))
@@ -2261,10 +2287,50 @@ def filter_sound_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         label = ev.get("label")
         if label not in ALLOWED_SOUND:
             continue
+        if (ev["end_ms"] - ev["start_ms"]) < MIN_SOUND_MS:
+            continue
         if label == "[MUSIC]" and (ev["end_ms"] - ev["start_ms"]) < MUSIC_LONG_ONLY_MS:
             continue
         out.append(ev)
-    return out
+    return collapse_nbcu_sound_clusters(out)
+
+
+def collapse_nbcu_sound_clusters(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if CAPTION_PROFILE != "nbcu" or not events:
+        return events
+    events = sorted(events, key=lambda e: (e["start_ms"], e["end_ms"]))
+    clusters: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = [events[0]]
+    for ev in events[1:]:
+        if ev["start_ms"] - current[-1]["end_ms"] <= NBCU_SOUND_CLUSTER_GAP_MS:
+            current.append(ev)
+        else:
+            clusters.append(current)
+            current = [ev]
+    clusters.append(current)
+
+    collapsed: List[Dict[str, Any]] = []
+    for cluster in clusters:
+        start_ms = min(ev["start_ms"] for ev in cluster)
+        end_ms = max(ev["end_ms"] for ev in cluster)
+        labels = [str(ev.get("label") or "") for ev in cluster if ev.get("label")]
+        if not labels:
+            continue
+
+        if "[MUSIC]" in labels:
+            longest_music = max(
+                (ev["end_ms"] - ev["start_ms"] for ev in cluster if ev.get("label") == "[MUSIC]"),
+                default=0,
+            )
+            music_count = sum(1 for ev in cluster if ev.get("label") == "[MUSIC]")
+            if (end_ms - start_ms) >= MUSIC_LONG_ONLY_MS or longest_music >= MUSIC_LONG_ONLY_MS or music_count >= 2:
+                collapsed.append({"label": "[MUSIC]", "start_ms": start_ms, "end_ms": end_ms})
+                continue
+
+        dominant = dominant_sound_label(labels, prefer_first_reaction=True)
+        if dominant:
+            collapsed.append({"label": dominant, "start_ms": start_ms, "end_ms": end_ms})
+    return collapsed
 
 
 def expand_sound_sequence(labels: List[str], start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
@@ -2280,6 +2346,14 @@ def expand_sound_sequence(labels: List[str], start_ms: int, end_ms: int) -> List
             ordered.append(l)
     if len(ordered) == 1:
         return [{"label": ordered[0], "start_ms": start_ms, "end_ms": end_ms}]
+
+    if CAPTION_PROFILE == "nbcu":
+        if "[MUSIC]" in ordered and (end_ms - start_ms) >= MUSIC_LONG_ONLY_MS:
+            return [{"label": "[MUSIC]", "start_ms": start_ms, "end_ms": end_ms}]
+        dominant = dominant_sound_label(ordered, prefer_first_reaction=True)
+        if dominant:
+            return [{"label": dominant, "start_ms": start_ms, "end_ms": end_ms}]
+        return []
 
     # Reaction + music pattern: give reaction a short head, music remainder.
     reactions = [l for l in ordered if l in {"[APPLAUSE]", "[LAUGHTER]", "[CHEERING]"}]
@@ -2362,7 +2436,7 @@ def place_sound_event(ev: Dict[str, Any], dialogue: List[Dict[str, Any]]) -> Opt
         if gap_end - gap_start < MIN_SOUND_MS:
             return None
     # In long dead-air gaps, bridge earlier instead of pinning the cue right on top of dialogue.
-    if ev["start_ms"] - gap_start >= 1000 and gap_end - gap_start >= LONG_GAP_BRIDGE_MS:
+    if CAPTION_PROFILE != "nbcu" and ev["start_ms"] - gap_start >= 1000 and gap_end - gap_start >= LONG_GAP_BRIDGE_MS:
         start = gap_start + BRIDGE_PAD_MS
     else:
         start = max(gap_start, ev["start_ms"])
