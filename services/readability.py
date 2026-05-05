@@ -9,10 +9,36 @@ Ensures captions are readable on screen by enforcing:
 • Balanced pacing
 """
 
-MIN_DIALOGUE_MS = 800
-MIN_SOUND_MS = 800
+import os
+
 MICRO_WORD_LIMIT = 2
 MICRO_DURATION_MS = 1000
+
+
+def _caption_profile():
+    return (os.getenv("CAPTION_PROFILE", "") or "").strip().lower()
+
+
+def _env_int(name, default):
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _min_dialogue_ms():
+    if _caption_profile() == "custom":
+        return _env_int("CUSTOM_MIN_DISPLAY_MS", 800)
+    return 800
+
+
+def _min_sound_ms():
+    if _caption_profile() == "custom":
+        return _env_int("CUSTOM_MIN_SOUND_DISPLAY_MS", 800)
+    return 800
 
 
 def enforce_min_duration(cues):
@@ -23,7 +49,7 @@ def enforce_min_duration(cues):
 
         duration = cue["end_ms"] - cue["start_ms"]
 
-        min_duration = MIN_SOUND_MS if cue["type"] == "sound" else MIN_DIALOGUE_MS
+        min_duration = _min_sound_ms() if cue["type"] == "sound" else _min_dialogue_ms()
 
         if duration >= min_duration:
             continue
