@@ -1,7 +1,7 @@
 import os
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -13,6 +13,17 @@ POLL_TIMEOUT_SECONDS = int(os.getenv("ASSEMBLY_POLL_TIMEOUT_SECONDS", str(60 * 6
 
 BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 
+DEFAULT_TRANSCRIPTION_PROMPT = (
+    "Transcribe spoken dialogue accurately with punctuation and formatting. "
+    "Dialogue is the priority. Preserve proper nouns and show titles accurately. "
+    "If speech is in a language other than English, preserve it in the original language. "
+    "Use bracketed non-speech tags only when unmistakable and editorially useful for broadcast captions. "
+    "Limit non-speech tags to [music], [laughter], [applause], and [cheering]. "
+    "Do not emit [inaudible], [noise], [pause], or [sound effect]. "
+    "Do not stack multiple audio tags. Do not insert audio tags inside dialogue sentences. "
+    "If uncertain, omit the tag."
+)
+
 
 def _headers() -> Dict[str, str]:
     if not ASSEMBLYAI_API_KEY:
@@ -23,39 +34,12 @@ def _headers() -> Dict[str, str]:
     }
 
 
-def _upload_media_to_assemblyai(media_url: str) -> str:
-    """Download media from source URL and upload directly to AssemblyAI.
-    Returns the AAI-hosted upload_url to use for transcription.
-    This bypasses any access restrictions on the original URL."""
-
-    print(f"[ASSEMBLY] Downloading media from: {media_url}")
-
-    download_resp = requests.get(media_url, stream=True, timeout=300)
-    download_resp.raise_for_status()
-
-    content_length = download_resp.headers.get("content-length")
-    if content_length:
-        print(f"[ASSEMBLY] File size: {int(content_length) / (1024*1024):.1f} MB")
-
-    print("[ASSEMBLY] Uploading to AssemblyAI...")
-    upload_resp = requests.post(
-        f"{ASSEMBLYAI_BASE_URL}/upload",
-        headers={"authorization": ASSEMBLYAI_API_KEY},
-        data=download_resp.iter_content(chunk_size=8192),
-        timeout=600,
-    )
-
-    if upload_resp.status_code >= 400:
-        raise RuntimeError(
-            f"AssemblyAI upload failed ({upload_resp.status_code}): {upload_resp.text}"
-        )
-
-    upload_url = upload_resp.json().get("upload_url")
-    if not upload_url:
-        raise RuntimeError(f"AssemblyAI upload did not return upload_url: {upload_resp.json()}")
-
-    print(f"[ASSEMBLY] Upload complete: {upload_url}")
-    return upload_url
+def _transcription_prompt() -> Optional[str]:
+    override = os.getenv("ASSEMBLYAI_PROMPT")
+    if override is not None:
+        prompt = override.strip()
+        return prompt or None
+    return DEFAULT_TRANSCRIPTION_PROMPT
 
 
 def submit_transcription_job(
@@ -63,24 +47,16 @@ def submit_transcription_job(
     speaker_labels: bool = True,
     language_detection: bool = True,
 ) -> str:
-    # Upload media to AAI first to bypass any source URL access restrictions
-    aai_url = _upload_media_to_assemblyai(media_url)
-
     payload: Dict[str, Any] = {
-        "audio_url": aai_url,
-        "speech_models": ["universal-3-pro"],
+        "audio_url": media_url,
+        "speech_models": ["universal-3-pro", "universal-2"],
         "speaker_labels": speaker_labels,
         "format_text": True,
         "language_detection": language_detection,
-        "prompt": (
-            "Transcribe speech with accurate punctuation and formatting. "
-            "Preserve non-speech audio in tags to indicate when the audio occurred. "
-            "Include audio event markers for [music], [laughter], [applause], [noise], "
-            "[pause], [inaudible], [cheering], and [sound effect] when clearly present. "
-            "Preserve proper nouns and show titles accurately. "
-            "If speech is in a language other than English, preserve it in the original language."
-        ),
     }
+    prompt = _transcription_prompt()
+    if prompt:
+        payload["prompt"] = prompt
 
     response = requests.post(
         f"{ASSEMBLYAI_BASE_URL}/transcript",
