@@ -1,3 +1,4 @@
+import os
 import re
 from typing import Dict, List
 
@@ -6,6 +7,44 @@ FUNCTION_WORDS = {
     "with", "from", "in", "on", "at", "for", "that",
     "this", "these", "those"
 }
+
+
+def _caption_profile() -> str:
+    return (os.getenv("CAPTION_PROFILE", "") or "").strip().lower()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _max_lines() -> int:
+    if _caption_profile() == "custom":
+        return _env_int("CUSTOM_MAX_LINES", 2)
+    return 2
+
+
+def _max_chars() -> int:
+    if _caption_profile() == "custom":
+        return _env_int("CUSTOM_MAX_CHARS", 32)
+    return 32
+
+
+def _min_dialogue_ms() -> int:
+    if _caption_profile() == "custom":
+        return _env_int("CUSTOM_MIN_DISPLAY_MS", 800)
+    return 800
+
+
+def _min_sound_ms() -> int:
+    if _caption_profile() == "custom":
+        return _env_int("CUSTOM_MIN_SOUND_DISPLAY_MS", 800)
+    return 800
 
 
 def ends_with_function_word(line: str) -> bool:
@@ -68,6 +107,10 @@ def count_protected_phrase_splits(lines: List[str], protected_phrases: List[str]
 
 
 def qc_report(cues_in: int, cues_out: List[Dict], protected_phrases: List[str]) -> Dict:
+    max_lines = _max_lines()
+    max_chars = _max_chars()
+    min_dialogue_ms = _min_dialogue_ms()
+    min_sound_ms = _min_sound_ms()
     max_lines_violation = 0
     max_chars_violation = 0
     short_duration_violations = 0
@@ -76,18 +119,18 @@ def qc_report(cues_in: int, cues_out: List[Dict], protected_phrases: List[str]) 
     protected_phrase_splits = 0
 
     for cue in cues_out:
-        if len(cue["lines"]) > 2:
+        if len(cue["lines"]) > max_lines:
             max_lines_violation += 1
 
-        if any(len(line) > 32 for line in cue["lines"]):
+        if any(len(line) > max_chars for line in cue["lines"]):
             max_chars_violation += 1
 
         duration = cue["end_ms"] - cue["start_ms"]
         if cue["type"] == "sound":
-            if duration < 800:
+            if duration < min_sound_ms:
                 short_duration_violations += 1
         else:
-            if duration < 800:
+            if duration < min_dialogue_ms:
                 short_duration_violations += 1
             if is_one_word(cue["lines"]):
                 one_word_dialogue_cues += 1
