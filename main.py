@@ -1,3 +1,12 @@
+"""
+Main FastAPI application — OTT Caption Rules Engine.
+
+UPDATED:
+- Improved captionOptions → env var mapping
+- Now properly passes protected_phrases through the pipeline
+- Better logging of received configuration
+"""
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
@@ -15,7 +24,7 @@ from services.assembly import (
 )
 from services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
 
-app = FastAPI(title="OTT Caption Rules Engine", version="3.1.1")
+app = FastAPI(title="OTT Caption Rules Engine", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,9 +39,7 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
 
-# -----------------------------
-# Request models
-# -----------------------------
+# ─── Request Models ─────────────────────────────────────────────────
 
 class CaptionRules(BaseModel):
     max_chars_per_line: int = 32
@@ -58,11 +65,11 @@ class CreateJobRequest(BaseModel):
     env: Optional[Dict[str, Any]] = None
     output_formats: Optional[List[str]] = None
     protected_phrases: Optional[List[str]] = None
+    # UPDATED: Also accept protectedPhrases (camelCase from frontend)
+    protectedPhrases: Optional[List[str]] = None
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# ─── Helpers ────────────────────────────────────────────────────────
 
 def utc_now() -> str:
     return datetime.utcnow().isoformat() + "Z"
@@ -71,12 +78,42 @@ def utc_now() -> str:
 def parse_output_formats(payload: Dict[str, Any]) -> Optional[List[str]]:
     if isinstance(payload.get("output_formats"), list) and payload.get("output_formats"):
         return [str(f).strip().lower() for f in payload["output_formats"] if str(f).strip()]
-    env = payload.get("env") or {}
+    env = payload.get("env") or payload.get("captionOptions") or {}
     if isinstance(env, dict):
         raw = env.get("OUTPUT_FORMATS")
         if raw:
             return [f.strip().lower() for f in str(raw).split(",") if f.strip()]
     return None
+
+
+def get_protected_phrases(payload: Dict[str, Any]) -> List[str]:
+    """UPDATED: Handle both snake_case and camelCase field names."""
+    phrases = payload.get("protected_phrases") or payload.get("protectedPhrases") or []
+    if isinstance(phrases, str):
+        phrases = [p.strip() for p in phrases.split(",") if p.strip()]
+    return phrases
+
+
+def get_env_overrides(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    UPDATED: Build env overrides from captionOptions.
+    
+    The frontend sends captionOptions as a flat dict of env var keys:
+    { "CAPTION_PROFILE": "nbcu", "CUSTOM_MAX_LINES": "2", ... }
+    
+    Also check the legacy 'env' field for backward compatibility.
+    """
+    env_dict = {}
+    
+    # Legacy env field
+    if isinstance(payload.get("env"), dict):
+        env_dict.update(payload["env"])
+    
+    # captionOptions (from frontend)
+    if isinstance(payload.get("captionOptions"), dict):
+        env_dict.update(payload["captionOptions"])
+    
+    return env_dict
 
 
 def update_job(job_id: str, **fields: Any) -> None:
@@ -98,25 +135,33 @@ def start_job_worker(job_id: str, payload: Dict[str, Any]) -> None:
     worker.start()
 
 
+# ─── Background Job Runner ──────────────────────────────────────────
+
 def run_caption_job(job_id: str, payload: Dict[str, Any]):
     """
     Background job runner.
 
     Flow:
-    1. Submit media URL to AssemblyAI
-    2. Poll AssemblyAI until complete
-    3. Build backbone SRT + timestamps JSON
-    4. Run caption formatter / cleanup
-    5. Store final result
+    1. Apply env overrides from captionOptions
+    2. Submit media URL to AssemblyAI (or fetch existing transcript)
+    3. Poll AssemblyAI until complete
+    4. Build backbone SRT + timestamps JSON
+    5. Run caption formatter / cleanup
+    6. Store final result
     """
     env_snapshot = None
     try:
         print(f"[{job_id}] Starting caption job")
-        print(f"[{job_id}] Input payload: {payload}")
 
-        env_snapshot = apply_env_overrides(payload.get("env") or {})
+        # UPDATED: Better env override extraction
+        env_overrides = get_env_overrides(payload)
+        env_snapshot = apply_env_overrides(env_overrides)
+        
         output_formats = parse_output_formats(payload)
-        protected_phrases = payload.get("protected_phrases") or []
+        protected_phrases = get_protected_phrases(payload)
+        
+        print(f"[{job_id}] Protected phrases: {protected_phrases[:5]}{'...' if len(protected_phrases) > 5 else ''}")
+        print(f"[{job_id}] Output formats: {output_formats}")
 
         transcript_id = JOBS.get(job_id, {}).get("assemblyai_transcript_id") or payload.get("transcript_id")
 
@@ -149,6 +194,7 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
 
         print(f"[{job_id}] AssemblyAI transcription completed")
         update_job(job_id, status="processing", stage="formatting")
+
         print(f"[{job_id}] Building formatter inputs from AssemblyAI result")
         backbone_srt_text, timestamps_json = build_caption_inputs_from_assembly_result(
             assembly_result
@@ -191,15 +237,14 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
             restore_env_overrides(env_snapshot)
 
 
-# -----------------------------
-# Routes
-# -----------------------------
+# ─── Routes ─────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
         "service": "ott-caption-rules-engine",
+        "version": "3.2.0",
         "time": utc_now(),
     }
 
@@ -212,7 +257,6 @@ def create_job(payload: CreateJobRequest):
     Processes in the background.
     """
     job_id = str(uuid.uuid4())
-
     print(f"[{job_id}] Job created")
 
     payload_data = payload.model_dump(mode="json")
@@ -302,6 +346,6 @@ def create_job(payload: CreateJobRequest):
 def get_job(job_id: str):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
