@@ -1,17 +1,45 @@
 """
 Main FastAPI application — OTT Caption Rules Engine.
 
-UPDATED:
-- Improved captionOptions → env var mapping
-- Now properly passes protected_phrases through the pipeline
-- Better logging of received configuration
+This is the BRAIN of the CC Creation pipeline. Base44 only stores results.
+
+Endpoints:
+  GET  /health           → liveness probe + version
+  POST /v1/jobs          → create a transcription/formatting job
+  GET  /v1/jobs/{job_id} → poll a job for status/result
+
+Job lifecycle (background thread):
+  queued
+    → submitted_to_assemblyai
+    → waiting_for_transcription
+    → fetching_transcript          (reformat_only path)
+    → formatting
+    → completed | failed
+
+A completed job carries:
+  result.cues[]            — list of formatted CaptionCue dicts
+  result.srt               — SRT string
+  result.vtt               — VTT string
+  result.qc                — QC report dict
+  result.assemblyai.utterances[] — raw AAI utterances (so Base44 can derive
+                                   CCSpeaker rows server-side from A/B/C
+                                   diarization without re-fetching AAI)
+  result._used_rules       — every env-driven rule value applied to this
+                             run, so the auditor can reproduce the result
+                             from the row alone (SOC 2 CC8.1).
+
+Auth:
+  If env var ENGINE_SHARED_SECRET is set, every POST/GET must carry
+  X-Engine-Secret header matching it. If unset (today's default), the
+  service is open — relies on the obscure Railway URL.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, Dict, Any, List
 from datetime import datetime
+import os
 import threading
 import uuid
 import traceback
@@ -24,7 +52,11 @@ from services.assembly import (
 )
 from services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
 
-app = FastAPI(title="OTT Caption Rules Engine", version="3.2.0")
+# Bump this on every meaningful edit. /health reports it so Base44 can
+# verify a deploy landed without grepping Railway logs.
+VERSION = "3.3.0-base44-pipeline"
+
+app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,9 +66,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory job store
+# In-memory job store. For 100+ concurrent users this is fine — jobs are
+# transient and consumed by Base44's poller within minutes. If we ever need
+# durability we can swap this for Redis (Upstash is already in the stack).
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+
+
+# ─── Auth ───────────────────────────────────────────────────────────
+
+def _check_secret(x_engine_secret: Optional[str]) -> None:
+    expected = os.getenv("ENGINE_SHARED_SECRET", "").strip()
+    if not expected:
+        return  # open mode
+    if x_engine_secret != expected:
+        raise HTTPException(status_code=401, detail="invalid X-Engine-Secret")
 
 
 # ─── Request Models ─────────────────────────────────────────────────
@@ -65,8 +109,14 @@ class CreateJobRequest(BaseModel):
     env: Optional[Dict[str, Any]] = None
     output_formats: Optional[List[str]] = None
     protected_phrases: Optional[List[str]] = None
-    # UPDATED: Also accept protectedPhrases (camelCase from frontend)
-    protectedPhrases: Optional[List[str]] = None
+    protectedPhrases: Optional[List[str]] = None  # camelCase alias
+
+    # Base44-side audit anchors. Echoed verbatim into the job record and
+    # the result so the Base44 ingester can correlate the engine job with
+    # the originating Project / CCFormatRun without out-of-band tracking.
+    project_id: Optional[str] = None
+    cc_format_run_id: Optional[str] = None
+    request_id: Optional[str] = None
 
 
 # ─── Helpers ────────────────────────────────────────────────────────
@@ -87,7 +137,6 @@ def parse_output_formats(payload: Dict[str, Any]) -> Optional[List[str]]:
 
 
 def get_protected_phrases(payload: Dict[str, Any]) -> List[str]:
-    """UPDATED: Handle both snake_case and camelCase field names."""
     phrases = payload.get("protected_phrases") or payload.get("protectedPhrases") or []
     if isinstance(phrases, str):
         phrases = [p.strip() for p in phrases.split(",") if p.strip()]
@@ -95,24 +144,11 @@ def get_protected_phrases(payload: Dict[str, Any]) -> List[str]:
 
 
 def get_env_overrides(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    UPDATED: Build env overrides from captionOptions.
-    
-    The frontend sends captionOptions as a flat dict of env var keys:
-    { "CAPTION_PROFILE": "nbcu", "CUSTOM_MAX_LINES": "2", ... }
-    
-    Also check the legacy 'env' field for backward compatibility.
-    """
-    env_dict = {}
-    
-    # Legacy env field
+    env_dict: Dict[str, Any] = {}
     if isinstance(payload.get("env"), dict):
         env_dict.update(payload["env"])
-    
-    # captionOptions (from frontend)
     if isinstance(payload.get("captionOptions"), dict):
         env_dict.update(payload["captionOptions"])
-    
     return env_dict
 
 
@@ -137,70 +173,38 @@ def start_job_worker(job_id: str, payload: Dict[str, Any]) -> None:
 
 # ─── Background Job Runner ──────────────────────────────────────────
 
-def run_caption_job(job_id: str, payload: Dict[str, Any]):
-    """
-    Background job runner.
-
-    Flow:
-    1. Apply env overrides from captionOptions
-    2. Submit media URL to AssemblyAI (or fetch existing transcript)
-    3. Poll AssemblyAI until complete
-    4. Build backbone SRT + timestamps JSON
-    5. Run caption formatter / cleanup
-    6. Store final result
-    """
+def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
     env_snapshot = None
     try:
         print(f"[{job_id}] Starting caption job")
 
-        # UPDATED: Better env override extraction
         env_overrides = get_env_overrides(payload)
         env_snapshot = apply_env_overrides(env_overrides)
-        
+
         output_formats = parse_output_formats(payload)
         protected_phrases = get_protected_phrases(payload)
-        
-        print(f"[{job_id}] Protected phrases: {protected_phrases[:5]}{'...' if len(protected_phrases) > 5 else ''}")
-        print(f"[{job_id}] Output formats: {output_formats}")
 
         transcript_id = JOBS.get(job_id, {}).get("assemblyai_transcript_id") or payload.get("transcript_id")
 
         if payload.get("reformat_only"):
             if not transcript_id:
                 raise ValueError("transcript_id is required when reformat_only=true")
-
-            update_job(
-                job_id,
-                status="processing",
-                stage="fetching_transcript",
-                assemblyai_transcript_id=transcript_id,
-            )
-
-            print(f"[{job_id}] Reformat-only: fetching AssemblyAI transcript {transcript_id}")
+            update_job(job_id, status="processing", stage="fetching_transcript",
+                       assemblyai_transcript_id=transcript_id)
+            print(f"[{job_id}] Reformat-only: fetching AAI transcript {transcript_id}")
             assembly_result = fetch_transcript_result(transcript_id, require_completed=True)
         else:
             if not transcript_id:
-                raise ValueError("assemblyai_transcript_id is required before starting transcription worker")
-
-            update_job(
-                job_id,
-                status="processing",
-                stage="waiting_for_transcription",
-                assemblyai_transcript_id=transcript_id,
-            )
-
+                raise ValueError("assemblyai_transcript_id is required before transcription worker starts")
+            update_job(job_id, status="processing", stage="waiting_for_transcription",
+                       assemblyai_transcript_id=transcript_id)
             print(f"[{job_id}] Waiting for AssemblyAI result...")
             assembly_result = wait_for_transcription_result(transcript_id)
 
-        print(f"[{job_id}] AssemblyAI transcription completed")
         update_job(job_id, status="processing", stage="formatting")
 
-        print(f"[{job_id}] Building formatter inputs from AssemblyAI result")
-        backbone_srt_text, timestamps_json = build_caption_inputs_from_assembly_result(
-            assembly_result
-        )
+        backbone_srt_text, timestamps_json = build_caption_inputs_from_assembly_result(assembly_result)
 
-        print(f"[{job_id}] Running caption formatter")
         caption_result = process_caption_job(
             backbone_srt_text=backbone_srt_text,
             timestamps=timestamps_json,
@@ -208,30 +212,41 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]):
             output_formats=output_formats,
         )
 
-        print(f"[{job_id}] Caption job completed successfully")
-        update_job(
-            job_id,
-            status="completed",
-            stage="completed",
-            result=caption_result,
-            error=None,
-            assemblyai_transcript_id=assembly_result.get("id") or transcript_id,
-        )
+        # Attach AAI utterances so Base44 can derive CCSpeaker rows without
+        # re-fetching from AssemblyAI. SOC 2 CC8.1 — the engine result is
+        # self-contained chain-of-custody evidence.
+        caption_result["assemblyai"] = {
+            "transcript_id": assembly_result.get("id"),
+            "language_code": assembly_result.get("language_code"),
+            "audio_duration": assembly_result.get("audio_duration"),
+            "utterances": [
+                {
+                    "speaker": u.get("speaker"),
+                    "start": u.get("start"),
+                    "end": u.get("end"),
+                    "text": u.get("text"),
+                    "confidence": u.get("confidence"),
+                }
+                for u in (assembly_result.get("utterances") or [])
+            ],
+        }
+        # Echo Base44-side audit anchors for the ingester to correlate.
+        caption_result["base44"] = {
+            "project_id": payload.get("project_id"),
+            "cc_format_run_id": payload.get("cc_format_run_id"),
+            "request_id": payload.get("request_id"),
+        }
+        caption_result["engine_version"] = VERSION
+
+        update_job(job_id, status="completed", stage="completed",
+                   result=caption_result, error=None,
+                   assemblyai_transcript_id=assembly_result.get("id") or transcript_id)
 
     except Exception as e:
         print(f"[{job_id}] Caption job FAILED: {e}")
         print(traceback.format_exc())
-
-        update_job(
-            job_id,
-            status="failed",
-            stage="failed",
-            result=None,
-            error={
-                "message": str(e),
-                "trace": traceback.format_exc(),
-            },
-        )
+        update_job(job_id, status="failed", stage="failed", result=None,
+                   error={"message": str(e), "trace": traceback.format_exc()[:4000]})
     finally:
         if env_snapshot is not None:
             restore_env_overrides(env_snapshot)
@@ -244,21 +259,16 @@ def health():
     return {
         "ok": True,
         "service": "ott-caption-rules-engine",
-        "version": "3.2.0",
+        "version": VERSION,
         "time": utc_now(),
     }
 
 
 @app.post("/v1/jobs")
-def create_job(payload: CreateJobRequest):
-    """
-    Base44-compatible job creation endpoint.
-    Accepts JSON payload with mediaUrl and caption settings.
-    Processes in the background.
-    """
-    job_id = str(uuid.uuid4())
-    print(f"[{job_id}] Job created")
+def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_engine_secret)
 
+    job_id = str(uuid.uuid4())
     payload_data = payload.model_dump(mode="json")
 
     if payload_data.get("reformat_only"):
@@ -269,68 +279,47 @@ def create_job(payload: CreateJobRequest):
             raise HTTPException(status_code=400, detail="mediaUrl is required for new transcription jobs")
 
     created_at = utc_now()
-    initial_stage = "queued"
     assemblyai_transcript_id = payload_data.get("transcript_id")
 
     with JOBS_LOCK:
         JOBS[job_id] = {
             "id": job_id,
             "status": "queued",
-            "stage": initial_stage,
+            "stage": "queued",
             "created_at": created_at,
             "updated_at": created_at,
             "input": payload_data,
             "assemblyai_transcript_id": assemblyai_transcript_id,
+            "project_id": payload_data.get("project_id"),
+            "cc_format_run_id": payload_data.get("cc_format_run_id"),
             "result": None,
             "error": None,
         }
 
     if payload_data.get("reformat_only"):
-        update_job(
-            job_id,
-            status="processing",
-            stage="fetching_transcript",
-            assemblyai_transcript_id=assemblyai_transcript_id,
-        )
+        update_job(job_id, status="processing", stage="fetching_transcript",
+                   assemblyai_transcript_id=assemblyai_transcript_id)
         start_job_worker(job_id, payload_data)
-        print(f"[{job_id}] Reformat worker dispatched")
     else:
         media_url = str(payload_data["mediaUrl"])
         speaker_labels = payload_data.get("speakerLabels", True)
         language_detection = payload_data.get("languageDetection", True)
-
         try:
-            print(f"[{job_id}] Submitting to AssemblyAI: {media_url}")
             assemblyai_transcript_id = submit_transcription_job(
                 media_url=media_url,
                 speaker_labels=speaker_labels,
                 language_detection=language_detection,
             )
         except Exception as exc:
-            print(f"[{job_id}] AssemblyAI submit FAILED: {exc}")
-            update_job(
-                job_id,
-                status="failed",
-                stage="failed",
-                error={"message": str(exc)},
-            )
+            update_job(job_id, status="failed", stage="failed", error={"message": str(exc)})
             return {
-                "id": job_id,
-                "status": "failed",
-                "stage": "failed",
-                "created_at": created_at,
-                "assemblyai_transcript_id": None,
+                "id": job_id, "status": "failed", "stage": "failed",
+                "created_at": created_at, "assemblyai_transcript_id": None,
                 "error": {"message": str(exc)},
             }
-
-        update_job(
-            job_id,
-            status="processing",
-            stage="waiting_for_transcription",
-            assemblyai_transcript_id=assemblyai_transcript_id,
-        )
+        update_job(job_id, status="processing", stage="waiting_for_transcription",
+                   assemblyai_transcript_id=assemblyai_transcript_id)
         start_job_worker(job_id, payload_data)
-        print(f"[{job_id}] Background worker dispatched with transcript {assemblyai_transcript_id}")
 
     job = JOBS[job_id]
     return {
@@ -339,11 +328,13 @@ def create_job(payload: CreateJobRequest):
         "stage": job.get("stage"),
         "created_at": job["created_at"],
         "assemblyai_transcript_id": job.get("assemblyai_transcript_id"),
+        "engine_version": VERSION,
     }
 
 
 @app.get("/v1/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(job_id: str, x_engine_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_engine_secret)
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if not job:
