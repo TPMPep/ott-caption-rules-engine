@@ -54,7 +54,7 @@ from services.formatter import process_caption_job, apply_env_overrides, restore
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "3.4.0-base44-pipeline"
+VERSION = "3.5.0-base44-pipeline"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
