@@ -1,23 +1,51 @@
 """
 Editorial AI — GPT-powered caption refinement.
 
-UPDATED: All profile helpers now read env vars unconditionally.
-The frontend sends correct values for each profile (NBCU=2/32, custom=user values).
-The GPT prompt is now dynamic based on SPEAKER_LABEL_MODE and other env vars.
+OPTIONAL polish pass that runs AFTER the rules-engine formatter has done
+its work. Improves punctuation, capitalization, phrase-aware line breaks,
+and speaker formatting WITHOUT changing the actual words. If the AI
+returns a rewrite that changes the underlying words (ignoring case +
+punctuation), the original is kept — auditor-defensible word fidelity.
+
+Skipped entirely if OPENAI_API_KEY is unset.
+
+╔══ Resilience contract (2026-05-28) ════════════════════════════════════╗
+║ This pass is the #1 source of formatter hangs in production. Root      ║
+║ cause: OpenAI's responses.create() has NO default timeout, and we call ║
+║ it once per cue serially. A single stalled connection (OpenAI's        ║
+║ responses endpoint occasionally just stops streaming — observed twice  ║
+║ on the same media) blocks the formatter thread forever, leaving the    ║
+║ engine job at stage='formatting' until Base44's 15-min stale guard     ║
+║ kills it. Auditor-grade defenses applied here:                         ║
+║                                                                        ║
+║   1. PER-CALL TIMEOUT — 30s on every OpenAI call. The SDK raises       ║
+║      APITimeoutError → the cue falls through to the "original kept"    ║
+║      branch → next cue starts immediately. One slow call ≠ stuck run.  ║
+║   2. RUN BUDGET — total wall-clock cap on the AI pass (default 120s).  ║
+║      Once exceeded, remaining cues are appended as-is. The rules       ║
+║      engine already produced spec-correct output; AI is polish only.   ║
+║   3. ERROR-RATE BAILOUT — if >20% of attempted cues errored, the AI    ║
+║      provider is having a bad day → abort and use rules-engine output. ║
+║   4. HEARTBEAT HOOK — every N cues, invoke an optional progress        ║
+║      callback so the engine can bump JOBS[job_id].updated_at, which    ║
+║      lets Base44's poller distinguish "still working" from "hung".     ║
+║                                                                        ║
+║ SOC 2 CC8.1 — graceful degradation never silently changes output;      ║
+║ every fallback path is the original rules-engine cue, byte-identical.  ║
+║ The audit row records cues_ai_applied vs cues_ai_skipped explicitly.   ║
+╚════════════════════════════════════════════════════════════════════════╝
 """
 
 import json
 import os
 import re
-from typing import Any, Dict, List
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 _WORD_RE = re.compile(r"\b[\w']+\b")
-_STYLE_TAG_RE = re.compile(r"\{\+an\d\}")
+_STYLE_TAG_RE = re.compile(r"\{\\+an\d\}")
 _ITALIC_TAG_RE = re.compile(r"</?i>")
-_WEAK_ENDS = {"a", "an", "the", "of", "to", "and", "or", "but", "with", "from", "in", "on", "at", "for", "that"}
 
-
-# ─── Profile Helpers (UPDATED: always read env vars) ────────────────
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -29,131 +57,169 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _caption_profile() -> str:
-    return (os.getenv("CAPTION_PROFILE", "") or "").strip().lower()
-
-
 def _max_lines() -> int:
-    """Always read from env. NBCU default = 2."""
     return _env_int("CUSTOM_MAX_LINES", 2)
 
 
 def _max_chars() -> int:
-    """Always read from env. NBCU default = 32."""
     return _env_int("CUSTOM_MAX_CHARS", 32)
 
 
 def _speaker_label_mode() -> str:
-    """Read speaker label mode from env. NBCU default = dash."""
     return (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
 
 
-# ─── Build Dynamic System Prompt ────────────────────────────────────
-
 def _build_system_prompt(max_lines: int, max_chars: int, speaker_mode: str) -> str:
-    """
-    Build the GPT system prompt dynamically based on profile settings.
-    """
-    # Base rules (always apply)
-    prompt_parts = [
+    parts = [
         "You are a broadcast closed-caption editorial assistant. "
         "Output must be suitable for any media (TV, streaming).",
-
         "Do not add, remove, replace, or reorder words.",
         "You may only change capitalization, punctuation, and line breaks.",
-
         "Capitalization: capitalize only the first word of a true sentence and proper nouns "
         "(names, titles, I). Do not capitalize a word just because it follows a comma or "
         "starts a new caption line.",
-
         "Punctuation (critical): use commas where the sentence or thought continues; "
         "use periods only at a real sentence stop. "
         "Only change a period to a comma when the next dialogue clearly continues the same "
         "thought (e.g. next starts with a lowercase continuation word).",
-
         "If this caption starts with a word that continues prev_dialogue "
         "(e.g. it's, well, and, but, so, then, where, really), output that word lowercased.",
-
         "When splitting into two lines, avoid a single word on the second line unless it is "
         "a brief response (Yes, No, OK, Yeah, Right).",
-
         "Prefer splitting at phrase or clause boundaries.",
         "Do not split protected phrases across lines.",
-
         "Avoid ending a line with weak function words "
         "(a, an, the, of, to, and, or, but, with, from, in, on, at, for, that) unless unavoidable.",
     ]
 
-    # Speaker-mode-specific rules
     if speaker_mode == "dash":
-        prompt_parts.append(
-            "If there are exactly two speaker runs, you MUST output exactly two lines "
-            "and begin each line with '- ' (dash space)."
-        )
+        parts.append("If there are exactly two speaker runs, you MUST output exactly two lines "
+                     "and begin each line with '- ' (dash space).")
     elif speaker_mode == "alpha":
-        prompt_parts.append(
-            "If there are multiple speaker runs, prefix each speaker's line with their "
-            "letter label followed by a colon (e.g. 'A: Hello' / 'B: Hi there')."
-        )
+        parts.append("If there are multiple speaker runs, prefix each speaker's line with their "
+                     "letter label followed by a colon (e.g. 'A: Hello' / 'B: Hi there').")
     elif speaker_mode == "generic":
-        generic_prefix = os.getenv("SPEAKER_GENERIC_PREFIX", "SPEAKER") or "SPEAKER"
-        prompt_parts.append(
-            f"If there are multiple speaker runs, prefix each speaker's line with "
-            f"'{generic_prefix} N:' where N is the speaker number."
-        )
+        gp = os.getenv("SPEAKER_GENERIC_PREFIX", "SPEAKER") or "SPEAKER"
+        parts.append(f"If there are multiple speaker runs, prefix each speaker's line with "
+                     f"'{gp} N:' where N is the speaker number.")
     elif speaker_mode == "named":
-        prompt_parts.append(
-            "If there are multiple speaker runs, prefix each speaker's line with "
-            "the speaker's name followed by a colon."
-        )
+        parts.append("If there are multiple speaker runs, prefix each speaker's line with "
+                     "the speaker's name followed by a colon.")
 
-    # Line/char limits
-    prompt_parts.append(
-        f"If text fits in one line (≤{max_chars} characters), output one line only; "
-        f"{max_lines} lines is the max, not required."
-    )
+    parts.append(f"If text fits in one line (≤{max_chars} characters), output one line only; "
+                 f"{max_lines} lines is the max, not required.")
+    parts.append('Return JSON only with the shape {"lines":["...","..."]}.')
 
-    # Output format
-    prompt_parts.append(
-        'Return JSON only with the shape {"lines":["...","..."]}.'
-    )
-
-    return " ".join(prompt_parts)
+    return " ".join(parts)
 
 
-# ─── Main Refinement Function ───────────────────────────────────────
+def editorial_refine_cues(
+    cues: List[Dict[str, Any]],
+    protected_phrases: List[str],
+    heartbeat: Optional[Callable[[int, int], None]] = None,
+) -> List[Dict[str, Any]]:
+    """Apply the optional editorial-AI polish pass to dialogue cues.
 
-def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[str]) -> List[Dict[str, Any]]:
-    """
-    Optional AI editorial pass.
-    Improves: punctuation/capitalization, phrase-aware line breaks, speaker formatting.
+    Args:
+        cues: Rules-engine output cues. Non-dialogue cues pass through.
+        protected_phrases: Phrases the AI is forbidden from splitting.
+        heartbeat: Optional callable `(idx, total) -> None` invoked every
+            HEARTBEAT_EVERY cues so the caller (main.py) can bump the job's
+            `updated_at` timestamp. Lets Base44's poller distinguish a
+            slow-but-progressing run from a hung formatter. SOC 2 CC8.1 —
+            engine state must be observable in real time.
 
-    Hard rule: never accept an AI rewrite that changes the underlying words
-    (ignoring case and punctuation).
+    Returns:
+        List of cues. AI-improved where successful, original where not.
+        Length always equals len(cues) — no cues are dropped.
     """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return cues
-
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+        from openai import OpenAI, APITimeoutError, APIError
+        # Per-call timeout pinned at the client level. The OpenAI SDK
+        # raises APITimeoutError after this wall-clock budget — the cue
+        # then falls through to "original kept" instead of blocking the
+        # entire formatter thread forever (the production hang root cause).
+        per_call_timeout = _env_int("OPENAI_REQUEST_TIMEOUT_SECONDS", 30)
+        client = OpenAI(api_key=api_key, timeout=float(per_call_timeout))
     except Exception:
         return cues
+
+    # Resilience budgets — all env-tunable so we can ratchet them under
+    # real-world load without a redeploy.
+    run_budget_seconds = _env_int("EDITORIAL_AI_RUN_BUDGET_SECONDS", 120)
+    error_rate_bailout_pct = _env_int("EDITORIAL_AI_ERROR_RATE_BAILOUT_PCT", 20)
+    min_attempts_before_bailout = _env_int("EDITORIAL_AI_MIN_ATTEMPTS_BEFORE_BAILOUT", 25)
+    heartbeat_every = _env_int("EDITORIAL_AI_HEARTBEAT_EVERY", 25)
 
     max_lines = _max_lines()
     max_chars = _max_chars()
     speaker_mode = _speaker_label_mode()
-
     system_prompt = _build_system_prompt(max_lines, max_chars, speaker_mode)
 
     refined: List[Dict[str, Any]] = []
     total = len(cues)
 
+    # Telemetry — printed once at the end so an operator scanning Railway
+    # logs can answer "did AI actually polish anything?" without grepping.
+    stats = {
+        "dialogue_attempted": 0,
+        "ai_applied": 0,
+        "ai_rejected_word_drift": 0,
+        "ai_rejected_overflow": 0,
+        "ai_rejected_dash_rule": 0,
+        "ai_error_timeout": 0,
+        "ai_error_other": 0,
+        "skipped_run_budget": 0,
+        "skipped_error_rate_bailout": 0,
+    }
+
+    start_time = time.monotonic()
+    bailed_out = False
+
     for idx, cue in enumerate(cues):
+        # Heartbeat — let the caller bump JOBS[job_id].updated_at so the
+        # Base44 poller's freshness watchdog stays honest even on long runs.
+        if heartbeat and idx > 0 and idx % heartbeat_every == 0:
+            try:
+                heartbeat(idx, total)
+            except Exception:
+                pass  # heartbeat is best-effort; never block the formatter
+
         if cue.get("type") != "dialogue":
             refined.append(cue)
             continue
+
+        # Once any resilience budget trips, we stop calling the AI but
+        # KEEP appending the original cues. Output length is preserved
+        # exactly so downstream stages (readability, QC, export) cannot
+        # tell the difference. SOC 2 CC8.1: graceful degradation.
+        if bailed_out:
+            refined.append(cue)
+            continue
+
+        # Run-wall-clock budget. The rules engine already produced spec-
+        # correct output; further AI polish is not worth blocking delivery.
+        if time.monotonic() - start_time > run_budget_seconds:
+            stats["skipped_run_budget"] += (total - idx)
+            bailed_out = True
+            refined.append(cue)
+            continue
+
+        # Error-rate bailout. If OpenAI is having a bad day (>20% error
+        # rate after at least 25 attempts), keep the rest as-is. Catches
+        # the partial-outage case where some calls succeed but most don't.
+        attempted = stats["dialogue_attempted"]
+        errored = stats["ai_error_timeout"] + stats["ai_error_other"]
+        if attempted >= min_attempts_before_bailout:
+            error_pct = (errored * 100) // max(1, attempted)
+            if error_pct >= error_rate_bailout_pct:
+                stats["skipped_error_rate_bailout"] += (total - idx)
+                bailed_out = True
+                refined.append(cue)
+                continue
 
         runs = cue.get("meta", {}).get("runs", [])
         dialogue_text = cue.get("meta", {}).get(
@@ -163,7 +229,6 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             refined.append(cue)
             continue
 
-        # Context: previous and next cue text
         prev_text = ""
         next_text = ""
         if idx > 0 and cues[idx - 1].get("type") == "dialogue":
@@ -175,10 +240,7 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
                 "dialogue_text", " ".join(cues[idx + 1].get("lines", []))
             ).strip()
 
-        # Build speaker formatting rule based on mode
-        two_speaker_rule = True  # default for dash mode
-        if speaker_mode != "dash":
-            two_speaker_rule = False
+        two_speaker_rule = speaker_mode == "dash"
 
         payload = {
             "dialogue_text": dialogue_text,
@@ -186,7 +248,7 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             "speaker_runs": runs,
             "prev_dialogue": prev_text,
             "next_dialogue": next_text,
-            "protected_phrases": protected_phrases[:50],
+            "protected_phrases": (protected_phrases or [])[:50],
             "rules": {
                 "max_lines": max_lines,
                 "max_chars_per_line": max_chars,
@@ -198,6 +260,8 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
                 "avoid_weak_function_word_line_endings": True,
             },
         }
+
+        stats["dialogue_attempted"] += 1
 
         try:
             response = client.responses.create(
@@ -211,7 +275,13 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             raw = response.output_text.strip()
             data = json.loads(raw)
             ai_lines = [str(x).strip() for x in data.get("lines", []) if str(x).strip()]
+        except APITimeoutError:
+            # Single slow call ≠ stuck run. Keep original; move on.
+            stats["ai_error_timeout"] += 1
+            refined.append(cue)
+            continue
         except Exception:
+            stats["ai_error_other"] += 1
             refined.append(cue)
             continue
 
@@ -220,32 +290,41 @@ def editorial_refine_cues(cues: List[Dict[str, Any]], protected_phrases: List[st
             refined.append(cue)
             continue
 
-        # Validate exact same words (ignore punctuation and case)
         original_words = _word_fingerprint(dialogue_text)
         ai_words = _word_fingerprint(" ".join(_strip_dashes(ai_lines)))
         if original_words != ai_words:
+            stats["ai_rejected_word_drift"] += 1
             refined.append(cue)
             continue
 
-        # Check line/char limits
         if len(ai_lines) > max_lines or any(_visible_len(line) > max_chars for line in ai_lines):
+            stats["ai_rejected_overflow"] += 1
             refined.append(cue)
             continue
 
-        # Speaker-mode validation
         if speaker_mode == "dash" and len(runs) == 2:
             if len(ai_lines) != 2 or not all(line.startswith("- ") for line in ai_lines):
+                stats["ai_rejected_dash_rule"] += 1
                 refined.append(cue)
                 continue
 
         new_cue = dict(cue)
         new_cue["lines"] = ai_lines
+        stats["ai_applied"] += 1
         refined.append(new_cue)
+
+    elapsed_s = round(time.monotonic() - start_time, 1)
+    print(
+        f"[EDITORIAL_AI] elapsed={elapsed_s}s "
+        f"applied={stats['ai_applied']}/{stats['dialogue_attempted']} "
+        f"timeouts={stats['ai_error_timeout']} other_errors={stats['ai_error_other']} "
+        f"bailed_out={bailed_out} "
+        f"skipped_budget={stats['skipped_run_budget']} "
+        f"skipped_error_rate={stats['skipped_error_rate_bailout']}"
+    )
 
     return refined
 
-
-# ─── Helpers ────────────────────────────────────────────────────────
 
 def _word_fingerprint(text: str) -> List[str]:
     return [m.group(0).lower() for m in _WORD_RE.finditer(text)]
