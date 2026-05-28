@@ -10,9 +10,9 @@ Endpoints:
 
 Job lifecycle (background thread):
   queued
-    → submitted_to_assemblyai
-    → waiting_for_transcription
-    → fetching_transcript          (reformat_only path)
+    → submitting_to_provider          (transcription_provider: 'elevenlabs' | 'assemblyai')
+    → waiting_for_transcription       (assemblyai async)
+    → fetching_transcript             (reformat_only path)
     → formatting
     → completed | failed
 
@@ -21,17 +21,30 @@ A completed job carries:
   result.srt               — SRT string
   result.vtt               — VTT string
   result.qc                — QC report dict
-  result.assemblyai.utterances[] — raw AAI utterances (so Base44 can derive
-                                   CCSpeaker rows server-side from A/B/C
-                                   diarization without re-fetching AAI)
-  result._used_rules       — every env-driven rule value applied to this
-                             run, so the auditor can reproduce the result
-                             from the row alone (SOC 2 CC8.1).
+  result.assemblyai.utterances[] — diarized utterances (AAI-shape, regardless
+                                    of provider — Scribe is normalized to
+                                    the same shape so the Base44 ingester is
+                                    provider-agnostic).
+  result.assemblyai.audio_events[] — structured non-dialogue events
+                                      (music, applause, laughter, ...) —
+                                      promoted into CaptionCue rows server-
+                                      side as cue_type='music'/'sound_effect'.
+  result.transcription_provider — 'elevenlabs' | 'assemblyai'
+  result.transcription_model    — 'scribe_v2' | 'universal-3-pro' | 'universal-2'
+  result._used_rules       — every env-driven rule value applied to this run.
 
 Auth:
   If env var ENGINE_SHARED_SECRET is set, every POST/GET must carry
   X-Engine-Secret header matching it. If unset (today's default), the
   service is open — relies on the obscure Railway URL.
+
+Provider selection (auditor-grade default):
+  Scribe v2 is the DEFAULT transcription provider for CC projects because it
+  provides native diarization + native audio-event tagging (FCC 47 CFR §79.1
+  compliance — non-dialogue coverage is provider-emitted, not prompt-coaxed).
+  AssemblyAI is retained as an opt-in fallback for legacy projects and as a
+  diagnostic comparison path. The Base44 producer sets `transcription_provider`
+  on every POST.
 """
 
 from fastapi import FastAPI, HTTPException, Header
@@ -49,12 +62,14 @@ from services.assembly import (
     wait_for_transcription_result,
     fetch_transcript_result,
     build_caption_inputs_from_assembly_result,
+    extract_audio_events_from_assembly_result,
 )
+from services.scribe import transcribe as scribe_transcribe
 from services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "3.5.0-base44-pipeline"
+VERSION = "4.0.0-scribe-v2-default"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -111,6 +126,16 @@ class CreateJobRequest(BaseModel):
     protected_phrases: Optional[List[str]] = None
     protectedPhrases: Optional[List[str]] = None  # camelCase alias
 
+    # Transcription provider selection (auditor-grade default: scribe_v2).
+    # 'elevenlabs' → ElevenLabs Scribe v2 (native diarization + audio events)
+    # 'assemblyai' → AssemblyAI universal-3-pro / universal-2 fallback chain
+    # When omitted, defaults to 'elevenlabs' so a misconfigured producer
+    # never silently degrades to a less auditable model.
+    transcription_provider: Optional[str] = "elevenlabs"
+    # ISO 639-3 (Scribe) or auto-detect (AAI). Producer derives this from the
+    # project's source_language. None / "auto" → provider auto-detects.
+    source_language_code: Optional[str] = None
+
     # Base44-side audit anchors. Echoed verbatim into the job record and
     # the result so the Base44 ingester can correlate the engine job with
     # the originating Project / CCFormatRun without out-of-band tracking.
@@ -152,6 +177,25 @@ def get_env_overrides(payload: Dict[str, Any]) -> Dict[str, Any]:
     return env_dict
 
 
+def _normalize_provider(raw: Optional[str]) -> str:
+    """Normalize the transcription_provider field. Default = 'elevenlabs'."""
+    if not raw:
+        return "elevenlabs"
+    p = str(raw).strip().lower()
+    if p in ("elevenlabs", "scribe", "scribe_v2", "el"):
+        return "elevenlabs"
+    if p in ("assemblyai", "aai"):
+        return "assemblyai"
+    return "elevenlabs"
+
+
+def _provider_model_id(provider: str) -> str:
+    """For auditor evidence — pin the exact model used by this run."""
+    if provider == "elevenlabs":
+        return os.getenv("ELEVENLABS_SCRIBE_MODEL", "scribe_v2")
+    return "universal-3-pro"  # AAI primary; engine sets a fallback chain
+
+
 def update_job(job_id: str, **fields: Any) -> None:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -184,20 +228,50 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         output_formats = parse_output_formats(payload)
         protected_phrases = get_protected_phrases(payload)
 
-        transcript_id = JOBS.get(job_id, {}).get("assemblyai_transcript_id") or payload.get("transcript_id")
+        provider = _normalize_provider(payload.get("transcription_provider"))
+        model_id = _provider_model_id(provider)
+        transcript_id = JOBS.get(job_id, {}).get("provider_transcript_id") or payload.get("transcript_id")
 
+        # ── Transcription branch ─────────────────────────────────────────
+        # `assembly_result` is intentionally the canonical name for the
+        # normalized result regardless of provider — the formatter and the
+        # downstream Base44 ingester both consume this shape. Scribe v2 is
+        # normalized by services.scribe.normalize_scribe_result to match.
+        assembly_result: Dict[str, Any]
         if payload.get("reformat_only"):
             if not transcript_id:
                 raise ValueError("transcript_id is required when reformat_only=true")
+            if provider != "assemblyai":
+                # Scribe v2 is synchronous — there is no transcript_id to
+                # rehydrate against. Reformat-only is an AssemblyAI-only path
+                # (the workflow's original use case was pure re-format runs).
+                raise ValueError("reformat_only=true requires transcription_provider='assemblyai'")
             update_job(job_id, status="processing", stage="fetching_transcript",
-                       assemblyai_transcript_id=transcript_id)
+                       provider_transcript_id=transcript_id,
+                       transcription_provider=provider,
+                       transcription_model=model_id)
             print(f"[{job_id}] Reformat-only: fetching AAI transcript {transcript_id}")
             assembly_result = fetch_transcript_result(transcript_id, require_completed=True)
+        elif provider == "elevenlabs":
+            update_job(job_id, status="processing", stage="submitting_to_provider",
+                       transcription_provider=provider,
+                       transcription_model=model_id)
+            media_url = str(payload["mediaUrl"])
+            lang = payload.get("source_language_code") or None
+            print(f"[{job_id}] Submitting to ElevenLabs Scribe (lang={lang or 'auto'})")
+            update_job(job_id, status="processing", stage="waiting_for_transcription")
+            assembly_result = scribe_transcribe(media_url, language_code=lang)
         else:
+            # AssemblyAI path (legacy fallback)
+            update_job(job_id, status="processing", stage="submitting_to_provider",
+                       transcription_provider=provider,
+                       transcription_model=model_id)
             if not transcript_id:
-                raise ValueError("assemblyai_transcript_id is required before transcription worker starts")
+                # AAI is submitted up front by the request handler — if we
+                # got here without one, that's a programmer error.
+                raise ValueError("AssemblyAI transcript_id missing before worker start")
             update_job(job_id, status="processing", stage="waiting_for_transcription",
-                       assemblyai_transcript_id=transcript_id)
+                       provider_transcript_id=transcript_id)
             print(f"[{job_id}] Waiting for AssemblyAI result...")
             assembly_result = wait_for_transcription_result(transcript_id)
 
@@ -223,9 +297,23 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
             heartbeat=_formatter_heartbeat,
         )
 
-        # Attach AAI utterances so Base44 can derive CCSpeaker rows without
-        # re-fetching from AssemblyAI. SOC 2 CC8.1 — the engine result is
-        # self-contained chain-of-custody evidence.
+        # ── Audio events (provider-native or extracted from AAI output) ──
+        # Scribe v2 emits audio_events natively in normalize_scribe_result.
+        # AssemblyAI doesn't — we extract from bracket tags as a best-effort
+        # so the FCC §79.1 non-dialogue coverage requirement is met on both
+        # paths. The Base44 worker's EVENT_TO_TEXT_WORKER map renders them
+        # into proper cue_type='music'/'sound_effect' caption rows.
+        if provider == "elevenlabs":
+            audio_events = list(assembly_result.get("audio_events") or [])
+        else:
+            audio_events = extract_audio_events_from_assembly_result(assembly_result)
+
+        # Attach diarization + audio events so Base44 can derive CCSpeaker
+        # rows and non-dialogue cues without re-fetching from the provider.
+        # SOC 2 CC8.1 — the engine result is self-contained chain-of-custody
+        # evidence. The key stays 'assemblyai' to keep the Base44 ingester
+        # contract stable; the provider fingerprint lives in
+        # caption_result.transcription_provider / transcription_model.
         caption_result["assemblyai"] = {
             "transcript_id": assembly_result.get("id"),
             "language_code": assembly_result.get("language_code"),
@@ -240,6 +328,7 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
                 }
                 for u in (assembly_result.get("utterances") or [])
             ],
+            "audio_events": audio_events,
         }
         # Echo Base44-side audit anchors for the ingester to correlate.
         caption_result["base44"] = {
@@ -248,10 +337,15 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
             "request_id": payload.get("request_id"),
         }
         caption_result["engine_version"] = VERSION
+        # Auditor fingerprint — pinned per-run, not derived.
+        caption_result["transcription_provider"] = provider
+        caption_result["transcription_model"] = model_id
 
         update_job(job_id, status="completed", stage="completed",
                    result=caption_result, error=None,
-                   assemblyai_transcript_id=assembly_result.get("id") or transcript_id)
+                   transcription_provider=provider,
+                   transcription_model=model_id,
+                   provider_transcript_id=assembly_result.get("id") or transcript_id)
 
     except Exception as e:
         print(f"[{job_id}] Caption job FAILED: {e}")
@@ -272,6 +366,8 @@ def health():
         "service": "ott-caption-rules-engine",
         "version": VERSION,
         "time": utc_now(),
+        "default_transcription_provider": "elevenlabs",
+        "scribe_model_id": os.getenv("ELEVENLABS_SCRIBE_MODEL", "scribe_v2"),
     }
 
 
@@ -281,16 +377,20 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
 
     job_id = str(uuid.uuid4())
     payload_data = payload.model_dump(mode="json")
+    provider = _normalize_provider(payload_data.get("transcription_provider"))
+    model_id = _provider_model_id(provider)
 
     if payload_data.get("reformat_only"):
         if not payload_data.get("transcript_id"):
             raise HTTPException(status_code=400, detail="transcript_id is required when reformat_only=true")
+        if provider != "assemblyai":
+            raise HTTPException(status_code=400, detail="reformat_only=true requires transcription_provider='assemblyai'")
     else:
         if not payload_data.get("mediaUrl"):
             raise HTTPException(status_code=400, detail="mediaUrl is required for new transcription jobs")
 
     created_at = utc_now()
-    assemblyai_transcript_id = payload_data.get("transcript_id")
+    provider_transcript_id = payload_data.get("transcript_id")
 
     with JOBS_LOCK:
         JOBS[job_id] = {
@@ -300,23 +400,31 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
             "created_at": created_at,
             "updated_at": created_at,
             "input": payload_data,
-            "assemblyai_transcript_id": assemblyai_transcript_id,
+            "transcription_provider": provider,
+            "transcription_model": model_id,
+            # Back-compat alias used by older Base44 poller paths.
+            "assemblyai_transcript_id": provider_transcript_id if provider == "assemblyai" else None,
+            "provider_transcript_id": provider_transcript_id,
             "project_id": payload_data.get("project_id"),
             "cc_format_run_id": payload_data.get("cc_format_run_id"),
             "result": None,
             "error": None,
         }
 
+    # ── AAI path: kick off the async transcription up front so the response
+    # carries assemblyai_transcript_id (the poller chains off this).
+    # ── Scribe path: synchronous — we just start the worker; no upfront ID.
     if payload_data.get("reformat_only"):
         update_job(job_id, status="processing", stage="fetching_transcript",
-                   assemblyai_transcript_id=assemblyai_transcript_id)
+                   provider_transcript_id=provider_transcript_id,
+                   assemblyai_transcript_id=provider_transcript_id)
         start_job_worker(job_id, payload_data)
-    else:
+    elif provider == "assemblyai":
         media_url = str(payload_data["mediaUrl"])
         speaker_labels = payload_data.get("speakerLabels", True)
         language_detection = payload_data.get("languageDetection", True)
         try:
-            assemblyai_transcript_id = submit_transcription_job(
+            provider_transcript_id = submit_transcription_job(
                 media_url=media_url,
                 speaker_labels=speaker_labels,
                 language_detection=language_detection,
@@ -325,11 +433,19 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
             update_job(job_id, status="failed", stage="failed", error={"message": str(exc)})
             return {
                 "id": job_id, "status": "failed", "stage": "failed",
-                "created_at": created_at, "assemblyai_transcript_id": None,
+                "created_at": created_at,
+                "assemblyai_transcript_id": None,
+                "transcription_provider": provider,
+                "transcription_model": model_id,
                 "error": {"message": str(exc)},
             }
         update_job(job_id, status="processing", stage="waiting_for_transcription",
-                   assemblyai_transcript_id=assemblyai_transcript_id)
+                   provider_transcript_id=provider_transcript_id,
+                   assemblyai_transcript_id=provider_transcript_id)
+        start_job_worker(job_id, payload_data)
+    else:
+        # ElevenLabs Scribe path — worker thread does the synchronous POST.
+        update_job(job_id, status="processing", stage="submitting_to_provider")
         start_job_worker(job_id, payload_data)
 
     job = JOBS[job_id]
@@ -338,7 +454,12 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
         "status": job["status"],
         "stage": job.get("stage"),
         "created_at": job["created_at"],
+        # AAI-back-compat field — null for Scribe runs (the AAI poller branch
+        # in Base44 looks for non-null before it tries to call AAI directly).
         "assemblyai_transcript_id": job.get("assemblyai_transcript_id"),
+        "provider_transcript_id": job.get("provider_transcript_id"),
+        "transcription_provider": provider,
+        "transcription_model": model_id,
         "engine_version": VERSION,
     }
 
