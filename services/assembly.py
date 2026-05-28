@@ -27,14 +27,31 @@ POLL_TIMEOUT_SECONDS = int(os.getenv("ASSEMBLY_POLL_TIMEOUT_SECONDS", str(60 * 6
 BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 
 DEFAULT_TRANSCRIPTION_PROMPT = (
+    # Broadcast-grade prompt aligned with FCC 47 CFR §79.1, which REQUIRES that
+    # non-speech information necessary for comprehension be identified in
+    # closed captions. Auditor framing: a CC track for a sports / drama /
+    # comedy asset that emits zero audio-event tags is presumptively
+    # non-compliant. We instruct AAI to emit common, editorially-useful tags
+    # generously — the rules engine downstream applies a SOUND_DENSITY filter
+    # ('conservative' / 'standard' / 'verbose') that trims to spec.
     "Transcribe spoken dialogue accurately with punctuation and formatting. "
     "Dialogue is the priority. Preserve proper nouns and show titles accurately. "
     "If speech is in a language other than English, preserve it in the original language. "
-    "Use bracketed non-speech tags only when unmistakable and editorially useful for broadcast captions. "
-    "Limit non-speech tags to [music], [laughter], [applause], and [cheering]. "
-    "Do not emit [inaudible], [noise], [pause], or [sound effect]. "
-    "Do not stack multiple audio tags. Do not insert audio tags inside dialogue sentences. "
-    "If uncertain, omit the tag."
+    "Emit bracketed non-speech audio-event tags whenever a sound is editorially "
+    "meaningful for a Deaf or hard-of-hearing viewer — music, audience reactions, "
+    "and prominent ambient sounds are routinely required for broadcast compliance. "
+    "Permitted tags: [music], [laughter], [applause], [cheering], [crowd cheering], "
+    "[gasps], [crying], [screaming], [phone rings], [doorbell], [knocking], "
+    "[footsteps], [gunshot], [explosion], [siren], [car horn], [engine revving], "
+    "[whistle blows], [whistle], [buzzer], [thunder], [wind], [whispering]. "
+    "Use [music] for any musical passage (score, song, jingle, theme). "
+    "Use [crowd cheering] or [cheering] for sports crowds. Use [whistle blows] for "
+    "referee whistles in sports. Use [applause] for audible audience applause. "
+    "Do not emit [inaudible], [noise], [pause], [sound effect], or [silence]. "
+    "Do not stack multiple audio tags. Do not insert audio tags inside dialogue sentences — "
+    "place them on their own line between sentences. "
+    "When a sound is clearly present and editorially useful, emit the tag. "
+    "Reserve omission for sounds that are ambiguous or genuinely imperceptible."
 )
 
 
