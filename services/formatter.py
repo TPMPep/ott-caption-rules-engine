@@ -477,6 +477,7 @@ def process_caption_job(
     timestamps: Any,
     protected_phrases: Optional[List[str]] = None,
     output_formats: Optional[List[str]] = None,
+    heartbeat: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Main caption processing pipeline.
@@ -549,8 +550,11 @@ def process_caption_job(
     cues_in_count = len(cues)
     print(f"[FORMATTER] Initial cues built: {cues_in_count}")
 
-    # 6. Editorial AI
-    cues = editorial_refine_cues(cues, protected_phrases)
+    # 6. Editorial AI — pass the heartbeat through so each cue's OpenAI
+    # call can pulse the job's updated_at timestamp. Closes the "engine
+    # looks hung from outside even though it's still working" perception
+    # gap that produced the Pluto-Test 16-min auto-fail.
+    cues = editorial_refine_cues(cues, protected_phrases, heartbeat=heartbeat)
     print(f"[FORMATTER] After editorial AI: {len(cues)} cues")
 
     # 7. Readability
