@@ -270,6 +270,103 @@ def tc_to_ms(tc: str) -> int:
     return ((hh * 60 + mm) * 60 + ss) * 1000 + ms
 
 
+# =============================================================================
+# extract_audio_events_from_assembly_result — promote bracketed tags from an
+# AAI transcript into the SAME structured `audio_events[]` shape Scribe v2
+# emits natively. Lets the Base44 ingester consume one provider-agnostic
+# array (FCC 47 CFR §79.1 non-dialogue coverage on both transcription paths).
+# Returns: [{event_type, start, end}, ...] in milliseconds.
+# =============================================================================
+_AAI_EVENT_TAG_MAP: List[Tuple[str, str]] = [
+    ("music playing", "music_playing"),
+    ("music",         "music"),
+    ("crowd cheering","crowd_noise"),
+    ("cheering",      "crowd_noise"),
+    ("crowd noise",   "crowd_noise"),
+    ("crowd",         "crowd_noise"),
+    ("applause",      "applause"),
+    ("laughter",      "laughter"),
+    ("laughing",      "laughter"),
+    ("gasps",         "gasping"),
+    ("gasping",       "gasping"),
+    ("screaming",     "screaming"),
+    ("shouting",      "shouting"),
+    ("crying",        "crying"),
+    ("sobbing",       "crying"),
+    ("whispering",    "whispering"),
+    ("phone ringing", "ringtone"),
+    ("phone rings",   "ringtone"),
+    ("doorbell",      "ringtone"),
+    ("alarm",         "alarm"),
+    ("siren",         "siren"),
+    ("buzzer",        "alarm"),
+    ("whistle blows", "whistle"),
+    ("whistle",       "whistle"),
+    ("gunshot",       "gunshot"),
+    ("gunfire",       "gunshot"),
+    ("explosion",     "explosion"),
+    ("engine revving","engine_noise"),
+    ("engine",        "engine_noise"),
+    ("car horn",      "engine_noise"),
+    ("thunder",       "thunder"),
+    ("rain",          "rain"),
+    ("wind",          "rain"),
+    ("footsteps",     "footsteps"),
+    ("knocking",      "knocking"),
+    ("knock",         "knocking"),
+]
+
+
+def _classify_aai_audio_tag(inner: str) -> Optional[str]:
+    s = re.sub(r"\s+", " ", (inner or "")).strip().lower()
+    if not s:
+        return None
+    for needle, event_type in _AAI_EVENT_TAG_MAP:
+        if needle in s:
+            return event_type
+    return None
+
+
+def extract_audio_events_from_assembly_result(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    utterances = result.get("utterances") or []
+    for utt in utterances:
+        text = (utt.get("text") or "").strip()
+        if not text:
+            continue
+        start_ms = int(utt.get("start", 0))
+        end_ms = int(utt.get("end", start_ms))
+        matches = list(BRACKET_TAG_RE.finditer(text))
+        if not matches:
+            continue
+        total_dur = max(1, end_ms - start_ms)
+        per_tag = max(1, total_dur // max(1, len(matches)))
+        for idx, m in enumerate(matches):
+            inner = m.group(0).strip("[]")
+            event_type = _classify_aai_audio_tag(inner)
+            if not event_type:
+                continue
+            tag_start = start_ms + (idx * per_tag)
+            tag_end = min(end_ms, tag_start + per_tag)
+            out.append({
+                "event_type": event_type,
+                "start": tag_start,
+                "end": max(tag_start + 300, tag_end),
+            })
+    # Merge adjacent same-type events (≤2s gap).
+    if not out:
+        return out
+    out.sort(key=lambda e: (e["start"], e["end"]))
+    merged: List[Dict[str, Any]] = [dict(out[0])]
+    for ev in out[1:]:
+        prev = merged[-1]
+        if ev["event_type"] == prev["event_type"] and ev["start"] - prev["end"] <= 2000:
+            prev["end"] = max(prev["end"], ev["end"])
+        else:
+            merged.append(dict(ev))
+    return [e for e in merged if (e["end"] - e["start"]) >= 300]
+
+
 def merge_and_dedup_tokens(spoken: List[Dict[str, Any]], sound: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged = spoken + sound
     merged.sort(key=lambda x: (x["start_ms"], x["end_ms"], x["text"]))
