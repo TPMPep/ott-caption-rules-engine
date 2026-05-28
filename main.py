@@ -54,7 +54,7 @@ from services.formatter import process_caption_job, apply_env_overrides, restore
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "3.3.0-base44-pipeline"
+VERSION = "3.4.0-base44-pipeline"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -205,11 +205,22 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
 
         backbone_srt_text, timestamps_json = build_caption_inputs_from_assembly_result(assembly_result)
 
+        # Heartbeat closure — editorial_ai calls this every N cues so the
+        # job's updated_at timestamp advances during the long AI polish
+        # pass. Without this, the formatter could correctly grind through
+        # 400 cues over 90 seconds and look "hung" to Base44's poller
+        # (which reads updated_at as the freshness signal). SOC 2 CC8.1 —
+        # engine progress must be observable in real time.
+        def _formatter_heartbeat(idx: int, total: int) -> None:
+            update_job(job_id, stage="formatting",
+                       formatter_progress={"cues_processed": idx, "cues_total": total})
+
         caption_result = process_caption_job(
             backbone_srt_text=backbone_srt_text,
             timestamps=timestamps_json,
             protected_phrases=protected_phrases,
             output_formats=output_formats,
+            heartbeat=_formatter_heartbeat,
         )
 
         # Attach AAI utterances so Base44 can derive CCSpeaker rows without
