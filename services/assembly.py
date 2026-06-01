@@ -125,18 +125,82 @@ def fetch_transcript_result(transcript_id: str, require_completed: bool = True) 
     return data
 
 
-def build_caption_inputs_from_assembly_result(assembly_result: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
-    transcript_id = assembly_result.get("id")
-    if not transcript_id:
-        raise ValueError("AssemblyAI result missing transcript id")
+def _ms_to_srt_tc(ms: int) -> str:
+    """Milliseconds → SRT timecode HH:MM:SS,mmm."""
+    ms = max(0, int(ms))
+    hh, rem = divmod(ms, 3600000)
+    mm, rem = divmod(rem, 60000)
+    ss, rem = divmod(rem, 1000)
+    return f"{hh:02d}:{mm:02d}:{ss:02d},{rem:03d}"
 
-    backbone_srt_text = fetch_srt(transcript_id)
+
+def build_backbone_srt_from_utterances(assembly_result: Dict[str, Any]) -> str:
+    """
+    Build the backbone SRT LOCALLY from the normalized utterances the engine
+    already holds — NO provider REST call.
+
+    This is the provider-agnostic source of truth: every transcription
+    provider (AssemblyAI, ElevenLabs Scribe) is normalized to the same
+    `utterances[]` shape (speaker/start/end/text) before this runs, so the
+    backbone is built identically regardless of who transcribed. The previous
+    code fetched the SRT from AssemblyAI's /transcript/{id}/srt endpoint, which
+    400'd for any non-AAI provider (the Scribe transcript id is unknown to AAI).
+    Building locally removes the provider coupling entirely — there is nothing
+    provider-specific left to get wrong. SOC 2 CC8.1 — the backbone is
+    deterministically reproducible from the in-memory result.
+    """
+    utterances = assembly_result.get("utterances") or []
+    blocks: List[str] = []
+    idx = 0
+    for utt in utterances:
+        text = (utt.get("text") or "").strip()
+        if not text:
+            continue
+        idx += 1
+        start_ms = int(utt.get("start", 0) or 0)
+        end_ms = int(utt.get("end", start_ms) or start_ms)
+        if end_ms <= start_ms:
+            end_ms = start_ms + 1
+        blocks.append(
+            f"{idx}\n{_ms_to_srt_tc(start_ms)} --> {_ms_to_srt_tc(end_ms)}\n{text}"
+        )
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+def build_caption_inputs(assembly_result: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Provider-agnostic caption-input builder. Works identically for AssemblyAI
+    and ElevenLabs Scribe because both are normalized to the same result shape
+    upstream (services.scribe.normalize_scribe_result / AAI's native shape).
+
+    Backbone SRT is built LOCALLY from utterances — no REST call to any
+    provider. The legacy AAI `/srt` endpoint fetch is retained ONLY as a
+    fallback for the reformat_only path where a result may arrive without
+    utterances (pure AAI re-format of a historic transcript).
+    """
+    backbone_srt_text = build_backbone_srt_from_utterances(assembly_result)
+
+    # Fallback: if (and only if) there were no utterances to build from AND we
+    # have a real AAI transcript id, pull the SRT from AAI. This never fires
+    # for a Scribe run (Scribe always has utterances) and never cross-calls the
+    # wrong provider.
+    if not backbone_srt_text.strip():
+        provider = (assembly_result.get("_provider") or "").lower()
+        transcript_id = assembly_result.get("id")
+        if provider in ("", "assemblyai") and transcript_id:
+            backbone_srt_text = fetch_srt(transcript_id)
+
     spoken_tokens = build_word_timestamps_from_result(assembly_result)
     sound_tokens = extract_sound_tokens_from_json(assembly_result)
     if not sound_tokens:
         sound_tokens = extract_sound_tokens_from_srt(backbone_srt_text)
     merged_tokens = merge_and_dedup_tokens(spoken_tokens, sound_tokens)
     return backbone_srt_text, merged_tokens
+
+
+def build_caption_inputs_from_assembly_result(assembly_result: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+    """Back-compat alias — delegates to the provider-agnostic builder."""
+    return build_caption_inputs(assembly_result)
 
 
 def fetch_srt(transcript_id: str) -> str:
