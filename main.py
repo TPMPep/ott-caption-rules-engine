@@ -61,7 +61,7 @@ from services.assembly import (
     submit_transcription_job,
     wait_for_transcription_result,
     fetch_transcript_result,
-    build_caption_inputs_from_assembly_result,
+    build_caption_inputs,
     extract_audio_events_from_assembly_result,
 )
 from services.scribe import transcribe as scribe_transcribe
@@ -69,7 +69,7 @@ from services.formatter import process_caption_job, apply_env_overrides, restore
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "4.1.0-baseline-words-fix"
+VERSION = "4.2.0-provider-agnostic-backbone"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -277,7 +277,7 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
 
         update_job(job_id, status="processing", stage="formatting")
 
-        backbone_srt_text, timestamps_json = build_caption_inputs_from_assembly_result(assembly_result)
+        backbone_srt_text, timestamps_json = build_caption_inputs(assembly_result)
 
         # Heartbeat closure — editorial_ai calls this every N cues so the
         # job's updated_at timestamp advances during the long AI polish
