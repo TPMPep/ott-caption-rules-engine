@@ -69,7 +69,7 @@ from services.formatter import process_caption_job, apply_env_overrides, restore
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "4.0.0-scribe-v2-default"
+VERSION = "4.1.0-baseline-words-fix"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -314,6 +314,15 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         # evidence. The key stays 'assemblyai' to keep the Base44 ingester
         # contract stable; the provider fingerprint lives in
         # caption_result.transcription_provider / transcription_model.
+        # CRITICAL: include per-utterance `words` (word-level timings) AND a
+        # flat top-level `words` array. The Base44 ingester writes these into
+        # the immutable S3 baseline, and every future Apply Spec re-run rebuilds
+        # its input cues from them via `_splitUtteranceByPauses`. Dropping them
+        # here (the prior bug) produced a baseline with words:[] — which made
+        # Apply Spec fail with "AAI baseline contained no utterances" on EVERY
+        # project. The normalizer (scribe.py / assembly.py) already populates
+        # utterance["words"]; we now carry it through verbatim. SOC 2 CC8.1 —
+        # the engine result is self-contained chain-of-custody evidence.
         caption_result["assemblyai"] = {
             "transcript_id": assembly_result.get("id"),
             "language_code": assembly_result.get("language_code"),
@@ -325,11 +334,17 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
                     "end": u.get("end"),
                     "text": u.get("text"),
                     "confidence": u.get("confidence"),
+                    "words": u.get("words") or [],
                 }
                 for u in (assembly_result.get("utterances") or [])
             ],
             "audio_events": audio_events,
         }
+        # Flat word list — the secondary baseline source. Mirrors the
+        # normalizer's `words` output (already provider-agnostic). The ingester
+        # prefers this when present; the per-utterance words above are the
+        # fallback. Carrying both makes the baseline robust to either reader.
+        caption_result["words"] = list(assembly_result.get("words") or [])
         # Echo Base44-side audit anchors for the ingester to correlate.
         caption_result["base44"] = {
             "project_id": payload.get("project_id"),
