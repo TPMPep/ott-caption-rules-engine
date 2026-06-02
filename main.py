@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.1.0-spec-driven-sound-speaker"
+VERSION = "5.2.0-completion-callback"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -164,6 +164,20 @@ class CreateJobRequest(BaseModel):
     project_id: Optional[str] = None
     cc_format_run_id: Optional[str] = None
     request_id: Optional[str] = None
+
+    # ── Fast-path completion callback (engine 5.2.0+) ───────────────────
+    # When set, the engine POSTs { job_id, engine_job_id, status } to
+    # callbackUrl the instant a job reaches a terminal state (completed /
+    # failed), carrying X-Callback-Secret: callbackSecret. This collapses
+    # Base44's up-to-5-min poll gap to ~1-2s. The callback is BEST-EFFORT —
+    # Base44's ccPollRailwayJobs scheduled sweep remains the durable
+    # guarantee, so a failed/dropped callback never strands a run. We never
+    # retry the callback and never block job completion on it.
+    # `base44_job_run_id` is the Base44 JobRun.id (NOT our internal job_id),
+    # echoed back so the callback can locate the run with zero external lookup.
+    callbackUrl: Optional[HttpUrl] = None
+    callbackSecret: Optional[str] = None
+    base44_job_run_id: Optional[str] = None
 
 
 # ─── Helpers ────────────────────────────────────────────────────────
@@ -283,6 +297,51 @@ def update_job(job_id: str, **fields: Any) -> None:
             return
         job.update(fields)
         job["updated_at"] = utc_now()
+
+
+# ── Fast-path completion callback ────────────────────────────────────
+# POST { job_id, engine_job_id, status } to the Base44 callback URL the
+# instant a job terminates. BEST-EFFORT: a short timeout, no retries, every
+# failure swallowed + logged. Base44's ccPollRailwayJobs sweep is the durable
+# guarantee — this only ACCELERATES the happy path. Never block job completion.
+CALLBACK_TIMEOUT_SECONDS = int(os.getenv("CALLBACK_TIMEOUT_SECONDS", "10") or 10)
+
+
+def fire_completion_callback(job_id: str, status: str) -> None:
+    """Notify Base44 that an engine job reached a terminal state. The callback
+    carries the Base44 JobRun.id (base44_job_run_id) so the receiver locates
+    the run with no lookup; it then re-fetches the full result via GET
+    /v1/jobs/:id. We send only the tiny signal, never the multi-MB payload."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        payload_in = job.get("input") or {}
+        callback_url = payload_in.get("callbackUrl")
+        callback_secret = payload_in.get("callbackSecret")
+        base44_job_run_id = payload_in.get("base44_job_run_id")
+
+    if not callback_url or not callback_secret or not base44_job_run_id:
+        return  # Callback not configured for this job — poller covers it.
+
+    try:
+        body = json.dumps({
+            "job_id": base44_job_run_id,   # Base44 JobRun.id (what the receiver keys on)
+            "engine_job_id": job_id,       # our internal Railway job id
+            "status": status,              # 'completed' | 'failed'
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            str(callback_url), data=body, method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Callback-Secret": callback_secret,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=CALLBACK_TIMEOUT_SECONDS) as resp:
+            print(f"[{job_id}] Completion callback → HTTP {resp.status} (status={status})")
+    except Exception as e:
+        # Swallow — the poller is the durable path. Log for observability only.
+        print(f"[{job_id}] Completion callback failed (non-fatal, poller will cover): {e}")
 
 
 def start_job_worker(job_id: str, payload: Dict[str, Any]) -> None:
@@ -471,6 +530,15 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
     finally:
         if env_snapshot is not None:
             restore_env_overrides(env_snapshot)
+        # Fast-path completion callback — fired AFTER the job's terminal state
+        # is committed to the store (so the GET the receiver does sees the
+        # final result) and AFTER env restore (so a callback hang can never
+        # leave env vars dirty). Best-effort, swallows all errors; the poller
+        # remains the durable guarantee.
+        with JOBS_LOCK:
+            terminal_status = (JOBS.get(job_id) or {}).get("status")
+        if terminal_status in ("completed", "failed"):
+            fire_completion_callback(job_id, terminal_status)
 
 
 # ─── Routes ─────────────────────────────────────────────────────────
