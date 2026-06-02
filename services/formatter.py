@@ -900,7 +900,22 @@ def _build_dialogue_cues(
 
         # Packing: would adding this whole sentence to the current pack still
         # fit, and is it the same speaker? If yes, append; else flush + start new.
-        speaker_changed = pack_speaker is not None and g_speaker != pack_speaker
+        #
+        # SPEAKER-INTEGRITY INVARIANT (Option A — universal, every spec):
+        # A finalized dialogue cue must NEVER silently contain words from two
+        # different speakers without the renderer being told. The packer
+        # therefore flushes on ANY speaker change — including the case where
+        # the current pack's speaker is known and the incoming group's speaker
+        # is unknown/null (or vice-versa). Treating null≠known as a change is
+        # what stops "Speaker A sentence" + "Speaker B sentence" fusing into a
+        # single flat, dash-less line when diarization is imperfect. A
+        # single-speaker cue is the guaranteed unit; intentional two-speaker
+        # dash captions are produced afterwards by group_two_speaker_cues in
+        # readability.py, which works ONLY on clean single-speaker cues.
+        speaker_changed = (
+            pack_words
+            and g_speaker != pack_speaker
+        )
         candidate = (" ".join(pack_words + g_words)).strip() if pack_words else g_text
         would_overflow = len(candidate) > budget
 
