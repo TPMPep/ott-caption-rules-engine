@@ -67,9 +67,12 @@ from services.assembly import (
 from services.scribe import transcribe as scribe_transcribe
 from services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
 
+import json
+import urllib.request
+
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "4.2.0-provider-agnostic-backbone"
+VERSION = "5.0.0-reformat-from-baseline"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -125,6 +128,25 @@ class CreateJobRequest(BaseModel):
     output_formats: Optional[List[str]] = None
     protected_phrases: Optional[List[str]] = None
     protectedPhrases: Optional[List[str]] = None  # camelCase alias
+
+    # ── Reformat-from-baseline mode (engine 5.0.0) ──────────────────────
+    # The auditor-grade re-format path. When `baselineUrl` is set, the engine
+    # SKIPS transcription entirely: it fetches the immutable baseline JSON
+    # (the same {utterances, words, audio_events} shape produced by Scribe/AAI
+    # and persisted by Base44 at cc-baselines/{project_id}/aai-baseline.json),
+    # and runs the FULL formatting pipeline against it — including the
+    # editorial-AI grammar pass. This is what powers a spec swap (e.g. 32×2 →
+    # 42×3): the new spec geometry flows in via captionOptions/env, so the
+    # grammar-AI re-decides line breaks for the new width (killing orphan
+    # lines), NOT a crude mechanical re-wrap. Provider-agnostic — works for
+    # any baseline regardless of which provider originally transcribed it.
+    #
+    # baselineUrl is a short-TTL signed S3 GET URL (Base44 signs it; the
+    # engine fetches it). We use a signed URL instead of an inline body so a
+    # feature-length show's multi-MB baseline never bloats the request body —
+    # mirrors how mediaUrl is handed to the transcription path.
+    baselineUrl: Optional[HttpUrl] = None
+    reformat_from_baseline: bool = False
 
     # Transcription provider selection (auditor-grade default: scribe_v2).
     # 'elevenlabs' → ElevenLabs Scribe v2 (native diarization + audio events)
@@ -196,6 +218,64 @@ def _provider_model_id(provider: str) -> str:
     return "universal-3-pro"  # AAI primary; engine sets a fallback chain
 
 
+# Max baseline JSON we will fetch — a guard against a malformed / unbounded
+# signed URL pointing at something enormous. A feature-length show's baseline
+# is typically a few MB; 128MB is a generous safety ceiling.
+BASELINE_FETCH_MAX_BYTES = 128 * 1024 * 1024
+BASELINE_FETCH_TIMEOUT_SECONDS = int(
+    os.getenv("BASELINE_FETCH_TIMEOUT_SECONDS", "120") or 120
+)
+
+
+def fetch_baseline_json(baseline_url: str) -> Dict[str, Any]:
+    """
+    Fetch + parse the immutable baseline JSON from a signed S3 GET URL.
+
+    The baseline is the {utterances, words, audio_events, ...} object Base44
+    persisted at transcription time. This is the EXACT shape the formatter's
+    `build_caption_inputs()` already consumes — so reformat-from-baseline runs
+    the identical pipeline transcription does, just with the provider call
+    skipped. No new formatting logic; the engine's editorial brain is reused
+    verbatim. SOC 2 CC8.1 — every reformat traces to the same immutable
+    evidence the original transcription produced.
+    """
+    req = urllib.request.Request(baseline_url, method="GET")
+    with urllib.request.urlopen(req, timeout=BASELINE_FETCH_TIMEOUT_SECONDS) as resp:
+        raw = resp.read(BASELINE_FETCH_MAX_BYTES + 1)
+    if len(raw) > BASELINE_FETCH_MAX_BYTES:
+        raise ValueError(
+            f"Baseline JSON exceeds {BASELINE_FETCH_MAX_BYTES} byte safety ceiling"
+        )
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Baseline JSON is not an object: {type(data).__name__}")
+    utterances = data.get("utterances")
+    if not isinstance(utterances, list) or len(utterances) == 0:
+        raise ValueError("Baseline JSON has no utterances — cannot reformat")
+    return data
+
+
+def baseline_to_assembly_result(baseline: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map a stored baseline dict into the canonical `assembly_result` shape the
+    formatter + audio-event extractor expect. The baseline was WRITTEN from
+    that same shape by the Base44 ingester, so this is a near-identity mapping
+    — we just normalize the keys the formatter reads and carry the native
+    audio_events through verbatim (so non-dialogue cues reproduce exactly).
+    """
+    return {
+        "id": baseline.get("transcript_id"),
+        "language_code": baseline.get("language_code"),
+        "audio_duration": baseline.get("audio_duration_sec") or baseline.get("audio_duration"),
+        "utterances": baseline.get("utterances") or [],
+        "words": baseline.get("words") or [],
+        "audio_events": baseline.get("audio_events") or [],
+        # Mark provenance so build_caption_inputs never cross-calls a provider
+        # for the backbone SRT (it builds locally from utterances).
+        "_provider": baseline.get("transcription_provider") or "",
+    }
+
+
 def update_job(job_id: str, **fields: Any) -> None:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -238,7 +318,26 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         # downstream Base44 ingester both consume this shape. Scribe v2 is
         # normalized by services.scribe.normalize_scribe_result to match.
         assembly_result: Dict[str, Any]
-        if payload.get("reformat_only"):
+        if payload.get("reformat_from_baseline"):
+            # ── Reformat-from-baseline (engine 5.0.0) ────────────────────
+            # Skip transcription entirely. Fetch the immutable baseline JSON
+            # from the signed S3 URL and run the FULL formatting pipeline
+            # (formatter → editorial-AI → readability → QC) against it. The
+            # new spec geometry arrived via captionOptions/env (already
+            # applied above), so the editorial-AI rebalances line breaks for
+            # the new width — the orphan-line fix on a spec swap.
+            baseline_url = payload.get("baselineUrl")
+            if not baseline_url:
+                raise ValueError("baselineUrl is required when reformat_from_baseline=true")
+            update_job(job_id, status="processing", stage="fetching_transcript",
+                       transcription_provider=provider,
+                       transcription_model=model_id)
+            print(f"[{job_id}] Reformat-from-baseline: fetching baseline JSON")
+            baseline = fetch_baseline_json(str(baseline_url))
+            assembly_result = baseline_to_assembly_result(baseline)
+            print(f"[{job_id}] Baseline loaded: {len(assembly_result.get('utterances') or [])} utterances, "
+                  f"{len(assembly_result.get('audio_events') or [])} audio events")
+        elif payload.get("reformat_only"):
             if not transcript_id:
                 raise ValueError("transcript_id is required when reformat_only=true")
             if provider != "assemblyai":
@@ -303,7 +402,10 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         # so the FCC §79.1 non-dialogue coverage requirement is met on both
         # paths. The Base44 worker's EVENT_TO_TEXT_WORKER map renders them
         # into proper cue_type='music'/'sound_effect' caption rows.
-        if provider == "elevenlabs":
+        if payload.get("reformat_from_baseline"):
+            # Baseline carries native audio_events verbatim — reproduce exactly.
+            audio_events = list(assembly_result.get("audio_events") or [])
+        elif provider == "elevenlabs":
             audio_events = list(assembly_result.get("audio_events") or [])
         else:
             audio_events = extract_audio_events_from_assembly_result(assembly_result)
@@ -395,7 +497,10 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
     provider = _normalize_provider(payload_data.get("transcription_provider"))
     model_id = _provider_model_id(provider)
 
-    if payload_data.get("reformat_only"):
+    if payload_data.get("reformat_from_baseline"):
+        if not payload_data.get("baselineUrl"):
+            raise HTTPException(status_code=400, detail="baselineUrl is required when reformat_from_baseline=true")
+    elif payload_data.get("reformat_only"):
         if not payload_data.get("transcript_id"):
             raise HTTPException(status_code=400, detail="transcript_id is required when reformat_only=true")
         if provider != "assemblyai":
@@ -429,7 +534,12 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
     # ── AAI path: kick off the async transcription up front so the response
     # carries assemblyai_transcript_id (the poller chains off this).
     # ── Scribe path: synchronous — we just start the worker; no upfront ID.
-    if payload_data.get("reformat_only"):
+    if payload_data.get("reformat_from_baseline"):
+        # Synchronous-style background worker; no upfront provider ID. The
+        # worker fetches the baseline + formats. Poller reads /v1/jobs/:id.
+        update_job(job_id, status="processing", stage="fetching_transcript")
+        start_job_worker(job_id, payload_data)
+    elif payload_data.get("reformat_only"):
         update_job(job_id, status="processing", stage="fetching_transcript",
                    provider_transcript_id=provider_transcript_id,
                    assemblyai_transcript_id=provider_transcript_id)
