@@ -182,6 +182,90 @@ def _speaker_label_mode() -> str:
     return _env_str("SPEAKER_LABEL_MODE", "dash").lower()
 
 
+def _music_cue_format() -> str:
+    """Per-spec music rendering. 'musical_note_prefix' wraps with ♪ (Pluto);
+    'bracketed_uppercase' renders [MUSIC] (broadcast). Sent from the spec via
+    MUSIC_CUE_FORMAT — the engine never hardcodes a client convention."""
+    return _env_str("MUSIC_CUE_FORMAT", "bracketed_uppercase").lower()
+
+
+def _sound_effect_format() -> str:
+    """Per-spec sound-effect rendering. 'bracketed_uppercase' = [DOOR SLAMS];
+    'parenthetical' = (door slams). Pluto accepts either. From SOUND_EFFECT_FORMAT."""
+    return _env_str("SOUND_EFFECT_FORMAT", "bracketed_uppercase").lower()
+
+
+def _lyrics_marker() -> str:
+    """Glyph used to wrap music cues / lyrics (♪). From LYRICS_MARKER."""
+    return _env_str("LYRICS_MARKER", "\u266a") or "\u266a"
+
+
+def _no_formatting_tags() -> bool:
+    """When true, strip ALL inline <b>/<i> markup at render time (Pluto forbids
+    formatting tags). From NO_FORMATTING_TAGS."""
+    return _env_str("NO_FORMATTING_TAGS", "0") in ("1", "true", "True")
+
+
+def _render_audio_event_text(raw_text: str, event_type: str) -> str:
+    """
+    UNIVERSAL audio-event renderer driven by the per-spec env knobs.
+
+    `raw_text` is the human label (e.g. 'MUSIC', 'DOOR SLAMS'); `event_type`
+    is the structured kind from the provider's audio_events[] (e.g. 'music',
+    'music_playing', 'crowd_noise', 'door_slam'). Music-family events are
+    rendered per MUSIC_CUE_FORMAT; everything else per SOUND_EFFECT_FORMAT.
+
+    The engine knows nothing about any specific client — it only obeys the
+    format knobs the spec sent. Pluto sends MUSIC_CUE_FORMAT='musical_note_prefix'
+    + SOUND_EFFECT_FORMAT='bracketed_uppercase' → '♪ music ♪' + '[DOOR SLAMS]'.
+    """
+    label = (raw_text or event_type or "").strip()
+    if not label:
+        return ""
+    et = (event_type or "").lower()
+    is_music = et in ("music", "music_playing", "music_note") or "music" in et
+
+    if is_music:
+        fmt = _music_cue_format()
+        if fmt == "musical_note_prefix":
+            note = _lyrics_marker()
+            # ♪ wraps the music cue; title-case the human label for readability.
+            body = label.title() if label.isupper() else label
+            return f"{note} {body} {note}"
+        if fmt == "italic":
+            return f"<i>{label}</i>"
+        if fmt == "none":
+            return ""
+        # bracketed_uppercase (default)
+        return f"[{label.upper()}]"
+
+    fmt = _sound_effect_format()
+    if fmt == "parenthetical":
+        return f"({label.lower()})"
+    if fmt == "italic":
+        return f"<i>{label}</i>"
+    if fmt == "none":
+        return ""
+    # bracketed_uppercase (default)
+    return f"[{label.upper()}]"
+
+
+def _strip_formatting_tags(text: str) -> str:
+    """Remove <b>/<i> markup. Used when NO_FORMATTING_TAGS is set (Pluto)."""
+    if not text:
+        return text
+    return re.sub(r"</?[bi]>", "", text)
+
+
+def _apply_no_formatting_tags(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """When the spec forbids formatting tags, strip <b>/<i> from every line."""
+    if not _no_formatting_tags():
+        return cues
+    for cue in cues:
+        cue["lines"] = [_strip_formatting_tags(l) for l in cue.get("lines", [])]
+    return cues
+
+
 def _italicize_titles() -> bool:
     """UPDATED: Now reads ITALICIZE_TITLES env var."""
     return _env_str("ITALICIZE_TITLES", "1") == "1"
@@ -478,6 +562,7 @@ def process_caption_job(
     protected_phrases: Optional[List[str]] = None,
     output_formats: Optional[List[str]] = None,
     heartbeat: Optional[Any] = None,
+    audio_events: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Main caption processing pipeline.
@@ -545,10 +630,18 @@ def process_caption_job(
     sound_tokens = _filter_sound_cues_by_density(sound_tokens, total_duration_ms)
     print(f"[FORMATTER] Sound after density filter: {len(sound_tokens)}")
 
-    # 5. Build cue list
-    cues = _build_cues_from_tokens(spoken_tokens, sound_tokens, max_lines, max_chars)
+    # 5. Build cue list. Native audio_events (Scribe v2 / baseline) are passed
+    # through so they become real sound cues rendered per the spec's
+    # MUSIC_CUE_FORMAT / SOUND_EFFECT_FORMAT. Without this they were silently
+    # dropped — the "no sound cues" regression. SOC 2 / FCC §79.1 non-dialogue
+    # coverage is now reproduced from the baseline on every reformat.
+    cues = _build_cues_from_tokens(
+        spoken_tokens, sound_tokens, max_lines, max_chars,
+        audio_events=audio_events or [],
+    )
     cues_in_count = len(cues)
-    print(f"[FORMATTER] Initial cues built: {cues_in_count}")
+    print(f"[FORMATTER] Initial cues built: {cues_in_count} "
+          f"(native audio_events in: {len(audio_events or [])})")
 
     # 6. Editorial AI — pass the heartbeat through so each cue's OpenAI
     # call can pulse the job's updated_at timestamp. Closes the "engine
@@ -569,6 +662,11 @@ def process_caption_job(
 
     # 10. Alignment (UPDATED)
     cues = _apply_alignment(cues)
+
+    # 10b. No-formatting-tags policy — strip <b>/<i> when the spec forbids
+    # markup (Pluto). Runs AFTER italics so a spec that forbade tags can never
+    # emit one even if an earlier stage added it. Universal mechanism, per-spec flag.
+    cues = _apply_no_formatting_tags(cues)
 
     # 11. QC
     qc = qc_report(cues_in_count, cues, protected_phrases)
@@ -618,27 +716,75 @@ def _build_cues_from_tokens(
     sound_tokens: List[Dict[str, Any]],
     max_lines: int,
     max_chars: int,
+    audio_events: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Build caption cues from spoken and sound tokens.
-    Groups tokens by speaker runs and sentence boundaries,
-    then interleaves sound cues at appropriate positions.
+    Build caption cues from spoken tokens, in-text sound tokens, AND the
+    provider's native audio_events[] array.
+
+    Two non-dialogue sources, both rendered through the per-spec renderer:
+      1. sound_tokens — bracketed tags found inside utterance text ([MUSIC]).
+      2. audio_events — the structured {event_type,start,end} array Scribe v2
+         emits natively (and the baseline carries verbatim). These were
+         previously dropped on the floor — the "no sound cues" regression.
+
+    Cue `type` is normalised to 'music' for music-family events and
+    'sound_effect' otherwise, so the Base44 ingester maps them to the correct
+    cue_type. Rendering (♪ vs [BRACKETED]) is decided purely by the spec's
+    MUSIC_CUE_FORMAT / SOUND_EFFECT_FORMAT — the engine never names a client.
     """
+    audio_events = audio_events or []
+
     # Build dialogue cues from spoken tokens
     dialogue_cues = _build_dialogue_cues(spoken_tokens, max_lines, max_chars)
 
-    # Build sound cues
-    sound_cues = []
+    sound_cues: List[Dict[str, Any]] = []
+
+    # (1) In-text bracketed sound tokens. Re-render through the spec renderer
+    # so even legacy in-text tags honour the spec's music/sfx convention.
     for token in sound_tokens:
+        inner = (token.get("text") or "").strip().strip("[]").strip()
+        et = "music" if "music" in inner.lower() else "sound_effect"
+        rendered = _render_audio_event_text(inner, et)
+        if not rendered:
+            continue
         sound_cues.append({
             "start_ms": token["start_ms"],
             "end_ms": max(token["end_ms"], token["start_ms"] + _min_sound_ms()),
-            "lines": [token["text"]],
-            "type": "sound",
+            "lines": [rendered],
+            "type": "music" if et == "music" else "sound_effect",
             "meta": {},
         })
 
-    # Merge dialogue + sound cues by start time
+    # (2) Native structured audio_events — the source we used to drop.
+    for ev in audio_events:
+        start = ev.get("start", ev.get("start_ms"))
+        end = ev.get("end", ev.get("end_ms"))
+        event_type = ev.get("event_type") or ev.get("type") or "sound"
+        if start is None or end is None:
+            continue
+        try:
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            end = start + _min_sound_ms()
+        label = (ev.get("text") or event_type).replace("_", " ")
+        rendered = _render_audio_event_text(label, event_type)
+        if not rendered:
+            continue
+        is_music = "music" in (event_type or "").lower()
+        sound_cues.append({
+            "start_ms": start,
+            "end_ms": max(end, start + _min_sound_ms()),
+            "lines": [rendered],
+            "type": "music" if is_music else "sound_effect",
+            "meta": {"native_audio_event": True, "event_type": event_type},
+        })
+
+    # Merge dialogue + sound cues by start time. Dialogue sorts before a
+    # co-incident sound cue so on-screen reading order stays natural.
     all_cues = dialogue_cues + sound_cues
     all_cues.sort(key=lambda c: (c["start_ms"], 0 if c["type"] == "dialogue" else 1))
 
@@ -726,9 +872,16 @@ def _finalize_dialogue_cue(
     max_lines: int,
     max_chars: int,
 ) -> Dict[str, Any]:
-    """Wrap words into lines respecting max_chars and max_lines."""
+    """Wrap words into lines respecting max_chars and max_lines, then apply
+    the deterministic speaker-render baseline (dash / off-camera labels).
+
+    The editorial-AI pass refines this further, but the DETERMINISTIC render
+    here guarantees speaker identification is correct even when AI is skipped,
+    times out, or hits its run budget — closing the "speaker IDs gone" gap.
+    UNIVERSAL one-speaker-per-line rule is enforced for multi-speaker groups
+    regardless of label mode (never two speakers on one line)."""
     dialogue_text = " ".join(words)
-    lines = _wrap_text(dialogue_text, max_chars, max_lines)
+    lines = _speaker_render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text)
 
     return {
         "idx": 0,
@@ -741,6 +894,73 @@ def _finalize_dialogue_cue(
             "runs": speaker_runs,
         },
     }
+
+
+def _speaker_render_lines(
+    words: List[str],
+    speaker_runs: List[Dict[str, Any]],
+    max_lines: int,
+    max_chars: int,
+    dialogue_text: str,
+) -> List[str]:
+    """
+    UNIVERSAL speaker-aware line builder, parameterised by the spec's
+    SPEAKER_LABEL_MODE. The engine never names a client — it only obeys the
+    mode the spec sent.
+
+    Hard universal invariant (every mode, never configurable):
+      • One speaker per line. Two distinct speakers are NEVER placed on the
+        same physical line. This is the Pluto "-Speaker One / -Speaker Two"
+        rule and is correct for every spec.
+
+    Modes:
+      • 'dash' (Pluto/FAST): multi-speaker group → each speaker's text on its
+        own line, prefixed with '- '. Single-speaker group → plain wrap, no dash.
+      • 'none': plain wrap, no speaker identifier.
+      • anything else ('first_occurrence_per_scene' / 'every_change' /
+        'always'): single-speaker groups wrap plainly here (named-tag insertion
+        is the editorial-AI / downstream concern); multi-speaker groups still
+        get one-speaker-per-line so reading order is unambiguous.
+    """
+    mode = _speaker_label_mode()
+    # Reconstruct per-speaker text segments from the runs' word offsets.
+    segments = _segments_from_runs(words, speaker_runs)
+    distinct_speakers = len({s.get("speaker") for s in (speaker_runs or []) if s.get("speaker") is not None})
+
+    # Single speaker (or no diarization) → plain greedy wrap. No dash, no split.
+    if distinct_speakers <= 1 or len(segments) <= 1:
+        return _wrap_text(dialogue_text, max_chars, max_lines)
+
+    # Multi-speaker group — one speaker per line (universal invariant).
+    prefix = "- " if mode == "dash" else ""
+    lines: List[str] = []
+    for seg in segments:
+        seg_text = seg["text"].strip()
+        if not seg_text:
+            continue
+        # Each speaker's text occupies its own line; if a single speaker's text
+        # is itself too long, we keep it on one line here (readability + the
+        # editorial-AI pass will rebalance). Never merge two speakers.
+        lines.append(f"{prefix}{seg_text}")
+
+    if not lines:
+        return _wrap_text(dialogue_text, max_chars, max_lines)
+    return lines
+
+
+def _segments_from_runs(words: List[str], speaker_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Split the flat word list into per-speaker text segments using each
+    run's `word_start` offset. Returns [{speaker, text}, ...] in order."""
+    if not speaker_runs:
+        return [{"speaker": None, "text": " ".join(words)}]
+    out: List[Dict[str, Any]] = []
+    for i, run in enumerate(speaker_runs):
+        start = run.get("word_start", 0)
+        end = speaker_runs[i + 1].get("word_start", len(words)) if i + 1 < len(speaker_runs) else len(words)
+        seg_words = words[start:end]
+        if seg_words:
+            out.append({"speaker": run.get("speaker"), "text": " ".join(seg_words)})
+    return out
 
 
 def _wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
