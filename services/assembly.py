@@ -215,11 +215,56 @@ def build_word_timestamps_from_result(assembly_result: Dict[str, Any]) -> List[D
     words = assembly_result.get("words") or []
     utterances = assembly_result.get("utterances") or []
     if utterances:
+        # Preferred path: utterances carry the diarized speaker; each word
+        # inherits its parent utterance's speaker. This is the speaker-correct
+        # source of truth (FCC 47 CFR §79.1 — speaker identification).
         return _build_tokens_from_utterances(utterances)
-    return _build_tokens_from_words(words)
+    # Fallback path: only a flat word array is available. Some providers /
+    # stored baselines leave per-word `speaker` null even when utterance-level
+    # diarization existed. Reconcile word speakers from the utterance time
+    # windows so the downstream segmenter still sees real speaker boundaries
+    # (the dash / one-speaker-per-line rules depend on this). SOC 2 CC8.1 —
+    # speaker identity is never silently lost on the fallback path.
+    return _build_tokens_from_words(words, utterances)
 
 
-def _build_tokens_from_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _reconcile_word_speaker(
+    start_ms: int,
+    end_ms: int,
+    utterance_windows: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Return the speaker whose utterance time-window contains this word.
+
+    Used only on the flat-words fallback path when a word carries no speaker.
+    A word belongs to the utterance window it overlaps most (by midpoint).
+    Deterministic and pure — identical inputs always resolve identically."""
+    if not utterance_windows:
+        return None
+    mid = (start_ms + end_ms) // 2 if end_ms >= start_ms else start_ms
+    for win in utterance_windows:
+        if win["start"] <= mid <= win["end"]:
+            return win["speaker"]
+    return None
+
+
+def _build_tokens_from_words(
+    words: List[Dict[str, Any]],
+    utterances: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    # Pre-build utterance time-windows once so per-word reconciliation is O(1)
+    # amortised — never re-scans utterances per word.
+    utterance_windows: List[Dict[str, Any]] = []
+    for u in (utterances or []):
+        sp = u.get("speaker")
+        if sp is None:
+            continue
+        try:
+            us = int(u.get("start", 0))
+            ue = int(u.get("end", us))
+        except (TypeError, ValueError):
+            continue
+        utterance_windows.append({"speaker": sp, "start": us, "end": ue})
+
     tokens: List[Dict[str, Any]] = []
     for word in words:
         text = (word.get("text") or "").strip()
@@ -228,6 +273,11 @@ def _build_tokens_from_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]
         start_ms = int(word.get("start", 0))
         end_ms = int(word.get("end", start_ms))
         speaker = word.get("speaker")
+        # Backfill a missing word-level speaker from the utterance windows so
+        # the segmenter sees real speaker boundaries even when the provider /
+        # stored baseline left per-word speaker null.
+        if speaker is None and utterance_windows:
+            speaker = _reconcile_word_speaker(start_ms, end_ms, utterance_windows)
         tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms, "speaker": speaker})
     return tokens
 
