@@ -13,8 +13,58 @@ POST /v1/jobs payload). No hardcoded profile fallbacks.
 
 import os
 
+# SINGLE SOURCE OF TRUTH for line rendering — the same module formatter.py uses
+# when it first builds a cue. The merge passes below recombine words + speaker
+# runs and RE-RENDER through this, so a merged cue is drawn identically to a
+# freshly-built one (correct \n line breaks, correct dash/label, never two
+# speakers on one line). This is what fixes the "A+B fused into one flat line"
+# defect — the merge passes no longer do naive string concatenation.
+try:
+    from .rendering import render_lines, merge_cue_meta, cue_speakers
+except Exception:
+    # Defensive fallback — must never crash a job. Degrades to flat behaviour.
+    def render_lines(words, runs, max_lines=None, max_chars=None, dialogue_text=None):
+        return [dialogue_text if dialogue_text is not None else " ".join(words)]
+
+    def merge_cue_meta(prev_cue, next_cue):
+        pt = (prev_cue.get("meta") or {}).get("dialogue_text") or " ".join(prev_cue.get("lines", []))
+        nt = (next_cue.get("meta") or {}).get("dialogue_text") or " ".join(next_cue.get("lines", []))
+        text = (pt + " " + nt).strip()
+        return {"dialogue_text": text, "runs": [{"speaker": None, "word_start": 0}], "words": text.split()}
+
+    def cue_speakers(cue):
+        runs = (cue.get("meta") or {}).get("runs") or []
+        return {r.get("speaker") for r in runs if r.get("speaker") is not None}
+
 MICRO_WORD_LIMIT = 2
 MICRO_DURATION_MS = 1000
+
+
+def _speakers_compatible(a, b):
+    """Two cues may be merged only when they don't introduce a NEW speaker
+    boundary that the renderer would have to split anyway. Compatible when:
+      • either cue has no known speaker (unknown — safe to join), OR
+      • they share the exact same single speaker.
+    Cues belonging to genuinely DIFFERENT speakers are never glued together —
+    that's what preserves the dash/label and stops A+B fusing into one line."""
+    sa = cue_speakers(a)
+    sb = cue_speakers(b)
+    if not sa or not sb:
+        return True
+    return sa == sb and len(sa) == 1
+
+
+def _rerender_merged(prev_cue, next_cue):
+    """Produce the merged cue: recombine word+speaker structure, then RE-RENDER
+    lines through the shared renderer so \n / dash / label are all correct."""
+    meta = merge_cue_meta(prev_cue, next_cue)
+    lines = render_lines(meta["words"], meta["runs"], dialogue_text=meta["dialogue_text"])
+    merged = dict(prev_cue)
+    merged["lines"] = lines
+    merged["end_ms"] = next_cue["end_ms"]
+    merged["start_ms"] = min(prev_cue.get("start_ms", next_cue["start_ms"]), next_cue["start_ms"])
+    merged["meta"] = {"dialogue_text": meta["dialogue_text"], "runs": meta["runs"]}
+    return merged
 
 # Orphan reflow — a final safety net. A dialogue cue of ORPHAN_WORD_LIMIT or
 # fewer words that is NOT a brief standalone response ("Yes." "No." "OK.")
@@ -58,6 +108,17 @@ def _merge_gap_ms() -> int:
     return _env_int("CUSTOM_MERGE_GAP_MS", 80)
 
 
+def _speaker_label_mode() -> str:
+    return (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
+
+
+# Two-speaker grouping window. When two adjacent DIFFERENT-speaker dialogue
+# cues both sit inside this window (a tight back-and-forth), a dash-style spec
+# groups them into ONE caption ('- A' / '- B'). Tunable per-job via env.
+def _two_speaker_group_gap_ms() -> int:
+    return _env_int("CUSTOM_TWO_SPEAKER_GROUP_GAP_MS", 600)
+
+
 def enforce_min_duration(cues):
     for i, cue in enumerate(cues):
         duration = cue["end_ms"] - cue["start_ms"]
@@ -89,10 +150,12 @@ def merge_micro_cues(cues):
                 and cues[i + 1]["type"] == "dialogue"):
             nxt = cues[i + 1]
             gap = nxt["start_ms"] - cue["end_ms"]
-            if gap <= max(200, merge_gap):
-                cue["lines"] = [(text + " " + " ".join(nxt["lines"])).strip()]
-                cue["end_ms"] = nxt["end_ms"]
-                merged.append(cue)
+            # SPEAKER GUARD — never glue a micro-cue onto a different speaker
+            # (that's what produced the dash-less A+B fusion). Same-speaker (or
+            # unknown) only, then RE-RENDER through the shared module so the
+            # merged cue keeps correct line breaks / dash / label.
+            if gap <= max(200, merge_gap) and _speakers_compatible(cue, nxt):
+                merged.append(_rerender_merged(cue, nxt))
                 i += 2
                 continue
 
@@ -155,51 +218,97 @@ def reflow_orphans(cues):
 
         orphan_text = " ".join(cue.get("lines", [])).strip()
 
-        # Try BACKWARD merge into the previous dialogue cue.
-        if i > 0 and out[i - 1].get("type") == "dialogue":
+        # Try BACKWARD merge into the previous dialogue cue. SPEAKER GUARD +
+        # RE-RENDER: only merge same-speaker (or unknown) cues, and draw the
+        # result through the shared renderer (correct \n / dash / label).
+        if (i > 0 and out[i - 1].get("type") == "dialogue"
+                and _speakers_compatible(out[i - 1], cue)):
             prev = out[i - 1]
-            prev_text = " ".join(prev.get("lines", [])).strip()
-            combined = (prev_text + " " + orphan_text).strip()
+            prev_text = (prev.get("meta") or {}).get("dialogue_text") or " ".join(prev.get("lines", []))
+            combined = (prev_text.strip() + " " + orphan_text).strip()
             if len(combined) <= budget:
-                prev["lines"] = [combined]
-                prev["end_ms"] = cue["end_ms"]
-                # Preserve the dialogue_text meta so any downstream re-read is
-                # consistent with the merged content.
-                if isinstance(prev.get("meta"), dict):
-                    prev["meta"]["dialogue_text"] = (
-                        (prev["meta"].get("dialogue_text", prev_text) + " " + orphan_text).strip()
-                    )
+                out[i - 1] = _rerender_merged(prev, cue)
                 del out[i]
                 continue  # re-check the same index (now the next cue)
 
         # Try FORWARD merge into the next dialogue cue.
-        if i < len(out) - 1 and out[i + 1].get("type") == "dialogue":
+        if (i < len(out) - 1 and out[i + 1].get("type") == "dialogue"
+                and _speakers_compatible(cue, out[i + 1])):
             nxt = out[i + 1]
-            nxt_text = " ".join(nxt.get("lines", [])).strip()
-            combined = (orphan_text + " " + nxt_text).strip()
+            nxt_text = (nxt.get("meta") or {}).get("dialogue_text") or " ".join(nxt.get("lines", []))
+            combined = (orphan_text + " " + nxt_text.strip()).strip()
             if len(combined) <= budget:
-                nxt["lines"] = [combined]
-                nxt["start_ms"] = cue["start_ms"]
-                if isinstance(nxt.get("meta"), dict):
-                    nxt["meta"]["dialogue_text"] = (
-                        (orphan_text + " " + nxt["meta"].get("dialogue_text", nxt_text)).strip()
-                    )
+                out[i + 1] = _rerender_merged(cue, nxt)
                 del out[i]
                 continue
 
-        # Can't merge either direction without breaking the spec — leave it.
+        # Can't merge either direction without breaking the spec or across a
+        # speaker boundary — leave it. QC will flag it.
         i += 1
 
+    return out
+
+
+def group_two_speaker_cues(cues):
+    """SPEC-DRIVEN multi-speaker grouping (dash convention).
+
+    Only active when the spec's SPEAKER_LABEL_MODE is 'dash' (Pluto / FAST and
+    any spec that carries the dash posture). For non-dash specs this is a no-op
+    — the professional default of one-speaker-per-cue (separate timecodes) is
+    correct and untouched.
+
+    When two ADJACENT dialogue cues belong to DIFFERENT speakers, sit inside a
+    tight back-and-forth window (small inter-cue gap), and their combined text
+    fits the spec's char×line budget, they are merged into ONE caption that the
+    shared renderer draws as:
+        - Speaker A line
+        - Speaker B line
+    This is the legitimate Pluto two-speakers-in-one-caption case. The merge
+    goes through merge_cue_meta + render_lines (the SAME universal renderer
+    every other stage uses), so the dash/label and one-speaker-per-line
+    invariant are guaranteed and auditor-consistent. SOC 2 CC8.1.
+    """
+    if _speaker_label_mode() != "dash":
+        return cues
+
+    budget = _max_chars() * _max_lines()
+    group_gap = _two_speaker_group_gap_ms()
+    out = []
+    i = 0
+    while i < len(cues):
+        cue = cues[i]
+        nxt = cues[i + 1] if i + 1 < len(cues) else None
+        if (nxt is not None
+                and cue.get("type") == "dialogue"
+                and nxt.get("type") == "dialogue"
+                and not _speakers_compatible(cue, nxt)  # genuinely DIFFERENT speakers
+                and (nxt["start_ms"] - cue["end_ms"]) <= group_gap):
+            combined = _rerender_merged(cue, nxt)
+            # Only accept the grouping if it still fits the on-screen budget
+            # (≤ max_lines lines, each ≤ max_chars). Dash prefixes count.
+            fits = (len(combined.get("lines", [])) <= _max_lines()
+                    and all(len(l) <= _max_chars() for l in combined.get("lines", []))
+                    and len(combined.get("meta", {}).get("dialogue_text", "")) <= budget)
+            if fits:
+                out.append(combined)
+                i += 2
+                continue
+        out.append(cue)
+        i += 1
     return out
 
 
 def apply_readability_rules(cues):
     """Master readability pass. Run AFTER AI formatting.
 
-    Order matters: reflow orphans FIRST (rejoin stranded fragments to their
-    sentence), THEN enforce min-duration + micro-merge on the cleaned set.
+    Order matters:
+      1. reflow orphans — rejoin stranded fragments to their sentence.
+      2. two-speaker grouping — SPEC-DRIVEN (dash mode only): fuse tight
+         back-and-forth A/B exchanges into one '- A' / '- B' caption.
+      3. enforce min-duration + micro-merge on the cleaned set.
     """
     cues = reflow_orphans(cues)
+    cues = group_two_speaker_cues(cues)
     cues = enforce_min_duration(cues)
     cues = merge_micro_cues(cues)
     return cues
