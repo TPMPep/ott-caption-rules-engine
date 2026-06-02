@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.7.0-universal-speaker-labels-sound-density"
+VERSION = "5.7.1-deterministic-label-reapply-post-ai"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
