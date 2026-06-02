@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.0.0-reformat-from-baseline"
+VERSION = "5.1.0-spec-driven-sound-speaker"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -378,6 +378,18 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
 
         backbone_srt_text, timestamps_json = build_caption_inputs(assembly_result)
 
+        # ── Audio events — computed BEFORE formatting so the formatter can
+        # turn them into real sound cues (rendered per the spec's MUSIC_CUE_
+        # FORMAT / SOUND_EFFECT_FORMAT). Scribe v2 / baseline carry them
+        # natively; AAI is best-effort extracted from bracket tags. Previously
+        # this ran AFTER process_caption_job and was only attached to the
+        # result side-channel — so the reformat ingester (which reads
+        # result.cues[]) never saw them. That was the "no sound cues" bug.
+        if payload.get("reformat_from_baseline") or provider == "elevenlabs":
+            audio_events = list(assembly_result.get("audio_events") or [])
+        else:
+            audio_events = extract_audio_events_from_assembly_result(assembly_result)
+
         # Heartbeat closure — editorial_ai calls this every N cues so the
         # job's updated_at timestamp advances during the long AI polish
         # pass. Without this, the formatter could correctly grind through
@@ -394,21 +406,8 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
             protected_phrases=protected_phrases,
             output_formats=output_formats,
             heartbeat=_formatter_heartbeat,
+            audio_events=audio_events,
         )
-
-        # ── Audio events (provider-native or extracted from AAI output) ──
-        # Scribe v2 emits audio_events natively in normalize_scribe_result.
-        # AssemblyAI doesn't — we extract from bracket tags as a best-effort
-        # so the FCC §79.1 non-dialogue coverage requirement is met on both
-        # paths. The Base44 worker's EVENT_TO_TEXT_WORKER map renders them
-        # into proper cue_type='music'/'sound_effect' caption rows.
-        if payload.get("reformat_from_baseline"):
-            # Baseline carries native audio_events verbatim — reproduce exactly.
-            audio_events = list(assembly_result.get("audio_events") or [])
-        elif provider == "elevenlabs":
-            audio_events = list(assembly_result.get("audio_events") or [])
-        else:
-            audio_events = extract_audio_events_from_assembly_result(assembly_result)
 
         # Attach diarization + audio events so Base44 can derive CCSpeaker
         # rows and non-dialogue cues without re-fetching from the provider.
