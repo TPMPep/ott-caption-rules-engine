@@ -45,6 +45,17 @@ from typing import Any, Callable, Dict, List, Optional
 _WORD_RE = re.compile(r"\b[\w']+\b")
 _STYLE_TAG_RE = re.compile(r"\{\\+an\d\}")
 _ITALIC_TAG_RE = re.compile(r"</?i>")
+# Strips a leading speaker label the AI may have emitted so we can re-apply the
+# deterministic one. Matches '- ', '[NAME:] ', '[SPEAKER A:] ', 'A: ', 'NAME: '.
+_LEADING_LABEL_RE = re.compile(r"^\s*(?:-\s+|\[[^\]]*\]:?\s*|[^\s:]{1,24}:\s+)")
+
+# SINGLE SOURCE OF TRUTH for the speaker label/dash. The AI polishes TEXT only;
+# the label is re-applied deterministically by render_lines so the AI can never
+# strip or mangle it (the "no dash / no bracket on a different speaker" defect).
+try:
+    from .rendering import render_lines as _render_lines
+except Exception:
+    _render_lines = None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -290,26 +301,41 @@ def editorial_refine_cues(
             refined.append(cue)
             continue
 
+        # Strip ANY speaker label the AI emitted (dash, bracket, 'A:', 'NAME:')
+        # before the fidelity check — the label is NOT dialogue and must not be
+        # graded as word content. The deterministic renderer re-applies it below.
+        ai_text_lines = [_strip_leading_label(l) for l in ai_lines]
+
         original_words = _word_fingerprint(dialogue_text)
-        ai_words = _word_fingerprint(" ".join(_strip_dashes(ai_lines)))
+        ai_words = _word_fingerprint(" ".join(ai_text_lines))
         if original_words != ai_words:
             stats["ai_rejected_word_drift"] += 1
             refined.append(cue)
             continue
 
-        if len(ai_lines) > max_lines or any(_visible_len(line) > max_chars for line in ai_lines):
+        # ── Re-apply the speaker label/dash DETERMINISTICALLY ────────────────
+        # The AI is trusted ONLY for punctuation / capitalisation / line breaks
+        # of the spoken text. The speaker label is a hard invariant owned by the
+        # renderer (single source of truth), so we re-render the AI's polished
+        # text through render_lines with the cue's speaker runs. This guarantees
+        # the bracket tag ('[SPEAKER C:]') or dash is present in EVERY mode —
+        # the AI can never silently drop it (the production defect). When the
+        # renderer is unavailable we fall back to the AI lines as-is.
+        if _render_lines is not None:
+            polished_text = " ".join(ai_text_lines).strip()
+            final_lines = _render_lines(
+                polished_text.split(), runs, max_lines, max_chars, polished_text,
+            )
+        else:
+            final_lines = ai_lines
+
+        if len(final_lines) > max_lines or any(_visible_len(line) > max_chars for line in final_lines):
             stats["ai_rejected_overflow"] += 1
             refined.append(cue)
             continue
 
-        if speaker_mode == "dash" and len(runs) == 2:
-            if len(ai_lines) != 2 or not all(line.startswith("- ") for line in ai_lines):
-                stats["ai_rejected_dash_rule"] += 1
-                refined.append(cue)
-                continue
-
         new_cue = dict(cue)
-        new_cue["lines"] = ai_lines
+        new_cue["lines"] = final_lines
         stats["ai_applied"] += 1
         refined.append(new_cue)
 
@@ -338,6 +364,14 @@ def _strip_dashes(lines: List[str]) -> List[str]:
         else:
             out.append(line)
     return out
+
+
+def _strip_leading_label(line: str) -> str:
+    """Remove a leading speaker label the AI may have emitted so the spoken
+    text can be fidelity-checked and re-rendered with the deterministic label.
+    Handles '- ', '[NAME:] ', '[SPEAKER A:] ', 'A: ', 'NAME: '. Idempotent on
+    lines that carry no label."""
+    return _LEADING_LABEL_RE.sub("", line or "", count=1).strip()
 
 
 def _normalize_lines(lines: List[str]) -> List[str]:
