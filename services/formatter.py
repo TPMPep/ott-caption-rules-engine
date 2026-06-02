@@ -801,67 +801,167 @@ def _build_dialogue_cues(
     max_chars: int,
 ) -> List[Dict[str, Any]]:
     """
-    Build dialogue cues from spoken tokens.
-    Groups by speaker and sentence boundaries.
+    Build dialogue cues from spoken tokens — PROFESSIONAL-GRADE pipeline.
+
+    Order (the industry-correct ordering — Iyuno / Pixelogic / Zoo / Deluxe):
+      1. SEGMENT the word stream into true SENTENCE GROUPS first
+         (abbreviation-aware — "Mr. Wang" is never split). A new group starts
+         only on a real sentence end or a speaker change. This is what stops
+         the "Wang." orphan at the source.
+      2. PACK whole sentences into cues, fitting the spec's char/line budget.
+         A cue holds as many whole sentences as fit on screen; a sentence is
+         split across cues ONLY when it genuinely overflows the budget, and
+         then only at a clause boundary that never leaves a one-word tail.
+      3. Orphan reflow (a final safety net) runs later in the master pipeline.
+
+    Sentence segmentation and spec-fitting are co-solved here — you cannot fit
+    to the line budget without knowing sentence boundaries, and you cannot
+    finalise boundaries without knowing the budget. Doing them as one pass is
+    why this produces "Good afternoon." / "You must be Mr. Wang." instead of
+    the orphaned fragment the naive per-word splitter produced.
     """
     if not tokens:
         return []
 
+    try:
+        from .segmentation import segment_into_sentence_groups
+    except Exception:
+        # Defensive: if the segmentation module can't import, fall back to a
+        # single-group-per-speaker grouping so we never crash a job. This
+        # path should never fire in production.
+        def segment_into_sentence_groups(toks):
+            return [{
+                "words": [t.get("text", "") for t in toks],
+                "start_ms": toks[0].get("start_ms", 0) if toks else 0,
+                "end_ms": toks[-1].get("end_ms", 0) if toks else 0,
+                "speaker_runs": [{"speaker": toks[0].get("speaker") if toks else None, "word_start": 0}],
+            }] if toks else []
+
+    sentence_groups = segment_into_sentence_groups(tokens)
+
     cues: List[Dict[str, Any]] = []
-    current_words: List[str] = []
-    current_start: Optional[int] = None
-    current_end: int = 0
-    current_speaker: Optional[str] = None
-    speaker_runs: List[Dict[str, Any]] = []
+    # Accumulator for packing consecutive whole sentences (same speaker) into
+    # one cue while they still fit the on-screen budget.
+    pack_words: List[str] = []
+    pack_start: Optional[int] = None
+    pack_end: int = 0
+    pack_runs: List[Dict[str, Any]] = []
+    pack_speaker: Optional[str] = None
 
-    SENTENCE_END_RE = re.compile(r"[.!?]$")
+    budget = max_chars * max_lines
 
-    for token in tokens:
-        text = token["text"]
-        speaker = token.get("speaker")
-        start_ms = token["start_ms"]
-        end_ms = token["end_ms"]
+    def _flush_pack() -> None:
+        nonlocal pack_words, pack_start, pack_end, pack_runs, pack_speaker
+        if pack_words:
+            cues.append(_finalize_dialogue_cue(
+                pack_words, pack_start, pack_end, pack_runs, max_lines, max_chars,
+            ))
+        pack_words = []
+        pack_start = None
+        pack_end = 0
+        pack_runs = []
+        pack_speaker = None
 
-        # Start new cue if speaker changes or sentence ends
-        speaker_changed = current_speaker is not None and speaker != current_speaker
-        sentence_ended = current_words and SENTENCE_END_RE.search(current_words[-1])
+    for group in sentence_groups:
+        g_words = group["words"]
+        g_text = " ".join(g_words)
+        g_speaker = (group.get("speaker_runs") or [{}])[0].get("speaker")
 
-        # Check if adding this word would exceed max chars
-        test_text = " ".join(current_words + [text])
-        would_exceed = len(test_text) > max_chars * max_lines
+        # A sentence that itself overflows the on-screen budget must be split
+        # across multiple cues at clause boundaries (never orphaning a tail).
+        # Timings are interpolated across chunks proportionally to word count
+        # over the group's REAL [start_ms, end_ms] window.
+        if len(g_text) > budget:
+            _flush_pack()
+            g_start = group["start_ms"]
+            g_end = max(group["end_ms"], g_start + 1)
+            chunk_list = _split_sentence_into_cue_chunks(g_words, max_chars, max_lines)
+            total_words = sum(len(c["words"]) for c in chunk_list) or 1
+            span = g_end - g_start
+            word_cursor = 0
+            for chunk in chunk_list:
+                c_words = chunk["words"]
+                c_start = g_start + (span * word_cursor) // total_words
+                word_cursor += len(c_words)
+                c_end = g_start + (span * word_cursor) // total_words
+                cues.append(_finalize_dialogue_cue(
+                    c_words, int(c_start), int(max(c_end, c_start + 1)),
+                    [{"speaker": g_speaker, "word_start": 0}], max_lines, max_chars,
+                ))
+            continue
 
-        if (speaker_changed or sentence_ended or would_exceed) and current_words:
-            cue = _finalize_dialogue_cue(
-                current_words, current_start, current_end,
-                speaker_runs, max_lines, max_chars,
-            )
-            cues.append(cue)
-            current_words = []
-            current_start = None
-            speaker_runs = []
+        # Packing: would adding this whole sentence to the current pack still
+        # fit, and is it the same speaker? If yes, append; else flush + start new.
+        speaker_changed = pack_speaker is not None and g_speaker != pack_speaker
+        candidate = (" ".join(pack_words + g_words)).strip() if pack_words else g_text
+        would_overflow = len(candidate) > budget
 
-        if current_start is None:
-            current_start = start_ms
+        if (speaker_changed or would_overflow) and pack_words:
+            _flush_pack()
 
-        if speaker != current_speaker:
-            if current_words:
-                # Close previous speaker run
-                pass
-            current_speaker = speaker
-            speaker_runs.append({"speaker": speaker, "word_start": len(current_words)})
+        if pack_start is None:
+            pack_start = group["start_ms"]
+        if pack_speaker is None:
+            pack_speaker = g_speaker
+            pack_runs.append({"speaker": g_speaker, "word_start": 0})
+        pack_words.extend(g_words)
+        pack_end = group["end_ms"]
 
-        current_words.append(text)
-        current_end = end_ms
-
-    # Flush remaining
-    if current_words:
-        cue = _finalize_dialogue_cue(
-            current_words, current_start, current_end,
-            speaker_runs, max_lines, max_chars,
-        )
-        cues.append(cue)
-
+    _flush_pack()
     return cues
+
+
+def _split_sentence_into_cue_chunks(
+    words: List[str],
+    max_chars: int,
+    max_lines: int,
+) -> List[Dict[str, Any]]:
+    """
+    Split a single over-long sentence into multiple cue-sized chunks at the
+    best clause/phrase boundary, never leaving a one-word orphan tail.
+
+    Greedy fill up to (max_chars * max_lines), but back off to the last clause
+    boundary (comma, semicolon, colon, dash) inside the window when one exists,
+    and guarantee the final chunk is never a lone word — if the tail would be a
+    single word, pull a word back from the previous chunk.
+
+    Returns [{ "words": [...] }, ...]. The caller interpolates real timecodes
+    across the returned chunks proportionally to word count over the group's
+    actual [start_ms, end_ms] window.
+    """
+    budget = max_chars * max_lines
+    _CLAUSE_END = (",", ";", ":", "—", "–")
+
+    chunks: List[List[str]] = []
+    cur: List[str] = []
+    for w in words:
+        test = (" ".join(cur + [w])).strip()
+        if len(test) <= budget or not cur:
+            cur.append(w)
+        else:
+            # Back off to the last clause boundary inside `cur` if one exists
+            # and it isn't the very first word.
+            split_at = None
+            for i in range(len(cur) - 1, 0, -1):
+                if cur[i].rstrip().endswith(_CLAUSE_END):
+                    split_at = i + 1
+                    break
+            if split_at and split_at < len(cur):
+                chunks.append(cur[:split_at])
+                cur = cur[split_at:] + [w]
+            else:
+                chunks.append(cur)
+                cur = [w]
+    if cur:
+        chunks.append(cur)
+
+    # Orphan guard: never leave a single-word final chunk — pull the last word
+    # of the previous chunk forward so the tail reads as a phrase.
+    if len(chunks) >= 2 and len(chunks[-1]) == 1 and len(chunks[-2]) > 1:
+        moved = chunks[-2].pop()
+        chunks[-1] = [moved] + chunks[-1]
+
+    return [{"words": c} for c in chunks]
 
 
 def _finalize_dialogue_cue(
