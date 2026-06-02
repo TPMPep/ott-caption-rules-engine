@@ -21,6 +21,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Project imports with local fallbacks
 try:
+    from .rendering import render_lines as _render_lines
+except Exception:
+    # Defensive: must never crash a job. Falls back to a plain join. This
+    # path should never fire in production (rendering.py ships with the engine).
+    def _render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text=None):
+        return [dialogue_text if dialogue_text is not None else " ".join(words)]
+
+try:
     from .assembly import normalize_tokens as _normalize_tokens, is_sound_token as _is_sound_token
 except Exception:
     def _normalize_tokens(timestamps: Any) -> List[Dict[str, Any]]:
@@ -981,7 +989,9 @@ def _finalize_dialogue_cue(
     UNIVERSAL one-speaker-per-line rule is enforced for multi-speaker groups
     regardless of label mode (never two speakers on one line)."""
     dialogue_text = " ".join(words)
-    lines = _speaker_render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text)
+    # SINGLE SOURCE OF TRUTH — render through the shared module so the cue is
+    # drawn the exact same way the readability merge passes will re-draw it.
+    lines = _render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text)
 
     return {
         "idx": 0,
@@ -994,108 +1004,3 @@ def _finalize_dialogue_cue(
             "runs": speaker_runs,
         },
     }
-
-
-def _speaker_render_lines(
-    words: List[str],
-    speaker_runs: List[Dict[str, Any]],
-    max_lines: int,
-    max_chars: int,
-    dialogue_text: str,
-) -> List[str]:
-    """
-    UNIVERSAL speaker-aware line builder, parameterised by the spec's
-    SPEAKER_LABEL_MODE. The engine never names a client — it only obeys the
-    mode the spec sent.
-
-    Hard universal invariant (every mode, never configurable):
-      • One speaker per line. Two distinct speakers are NEVER placed on the
-        same physical line. This is the Pluto "-Speaker One / -Speaker Two"
-        rule and is correct for every spec.
-
-    Modes:
-      • 'dash' (Pluto/FAST): multi-speaker group → each speaker's text on its
-        own line, prefixed with '- '. Single-speaker group → plain wrap, no dash.
-      • 'none': plain wrap, no speaker identifier.
-      • anything else ('first_occurrence_per_scene' / 'every_change' /
-        'always'): single-speaker groups wrap plainly here (named-tag insertion
-        is the editorial-AI / downstream concern); multi-speaker groups still
-        get one-speaker-per-line so reading order is unambiguous.
-    """
-    mode = _speaker_label_mode()
-    # Reconstruct per-speaker text segments from the runs' word offsets.
-    segments = _segments_from_runs(words, speaker_runs)
-    distinct_speakers = len({s.get("speaker") for s in (speaker_runs or []) if s.get("speaker") is not None})
-
-    # Single speaker (or no diarization) → plain greedy wrap. No dash, no split.
-    if distinct_speakers <= 1 or len(segments) <= 1:
-        return _wrap_text(dialogue_text, max_chars, max_lines)
-
-    # Multi-speaker group — one speaker per line (universal invariant).
-    prefix = "- " if mode == "dash" else ""
-    lines: List[str] = []
-    for seg in segments:
-        seg_text = seg["text"].strip()
-        if not seg_text:
-            continue
-        # Each speaker's text occupies its own line; if a single speaker's text
-        # is itself too long, we keep it on one line here (readability + the
-        # editorial-AI pass will rebalance). Never merge two speakers.
-        lines.append(f"{prefix}{seg_text}")
-
-    if not lines:
-        return _wrap_text(dialogue_text, max_chars, max_lines)
-    return lines
-
-
-def _segments_from_runs(words: List[str], speaker_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Split the flat word list into per-speaker text segments using each
-    run's `word_start` offset. Returns [{speaker, text}, ...] in order."""
-    if not speaker_runs:
-        return [{"speaker": None, "text": " ".join(words)}]
-    out: List[Dict[str, Any]] = []
-    for i, run in enumerate(speaker_runs):
-        start = run.get("word_start", 0)
-        end = speaker_runs[i + 1].get("word_start", len(words)) if i + 1 < len(speaker_runs) else len(words)
-        seg_words = words[start:end]
-        if seg_words:
-            out.append({"speaker": run.get("speaker"), "text": " ".join(seg_words)})
-    return out
-
-
-def _wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
-    """
-    Wrap text into lines respecting max_chars per line.
-    Prefers breaking at punctuation and phrase boundaries.
-    """
-    text = text.strip()
-    if not text:
-        return [""]
-
-    if len(text) <= max_chars:
-        return [text]
-
-    words = text.split()
-    lines: List[str] = []
-    current_line = ""
-
-    for word in words:
-        test = (current_line + " " + word).strip() if current_line else word
-
-        if len(test) <= max_chars:
-            current_line = test
-        else:
-            if current_line:
-                lines.append(current_line)
-            current_line = word
-
-            if len(lines) >= max_lines - 1:
-                # Last line — dump remaining
-                remaining = " ".join(words[words.index(word):])
-                lines.append(remaining)
-                return lines[:max_lines]
-
-    if current_line:
-        lines.append(current_line)
-
-    return lines[:max_lines]
