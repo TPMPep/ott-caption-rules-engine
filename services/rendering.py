@@ -59,6 +59,70 @@ def _speaker_label_mode() -> str:
     return (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
 
 
+def _label_case() -> str:
+    return (os.getenv("SPEAKER_LABEL_CASE", "uppercase") or "uppercase").strip().lower()
+
+
+def _format_speaker_name(raw: Optional[str], mode: str) -> str:
+    """Turn a raw diarization speaker id (e.g. 'A', 'SPEAKER_01', 'John') into
+    the display name the spec's mode wants:
+      • alpha   → 'SPEAKER A'  (letter from the id, A/B/C…)
+      • generic → 'SPEAKER 1'  (1-indexed number from the id)
+      • named / first_occurrence / every_change / always → the real name as-is
+    Case is applied per SPEAKER_LABEL_CASE (broadcast default uppercase)."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+
+    if mode == "alpha":
+        # Pull a single A–Z letter. AssemblyAI/Scribe ids are usually already
+        # 'A','B','C' or 'SPEAKER_A'; fall back to the first alpha char.
+        letter = next((ch for ch in s.upper() if ch.isalpha()), "A")
+        name = f"SPEAKER {letter}"
+    elif mode == "generic":
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if digits:
+            num = int(digits) + (0 if digits != "0" else 1)
+        else:
+            # Map a letter id to a 1-based number (A→1, B→2…).
+            first = next((ch for ch in s.upper() if ch.isalpha()), "A")
+            num = ord(first) - ord("A") + 1
+        name = f"SPEAKER {num}"
+    else:
+        # named / first_occurrence_per_scene / every_change / always
+        name = s
+
+    case = _label_case()
+    if case == "uppercase":
+        return name.upper()
+    if case == "title":
+        return name.title()
+    return name
+
+
+def _label_format(off_camera: bool = False) -> str:
+    """Tag template from the spec. {name} is substituted. Off-camera speakers
+    may use a distinct template (Pluto: '({name}):')."""
+    if off_camera:
+        oc = (os.getenv("OFF_CAMERA_LABEL_FORMAT", "") or "").strip()
+        if oc:
+            return oc
+    return (os.getenv("SPEAKER_LABEL_FORMAT", "[{name}:]") or "[{name}:]").strip()
+
+
+def _render_speaker_tag(raw_speaker: Optional[str], mode: str) -> str:
+    """Build the full speaker tag string (e.g. '[SPEAKER A:]') for a cue's
+    speaker, per the spec's mode + format template. Returns '' when the mode
+    emits no tag ('none') or there is no speaker."""
+    if mode in ("none", "dash"):
+        return ""  # 'dash' is handled separately (prefix, not a name tag)
+    name = _format_speaker_name(raw_speaker, mode)
+    if not name:
+        return ""
+    template = _label_format()
+    return template.replace("{name}", name)
+
+
 def segments_from_runs(words: List[str], speaker_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Split the flat word list into per-speaker text segments using each
     run's `word_start` offset. Returns [{speaker, text}, ...] in order."""
@@ -124,20 +188,30 @@ def render_lines(
     SPEAKER_LABEL_MODE. The engine never names a client — it only obeys the
     mode the spec sent.
 
-    Hard universal invariant (every mode, never configurable):
+    Two universal hard invariants (every mode, never configurable):
       • One speaker per line. Two distinct speakers are NEVER placed on the
-        same physical line. This is the Pluto "- Speaker One / - Speaker Two"
-        rule and is correct for every spec.
+        same physical line.
+      • A speaker label is emitted at the start of each speaker's text, in the
+        style the spec's mode dictates. This is the FCC/industry baseline
+        ("signal a new speaker with a hyphen or a clear label") — true for
+        every spec, not just Pluto. The DETERMINISTIC renderer owns this so
+        labels are present even when the editorial-AI is skipped / times out /
+        hits its run budget under 100-user load. SOC 2 CC8.1 / FCC §79.1 —
+        speaker identification is never silently lost.
 
-    Modes:
-      • 'dash' (Pluto/FAST): multi-speaker group → each speaker's text on its
-        own line, prefixed with '- '. Single-speaker group → plain wrap, no dash.
-      • 'none': plain wrap, no speaker identifier.
-      • anything else ('first_occurrence_per_scene' / 'every_change' /
-        'always' / 'named' / 'alpha' / 'generic'): single-speaker groups wrap
-        plainly here (named-tag insertion is the editorial-AI / downstream
-        concern); multi-speaker groups still get one-speaker-per-line so reading
-        order is unambiguous.
+    Styles (the ONLY per-spec variation — the glyph, never whether a label
+    appears):
+      • 'dash'    : prefix each speaker's line with '- '  (Pluto/FAST).
+      • 'alpha'   : '[SPEAKER A:]' bracket tag.
+      • 'generic' : '[SPEAKER 1:]' bracket tag.
+      • 'named' / 'first_occurrence_per_scene' / 'every_change' / 'always'
+                  : '[NAME:]' bracket tag using the real diarized name.
+      • 'none'    : no label (plain wrap) — the only mode that omits a label.
+
+    NOTE on "every speaker change": render_lines is per-cue and the packer
+    guarantees one speaker per dialogue cue (the speaker-integrity invariant),
+    so labelling the cue's speaker == labelling on every change. A genuine
+    multi-speaker cue (intentional dash grouping) labels each segment.
     """
     max_lines = max_lines if max_lines is not None else _max_lines()
     max_chars = max_chars if max_chars is not None else _max_chars()
@@ -149,18 +223,43 @@ def render_lines(
         s.get("speaker") for s in (speaker_runs or []) if s.get("speaker") is not None
     })
 
-    # Single speaker (or no diarization) → plain greedy wrap. No dash, no split.
-    if distinct_speakers <= 1 or len(segments) <= 1:
-        return wrap_text(dialogue_text, max_chars, max_lines)
+    # The cue's single speaker (for single-speaker cues, which is most cues).
+    primary_speaker = None
+    for run in (speaker_runs or []):
+        if run.get("speaker") is not None:
+            primary_speaker = run.get("speaker")
+            break
 
-    # Multi-speaker group — one speaker per line (universal invariant).
-    prefix = "- " if mode == "dash" else ""
+    # ── Single speaker (the common case) ─────────────────────────────────
+    if distinct_speakers <= 1 or len(segments) <= 1:
+        if mode == "none" or primary_speaker is None:
+            return wrap_text(dialogue_text, max_chars, max_lines)
+        if mode == "dash":
+            # Dash mode does NOT prefix a single-speaker cue (the dash only
+            # disambiguates a multi-speaker exchange). Plain wrap.
+            return wrap_text(dialogue_text, max_chars, max_lines)
+        # Bracket-style modes (alpha / generic / named / first_occurrence /
+        # every_change / always): prepend the tag to the wrapped text so the
+        # label rides on the first line. The tag counts toward the char budget
+        # of line 1 — wrap the tagged text as a whole so QC stays honest.
+        tag = _render_speaker_tag(primary_speaker, mode)
+        if not tag:
+            return wrap_text(dialogue_text, max_chars, max_lines)
+        return wrap_text(f"{tag} {dialogue_text}".strip(), max_chars, max_lines)
+
+    # ── Multi-speaker cue — one speaker per line + per-speaker label ──────
     lines: List[str] = []
     for seg in segments:
         seg_text = seg["text"].strip()
         if not seg_text:
             continue
-        lines.append(f"{prefix}{seg_text}")
+        if mode == "dash":
+            lines.append(f"- {seg_text}")
+        elif mode == "none":
+            lines.append(seg_text)
+        else:
+            tag = _render_speaker_tag(seg.get("speaker"), mode)
+            lines.append(f"{tag} {seg_text}".strip() if tag else seg_text)
 
     if not lines:
         return wrap_text(dialogue_text, max_chars, max_lines)
