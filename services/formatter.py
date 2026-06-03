@@ -676,6 +676,17 @@ def process_caption_job(
     # emit one even if an earlier stage added it. Universal mechanism, per-spec flag.
     cues = _apply_no_formatting_tags(cues)
 
+    # 10c. first_occurrence_per_scene label suppression. render_lines is stateless
+    # per-cue so it labels EVERY cue; this single stateful post-pass strips the
+    # repeat labels so each speaker is labeled only on their first cue in the scene
+    # (MVP: whole output = one scene). No-op for every other label_mode. Runs AFTER
+    # readability (cues are final) and BEFORE QC so CPS/CPL grade the delivered text.
+    try:
+        from .rendering import suppress_repeat_speaker_labels
+        cues = suppress_repeat_speaker_labels(cues)
+    except Exception as _e:
+        print(f"[FORMATTER] label-suppression skipped (non-fatal): {_e}")
+
     # 11. QC
     qc = qc_report(cues_in_count, cues, protected_phrases)
     print(f"[FORMATTER] QC: {qc}")
