@@ -154,7 +154,13 @@ def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
     lines: List[str] = []
     current_line = ""
 
-    for word in words:
+    # CRITICAL: iterate with enumerate() so the "remaining words" slice uses the
+    # TRUE current loop index. The prior code used words.index(word), which
+    # returns the FIRST occurrence of the word in the list — so any cue with a
+    # repeated word (e.g. "go go go to the town and the town will know") would
+    # slice from the wrong position, duplicating or dropping text. SOC 2 CC8.1 —
+    # rendering must be deterministic and word-faithful regardless of repeats.
+    for idx, word in enumerate(words):
         test = (current_line + " " + word).strip() if current_line else word
 
         if len(test) <= max_chars:
@@ -165,8 +171,9 @@ def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
             current_line = word
 
             if len(lines) >= max_lines - 1:
-                # Last allowed line — dump the remaining words onto it.
-                remaining = " ".join(words[words.index(word):])
+                # Last allowed line — dump the remaining words onto it, sliced
+                # from the CURRENT index (not the first matching word).
+                remaining = " ".join(words[idx:])
                 lines.append(remaining)
                 return lines[:max_lines]
 
