@@ -285,13 +285,22 @@ def _build_tokens_from_words(
 def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tokens: List[Dict[str, Any]] = []
     for utterance in utterances:
-        speaker = utterance.get("speaker")
+        utt_speaker = utterance.get("speaker")
         for word in (utterance.get("words") or []):
             text = (word.get("text") or "").strip()
             if not text:
                 continue
             start_ms = int(word.get("start", 0))
             end_ms = int(word.get("end", start_ms))
+            # Speaker precedence: the word's OWN speaker wins when present
+            # (post-fix Scribe baselines carry it on every word); otherwise
+            # inherit the utterance's authoritative speaker. A word can NEVER
+            # arrive null when its utterance has a speaker — this is what
+            # stops the packer fusing adjacent A/B utterances into one
+            # mislabeled cue on the reformat-from-baseline path. SOC 2 CC8.1.
+            speaker = word.get("speaker")
+            if speaker is None:
+                speaker = utt_speaker
             tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms, "speaker": speaker})
     return tokens
 
