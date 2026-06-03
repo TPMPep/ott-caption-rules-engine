@@ -22,6 +22,7 @@ import os
 try:
     from .rendering import render_lines, merge_cue_meta, cue_speakers
 except Exception:
+    _HAVE_RENDERING = False
     # Defensive fallback — must never crash a job. Degrades to flat behaviour.
     def render_lines(words, runs, max_lines=None, max_chars=None, dialogue_text=None):
         return [dialogue_text if dialogue_text is not None else " ".join(words)]
@@ -133,36 +134,138 @@ def enforce_min_duration(cues):
     return cues
 
 
+# ─── CPS-aware merge math (single source of truth) ───────────────────────────
+# Reuse cps.py's exact CPS / visible-char / duration helpers so the merge
+# improvement-gate measures reading speed IDENTICALLY to how the CPS driver and
+# the QC gate measure it. No second definition of CPS anywhere — zero drift.
+try:
+    from .cps import cue_cps as _cue_cps, _visible_chars as _cps_visible_chars
+except Exception:
+    def _cue_cps(cue):
+        text = " ".join(cue.get("lines", [])).replace("\n", " ").strip()
+        dur = max(1, int(cue.get("end_ms", 0)) - int(cue.get("start_ms", 0)))
+        return len(text) / (dur / 1000.0)
+
+    def _cps_visible_chars(cue):
+        return len(" ".join(cue.get("lines", [])).replace("\n", " ").strip())
+
+
+# Maximum on-screen duration a merged cue may occupy. Reuses the same env knob
+# the CPS driver uses so a merge can never produce a cue the CPS pass would
+# immediately judge over-long.
+def _max_display_ms() -> int:
+    return _env_int("CUSTOM_MAX_DISPLAY_MS", 7000)
+
+
+def _max_cps() -> int:
+    return _env_int("CUSTOM_MAX_CPS", 45)
+
+
+def _merge_improves(prev_cue, next_cue, merged):
+    """The auditor-grade acceptance gate. A micro-cue merge is accepted ONLY
+    when it provably improves readability WITHOUT introducing a new violation:
+
+      1. layout: merged cue is ≤ max_lines lines, every line ≤ max_chars.
+      2. duration: merged on-screen time is within [min_display, max_display].
+      3. reading speed: merged CPS is no worse than the WORST of the two inputs
+         (i.e. the merge does not raise reading speed) AND, when at least one
+         input was below min_display, the merged cue clears min_display.
+
+    This is intentionally conservative — it never ships a state worse than what
+    it started with. Anything it declines is left for the CPS driver / QC gate.
+    SOC 2 CC8.1: every merge is a provable readability improvement, never a
+    cosmetic regrouping that hides a fail."""
+    max_chars = _max_chars()
+    max_lines = _max_lines()
+    min_display = _min_dialogue_ms()
+    max_display = _max_display_ms()
+    max_cps = _max_cps()
+
+    lines = merged.get("lines", [])
+    # (1) layout must stay within the spec geometry.
+    if len(lines) > max_lines:
+        return False
+    if any(len(l) > max_chars for l in lines):
+        return False
+
+    # (2) duration window.
+    merged_dur = int(merged.get("end_ms", 0)) - int(merged.get("start_ms", 0))
+    if merged_dur < min_display or merged_dur > max_display:
+        return False
+
+    # (3) reading speed must not worsen.
+    prev_cps = _cue_cps(prev_cue)
+    next_cps = _cue_cps(next_cue)
+    merged_cps = _cue_cps(merged)
+    worst_input_cps = max(prev_cps, next_cps)
+    # Merge must not raise CPS above the worse of the two inputs. (Combining a
+    # short fragment with a neighbour lengthens the window, so a genuine
+    # improvement lowers CPS; we accept equal-or-better, never worse.)
+    if merged_cps > worst_input_cps + 0.01:
+        return False
+    # If neither input was short, there's no min-duration problem to solve and
+    # we don't want to needlessly fuse two healthy cues — require that at least
+    # one input was actually below min_display (the real merge signal).
+    prev_dur = int(prev_cue.get("end_ms", 0)) - int(prev_cue.get("start_ms", 0))
+    nxt_dur = int(next_cue.get("end_ms", 0)) - int(next_cue.get("start_ms", 0))
+    if prev_dur >= min_display and nxt_dur >= min_display:
+        return False
+
+    return True
+
+
 def merge_micro_cues(cues):
-    merge_gap = _merge_gap_ms()
+    """Merge adjacent sub-min_display dialogue fragments into a single compliant
+    cue — but ONLY when the merge provably improves readability (see
+    _merge_improves). Two merge shapes, both gated identically:
+
+      • SAME-SPEAKER continuation — fragments from one speaker re-render as one
+        cue (single-line continuation, or a balanced 2-line wrap if needed).
+      • ADJACENT DIFFERENT-SPEAKER into a valid TWO-LINE cue — when the spec
+        permits ≥2 lines, a tight A→B back-and-forth where each fragment is
+        sub-min_display renders as one caption with one speaker per line and the
+        spec's labels preserved (first_occurrence_per_scene, alpha, named, …).
+        The dash convention has its own dedicated pass (group_two_speaker_cues);
+        this path handles every NON-dash spec's legitimate two-speaker caption.
+
+    one-speaker-per-line, max_lines, max_chars, and label mode are all enforced
+    by re-rendering through the shared renderer (render_lines via
+    _rerender_merged). CPS math is cps.py's, so the gate never drifts from QC."""
+    min_display = _min_dialogue_ms()
+    group_gap = _two_speaker_group_gap_ms()
+    max_lines = _max_lines()
+    label_mode = _speaker_label_mode()
     merged = []
     i = 0
     while i < len(cues):
         cue = cues[i]
-        duration = cue["end_ms"] - cue["start_ms"]
-        text = " ".join(cue["lines"])
-        word_count = len(text.split())
+        nxt = cues[i + 1] if i + 1 < len(cues) else None
+        cur_dur = cue["end_ms"] - cue["start_ms"]
 
-        if (cue["type"] == "dialogue"
-                and duration < MICRO_DURATION_MS
-                and word_count <= MICRO_WORD_LIMIT
-                and i < len(cues) - 1
-                and cues[i + 1]["type"] == "dialogue"):
-            nxt = cues[i + 1]
-            gap = nxt["start_ms"] - cue["end_ms"]
-            # SPEAKER GUARD — never glue a micro-cue onto a different speaker
-            # (that's what produced the dash-less A+B fusion). Same-speaker (or
-            # unknown) only, then RE-RENDER through the shared module so the
-            # merged cue keeps correct line breaks / dash / label.
-            if gap <= max(200, merge_gap) and _speakers_compatible(cue, nxt):
-                merged.append(_rerender_merged(cue, nxt))
-                i += 2
-                continue
+        # ── Dialogue micro-merge — the real readability fix ──────────────────
+        # Trigger when THIS cue is a sub-min_display dialogue fragment and the
+        # next is also dialogue within a tight conversational gap.
+        if (cue.get("type") == "dialogue"
+                and cur_dur < min_display
+                and nxt is not None
+                and nxt.get("type") == "dialogue"
+                and (nxt["start_ms"] - cue["end_ms"]) <= group_gap):
+            same_speaker = _speakers_compatible(cue, nxt)
+            # Different-speaker merge is only allowed when the spec gives us a
+            # second line to put the second speaker on (one-speaker-per-line is
+            # non-negotiable). Dash mode is handled by group_two_speaker_cues.
+            allow_cross = (not same_speaker) and max_lines >= 2 and label_mode != "dash"
+            if same_speaker or allow_cross:
+                candidate = _rerender_merged(cue, nxt)
+                if _merge_improves(cue, nxt, candidate):
+                    merged.append(candidate)
+                    i += 2
+                    continue
 
-        if (cue["type"] == "sound"
-                and i < len(cues) - 1
-                and cues[i + 1]["type"] == "sound"):
-            nxt = cues[i + 1]
+        # ── Sound-cue clustering (unchanged) ─────────────────────────────────
+        if (cue.get("type") == "sound"
+                and nxt is not None
+                and nxt.get("type") == "sound"):
             a = cue["lines"][0].strip("[]")
             b = nxt["lines"][0].strip("[]")
             cue["lines"] = [f"[{a} AND {b}]"]
