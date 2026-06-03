@@ -337,3 +337,97 @@ def cue_speakers(cue: Dict[str, Any]) -> set:
     Empty set when the cue has no speaker structure (treated as 'unknown')."""
     runs = (cue.get("meta") or {}).get("runs") or []
     return {r.get("speaker") for r in runs if r.get("speaker") is not None}
+
+
+# ─── first_occurrence_per_scene label suppression ───────────────────────────
+# render_lines is intentionally STATELESS per cue (single source of truth, called
+# by the formatter AND the readability merge passes). It therefore cannot decide
+# "is this the speaker's FIRST cue in the scene?" — so on its own it renders a
+# bracket label on EVERY cue (correct for 'always' / 'every_change', wrong for
+# 'first_occurrence_per_scene', which is what the bug was: the catch-all branch
+# silently degraded first_occurrence to always).
+#
+# The spec-faithful fix is a SINGLE stateful post-pass over the finished cue list.
+# It runs ONCE, after every cue is built/refined/readability-processed, walks the
+# cues in display order, and for label_mode='first_occurrence_per_scene' strips the
+# bracket/paren label from any cue whose speaker has already been labeled earlier
+# in the scene. MVP scene definition (per directive): the ENTIRE output is one
+# scene unless explicit scene boundaries are provided — so each speaker is labeled
+# exactly once, on their first cue.
+#
+# Why this can never break layout: removing a leading label only ever SHORTENS a
+# line, never lengthens it, so no cue can newly overflow max_chars. We re-wrap the
+# stripped first line defensively anyway (free, deterministic) so a label that had
+# pushed text onto a second line collapses back to one when it now fits.
+#
+# Modes other than first_occurrence_per_scene are untouched (dash / alpha / generic
+# / named / every_camera / always / none all keep their current behaviour). SOC 2
+# CC8.1 / FCC §79.1 — speaker identification still appears (once), and the pass is
+# a deterministic, reproducible function of (cues, mode, scene boundaries).
+
+# Match a leading bracket tag '[NAME:] ' or paren tag '(NAME): ' the renderer
+# emitted. Dash ('- ') is NOT stripped here — dash mode is a separate label_mode
+# and is never first_occurrence_per_scene.
+import re as _re_for_labels
+_BRACKET_LABEL_RE = _re_for_labels.compile(r"^\s*\[[^\]]*:\]\s*")
+_PAREN_LABEL_RE = _re_for_labels.compile(r"^\s*\([^)]*\):\s*")
+
+
+def _strip_leading_bracket_label(line: str) -> str:
+    s = _BRACKET_LABEL_RE.sub("", line or "", count=1)
+    s = _PAREN_LABEL_RE.sub("", s, count=1)
+    return s
+
+
+def _line_has_bracket_label(line: str) -> bool:
+    return _strip_leading_bracket_label(line) != (line or "")
+
+
+def suppress_repeat_speaker_labels(
+    cues: List[Dict[str, Any]],
+    scene_boundary_idxs: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """Enforce label_mode='first_occurrence_per_scene' across a finished cue list.
+
+    For each scene, the FIRST cue of each speaker keeps its rendered label; every
+    later cue of that same speaker in the same scene has its label stripped. No-op
+    for any other label_mode. Pure, deterministic, in-place-safe (returns the same
+    list mutated). `scene_boundary_idxs` is a set of cue indices that START a new
+    scene; when None/empty the entire output is treated as ONE scene (MVP).
+    """
+    mode = _speaker_label_mode()
+    if mode != "first_occurrence_per_scene":
+        return cues
+
+    max_lines = _max_lines()
+    max_chars = _max_chars()
+    boundaries = scene_boundary_idxs or set()
+    seen_speakers: set = set()
+
+    for i, cue in enumerate(cues):
+        if i in boundaries:
+            seen_speakers = set()  # new scene → labels re-appear
+        if cue.get("type") != "dialogue":
+            continue
+        speaker = None
+        for run in ((cue.get("meta") or {}).get("runs") or []):
+            if run.get("speaker") is not None:
+                speaker = run.get("speaker")
+                break
+        # A cue with no resolvable speaker carries no first-occurrence identity;
+        # leave it exactly as rendered.
+        if speaker is None:
+            continue
+
+        if speaker in seen_speakers:
+            # Repeat occurrence — strip the label off this cue's lines, then
+            # re-wrap the now-shorter spoken text so a label that had forced a
+            # 2nd line collapses cleanly. Shortening can never overflow.
+            lines = cue.get("lines", [])
+            if any(_line_has_bracket_label(l) for l in lines):
+                spoken = " ".join(_strip_leading_bracket_label(l) for l in lines).strip()
+                cue["lines"] = wrap_text(spoken, max_chars, max_lines)
+        else:
+            seen_speakers.add(speaker)
+
+    return cues
