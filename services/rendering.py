@@ -369,8 +369,13 @@ def cue_speakers(cue: Dict[str, Any]) -> set:
 # emitted. Dash ('- ') is NOT stripped here — dash mode is a separate label_mode
 # and is never first_occurrence_per_scene.
 import re as _re_for_labels
-_BRACKET_LABEL_RE = _re_for_labels.compile(r"^\s*\[[^\]]*:\]\s*")
-_PAREN_LABEL_RE = _re_for_labels.compile(r"^\s*\([^)]*\):\s*")
+# CRITICAL: the inner class must be LAZY ([^\]]*?). The rendered label is
+# '[SPEAKER A:]' — the ':' is itself a non-']' char, so a GREEDY [^\]]* eats
+# 'SPEAKER A:' and leaves only ']', making the required ':\]' suffix unmatchable.
+# A greedy class therefore NEVER matches a real label (the silent no-op bug).
+# Lazy expansion stops at the first ':]' and matches correctly.
+_BRACKET_LABEL_RE = _re_for_labels.compile(r"^\s*\[[^\]]*?:\]\s*")
+_PAREN_LABEL_RE = _re_for_labels.compile(r"^\s*\([^)]*?\):\s*")
 
 
 def _strip_leading_bracket_label(line: str) -> str:
