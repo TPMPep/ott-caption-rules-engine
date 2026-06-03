@@ -423,7 +423,17 @@ def normalize_scribe_result(raw: Dict[str, Any]) -> Dict[str, Any]:
             "text":  text,
             "confidence": round(avg_conf, 4),
             "words": [
-                {"text": w["text"], "start": w["start"], "end": w["end"], "confidence": w["confidence"]}
+                # CRITICAL: carry `speaker` onto EVERY per-utterance word.
+                # The reformat-from-baseline token builder reads per-word
+                # speaker; without it, words arrive null-speaker and the
+                # packer can fuse adjacent different-speaker utterances into
+                # one mislabeled cue (A's "Chest pass" absorbed into B). The
+                # utterance-level speaker is authoritative and applied to
+                # every word here so speaker identity is explicit on the word,
+                # never inferred from timestamps. FCC 47 CFR §79.1 / SOC 2
+                # CC8.1 — speaker identity is provably carried on every token.
+                {"text": w["text"], "start": w["start"], "end": w["end"],
+                 "speaker": u["speaker"], "confidence": w["confidence"]}
                 for w in words_in_utt
             ],
         })
