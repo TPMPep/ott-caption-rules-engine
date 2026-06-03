@@ -36,6 +36,11 @@ identical (words, runs, spec) always renders identical lines, on every stage.
 import os
 from typing import Any, Dict, List, Optional
 
+try:
+    from services.linebreak import choose_two_line_break
+except ImportError:  # pragma: no cover — defensive for alternate import roots
+    from linebreak import choose_two_line_break
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -138,10 +143,40 @@ def segments_from_runs(words: List[str], speaker_runs: List[Dict[str, Any]]) -> 
     return out
 
 
+def _greedy_wrap(words: List[str], max_chars: int, max_lines: int) -> List[str]:
+    """Greedy left-to-right fill. The deterministic fallback used for the
+    1-line case, the 3+-line case, and whenever the syntax-aware 2-line breaker
+    finds no feasible balanced split. Word-faithful (enumerate-based slice)."""
+    lines: List[str] = []
+    current_line = ""
+    for idx, word in enumerate(words):
+        test = (current_line + " " + word).strip() if current_line else word
+        if len(test) <= max_chars:
+            current_line = test
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+            if len(lines) >= max_lines - 1:
+                # Last allowed line — dump remaining words from the CURRENT
+                # index (never words.index(word), which finds the first match).
+                lines.append(" ".join(words[idx:]))
+                return lines[:max_lines]
+    if current_line:
+        lines.append(current_line)
+    return lines[:max_lines]
+
+
 def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
     """
     Wrap text into lines respecting max_chars per line.
-    Greedy fill; prefers natural word boundaries.
+
+    For the common 2-line case the SYNTAX-AWARE breaker (services.linebreak)
+    chooses the break that preserves clause/phrase integrity AND balances the
+    two line lengths — the professional-captioner behaviour (honors the spec's
+    PREFER_BALANCED_LINES + PRESERVE_CLAUSE_INTEGRITY flags). For 1-line, 3+
+    lines, or when no feasible balanced split exists, falls back to greedy fill.
+    Both paths are deterministic and word-faithful. SOC 2 CC8.1.
     """
     text = (text or "").strip()
     if not text:
@@ -151,36 +186,18 @@ def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
         return [text]
 
     words = text.split()
-    lines: List[str] = []
-    current_line = ""
 
-    # CRITICAL: iterate with enumerate() so the "remaining words" slice uses the
-    # TRUE current loop index. The prior code used words.index(word), which
-    # returns the FIRST occurrence of the word in the list — so any cue with a
-    # repeated word (e.g. "go go go to the town and the town will know") would
-    # slice from the wrong position, duplicating or dropping text. SOC 2 CC8.1 —
-    # rendering must be deterministic and word-faithful regardless of repeats.
-    for idx, word in enumerate(words):
-        test = (current_line + " " + word).strip() if current_line else word
+    # ── Syntax-aware balanced break — only the exact-2-line case ──────────
+    # When max_lines >= 2 and the whole string fits across two lines, prefer the
+    # clause-aware balanced split over greedy. choose_two_line_break returns None
+    # if no feasible two-line split exists (e.g. content needs 3 lines), in which
+    # case we fall through to greedy below.
+    if max_lines >= 2:
+        two = choose_two_line_break(text, max_chars)
+        if two is not None:
+            return two
 
-        if len(test) <= max_chars:
-            current_line = test
-        else:
-            if current_line:
-                lines.append(current_line)
-            current_line = word
-
-            if len(lines) >= max_lines - 1:
-                # Last allowed line — dump the remaining words onto it, sliced
-                # from the CURRENT index (not the first matching word).
-                remaining = " ".join(words[idx:])
-                lines.append(remaining)
-                return lines[:max_lines]
-
-    if current_line:
-        lines.append(current_line)
-
-    return lines[:max_lines]
+    return _greedy_wrap(words, max_chars, max_lines)
 
 
 def render_lines(
