@@ -109,8 +109,19 @@ def qc_report(cues_in: int, cues_out: List[Dict], protected_phrases: List[str]) 
     one_word_dialogue_cues = 0
     function_word_endings = 0
     protected_phrase_splits = 0
+    # DIAGNOSTIC (speaker-fusion fingerprint): count dialogue cues whose
+    # meta.runs carry 2+ DISTINCT speakers. A correctly-segmented alpha/named
+    # deliverable should have ZERO multi-speaker cues (one speaker per cue);
+    # any non-zero count localizes the A/B fusion to the packer. Pure audit
+    # signal — never alters output. SOC 2 CC8.1.
+    multi_speaker_dialogue_cues = 0
 
     for cue in cues_out:
+        if cue.get("type") == "dialogue":
+            _runs = (cue.get("meta") or {}).get("runs") or []
+            _distinct = {r.get("speaker") for r in _runs if r.get("speaker") is not None}
+            if len(_distinct) >= 2:
+                multi_speaker_dialogue_cues += 1
         if len(cue["lines"]) > max_lines:
             max_lines_violation += 1
         if any(len(line) > max_chars for line in cue["lines"]):
@@ -138,6 +149,9 @@ def qc_report(cues_in: int, cues_out: List[Dict], protected_phrases: List[str]) 
         "sound_overlap_violations": count_sound_overlaps(cues_out),
         "function_word_endings": function_word_endings,
         "protected_phrase_splits": protected_phrase_splits,
+        # Fusion fingerprint — see comment above. Surfaced top-level so the
+        # Base44 telemetry diagnostic reads it without digging into _rules_used.
+        "multi_speaker_dialogue_cues": multi_speaker_dialogue_cues,
         "_rules_used": {
             # Truthful audit label. The engine is spec-agnostic — every rule
             # below comes from the CUSTOM_* / SPEAKER_LABEL_MODE / MUSIC_CUE_*
@@ -151,5 +165,10 @@ def qc_report(cues_in: int, cues_out: List[Dict], protected_phrases: List[str]) 
             "max_chars": max_chars,
             "min_dialogue_ms": min_dialogue_ms,
             "min_sound_ms": min_sound_ms,
+            # The speaker mode the engine ACTUALLY resolved at format time.
+            # Confirms whether the Base44 producer's project posture ('alpha')
+            # reached the engine, or whether it fell to the 'dash' default
+            # (which would explain dash-path grouping running unexpectedly).
+            "speaker_label_mode": (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower(),
         },
     }
