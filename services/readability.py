@@ -306,9 +306,20 @@ def apply_readability_rules(cues):
       2. two-speaker grouping — SPEC-DRIVEN (dash mode only): fuse tight
          back-and-forth A/B exchanges into one '- A' / '- B' caption.
       3. enforce min-duration + micro-merge on the cleaned set.
+      4. CPS enforcement (Phase 2) — reading-speed rules as active drivers:
+         extend over-fast cues into idle gap, split the still-over-fast ones at
+         a clause boundary, trim over-slow lingering cues. Runs AFTER merging so
+         it sees final cue boundaries, and is the LAST structural pass so its
+         timing/split decisions are not undone by a later merge.
     """
     cues = reflow_orphans(cues)
     cues = group_two_speaker_cues(cues)
     cues = enforce_min_duration(cues)
     cues = merge_micro_cues(cues)
+    try:
+        from .cps import enforce_cps_rules
+    except Exception:
+        def enforce_cps_rules(c):
+            return c
+    cues = enforce_cps_rules(cues)
     return cues
