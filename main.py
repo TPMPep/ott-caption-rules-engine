@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.10.0-cps-enforcement-qc-gate"
+VERSION = "5.11.0-first-occurrence-per-scene-labels"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
