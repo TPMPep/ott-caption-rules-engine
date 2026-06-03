@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.11.1-label-strip-regex-fix"
+VERSION = "5.12.0-cps-aware-micro-merge"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
