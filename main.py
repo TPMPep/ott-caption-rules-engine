@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.14.0-cjk-segmentation-wrap"
+VERSION = "5.15.0-universal-caption-shaping"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
