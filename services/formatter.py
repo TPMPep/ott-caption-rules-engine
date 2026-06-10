@@ -28,6 +28,19 @@ except Exception:
     def _render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text=None):
         return [dialogue_text if dialogue_text is not None else " ".join(words)]
 
+# CJK awareness — single source of truth for no-space-script handling.
+try:
+    from .cjk import is_cjk_text as _is_cjk, cjk_char_count as _cjk_count, wrap_cjk as _wrap_cjk
+except Exception:  # pragma: no cover — defensive for alternate import roots
+    def _is_cjk(text):
+        return False
+
+    def _cjk_count(text):
+        return len((text or "").replace(" ", ""))
+
+    def _wrap_cjk(text, max_chars, max_lines):
+        return [text]
+
 try:
     from .assembly import normalize_tokens as _normalize_tokens, is_sound_token as _is_sound_token
 except Exception:
@@ -885,28 +898,50 @@ def _build_dialogue_cues(
         g_words = group["words"]
         g_text = " ".join(g_words)
         g_speaker = (group.get("speaker_runs") or [{}])[0].get("speaker")
+        g_is_cjk = _is_cjk(g_text)
+
+        # The on-screen budget. For CJK the budget is measured in CHARACTERS
+        # (no spaces); a Japanese caption packs max_chars × max_lines glyphs.
+        g_len = _cjk_count(g_text) if g_is_cjk else len(g_text)
 
         # A sentence that itself overflows the on-screen budget must be split
-        # across multiple cues at clause boundaries (never orphaning a tail).
-        # Timings are interpolated across chunks proportionally to word count
-        # over the group's REAL [start_ms, end_ms] window.
-        if len(g_text) > budget:
+        # across multiple cues. CJK splits by character at 、。 clause boundaries
+        # (kinsoku-aware); Latin splits at clause boundaries by word. Both
+        # interpolate timings proportionally over the group's real window.
+        if g_len > budget:
             _flush_pack()
             g_start = group["start_ms"]
             g_end = max(group["end_ms"], g_start + 1)
-            chunk_list = _split_sentence_into_cue_chunks(g_words, max_chars, max_lines)
-            total_words = sum(len(c["words"]) for c in chunk_list) or 1
             span = g_end - g_start
-            word_cursor = 0
-            for chunk in chunk_list:
-                c_words = chunk["words"]
-                c_start = g_start + (span * word_cursor) // total_words
-                word_cursor += len(c_words)
-                c_end = g_start + (span * word_cursor) // total_words
-                cues.append(_finalize_dialogue_cue(
-                    c_words, int(c_start), int(max(c_end, c_start + 1)),
-                    [{"speaker": g_speaker, "word_start": 0}], max_lines, max_chars,
-                ))
+
+            if g_is_cjk:
+                # Split the whole CJK sentence string into cue-sized character
+                # chunks (each ≤ budget), then interpolate by character count.
+                cjk_str = "".join(g_words) if len(g_words) > 1 else g_text
+                chunk_strs = _split_cjk_sentence_into_cue_chunks(cjk_str, max_chars, max_lines)
+                total_chars = sum(_cjk_count(c) for c in chunk_strs) or 1
+                char_cursor = 0
+                for c_str in chunk_strs:
+                    c_start = g_start + (span * char_cursor) // total_chars
+                    char_cursor += _cjk_count(c_str)
+                    c_end = g_start + (span * char_cursor) // total_chars
+                    cues.append(_finalize_dialogue_cue(
+                        [c_str], int(c_start), int(max(c_end, c_start + 1)),
+                        [{"speaker": g_speaker, "word_start": 0}], max_lines, max_chars,
+                    ))
+            else:
+                chunk_list = _split_sentence_into_cue_chunks(g_words, max_chars, max_lines)
+                total_words = sum(len(c["words"]) for c in chunk_list) or 1
+                word_cursor = 0
+                for chunk in chunk_list:
+                    c_words = chunk["words"]
+                    c_start = g_start + (span * word_cursor) // total_words
+                    word_cursor += len(c_words)
+                    c_end = g_start + (span * word_cursor) // total_words
+                    cues.append(_finalize_dialogue_cue(
+                        c_words, int(c_start), int(max(c_end, c_start + 1)),
+                        [{"speaker": g_speaker, "word_start": 0}], max_lines, max_chars,
+                    ))
             continue
 
         # Packing: would adding this whole sentence to the current pack still
@@ -927,8 +962,14 @@ def _build_dialogue_cues(
             pack_words
             and g_speaker != pack_speaker
         )
-        candidate = (" ".join(pack_words + g_words)).strip() if pack_words else g_text
-        would_overflow = len(candidate) > budget
+        # CJK packs by joining with no space (no inter-word spaces in Japanese);
+        # Latin joins by space. Length is measured the same way the budget is.
+        if g_is_cjk:
+            candidate = ("".join(pack_words + g_words)).strip() if pack_words else g_text
+            would_overflow = _cjk_count(candidate) > budget
+        else:
+            candidate = (" ".join(pack_words + g_words)).strip() if pack_words else g_text
+            would_overflow = len(candidate) > budget
 
         if (speaker_changed or would_overflow) and pack_words:
             _flush_pack()
@@ -998,6 +1039,42 @@ def _split_sentence_into_cue_chunks(
     return [{"words": c} for c in chunks]
 
 
+def _split_cjk_sentence_into_cue_chunks(
+    sentence: str,
+    max_chars: int,
+    max_lines: int,
+) -> List[str]:
+    """Split an over-long CJK sentence into cue-sized character chunks, each ≤
+    max_chars × max_lines characters, breaking at 、。clause boundaries where
+    possible (kinsoku-aware). Returns a list of CJK strings — each becomes one
+    cue, then wrap_cjk lays it out across ≤max_lines lines. This is the CJK twin
+    of _split_sentence_into_cue_chunks; it splits by CHARACTER, never by space."""
+    from .cjk import CJK_CLAUSE_ENDERS, CJK_SENTENCE_ENDERS, cjk_char_count
+
+    budget = max_chars * max_lines
+    s = (sentence or "").strip()
+    if cjk_char_count(s) <= budget:
+        return [s]
+
+    chunks: List[str] = []
+    remaining = s
+    while cjk_char_count(remaining) > budget:
+        window = remaining[:budget]
+        # Prefer the last clause/sentence boundary inside the window so the cue
+        # ends on a natural pause (、 or 。). Break AFTER the punctuation.
+        cut = -1
+        for i in range(len(window)):
+            if window[i] in CJK_CLAUSE_ENDERS or window[i] in CJK_SENTENCE_ENDERS:
+                cut = i + 1
+        if cut < 1:
+            cut = budget  # no boundary — hard-cut at the budget
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return [c for c in chunks if c]
+
+
 def _finalize_dialogue_cue(
     words: List[str],
     start_ms: int,
@@ -1014,7 +1091,16 @@ def _finalize_dialogue_cue(
     times out, or hits its run budget — closing the "speaker IDs gone" gap.
     UNIVERSAL one-speaker-per-line rule is enforced for multi-speaker groups
     regardless of label mode (never two speakers on one line)."""
-    dialogue_text = " ".join(words)
+    # CJK joins with NO space (Japanese has no inter-word spaces); a stray space
+    # between sentences would inflate the char count and read wrong. Latin joins
+    # with a single space. render_lines/wrap_text route CJK to wrap_cjk via the
+    # same is_cjk_text check, so the dialogue_text built here stays consistent.
+    if len(words) == 1:
+        dialogue_text = words[0]
+    elif _is_cjk(" ".join(words)):
+        dialogue_text = "".join(words)
+    else:
+        dialogue_text = " ".join(words)
     # SINGLE SOURCE OF TRUTH — render through the shared module so the cue is
     # drawn the exact same way the readability merge passes will re-draw it.
     lines = _render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text)
