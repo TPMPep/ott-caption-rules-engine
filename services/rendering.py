@@ -41,6 +41,22 @@ try:
 except ImportError:  # pragma: no cover — defensive for alternate import roots
     from linebreak import choose_two_line_break
 
+# CJK awareness — route no-space-script text to the character-aware wrapper.
+try:
+    from services.cjk import is_cjk_text as _is_cjk, wrap_cjk as _wrap_cjk, cjk_char_count as _cjk_count
+except ImportError:  # pragma: no cover
+    try:
+        from cjk import is_cjk_text as _is_cjk, wrap_cjk as _wrap_cjk, cjk_char_count as _cjk_count
+    except ImportError:
+        def _is_cjk(text):
+            return False
+
+        def _wrap_cjk(text, max_chars, max_lines):
+            return [text]
+
+        def _cjk_count(text):
+            return len((text or "").replace(" ", ""))
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -181,6 +197,14 @@ def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
     text = (text or "").strip()
     if not text:
         return [""]
+
+    # CJK (no-space script): wrap by CHARACTER count at 、。 boundaries with
+    # kinsoku, never by space-split words. This is the core fix for the Japanese
+    # 54-char-line / mega-cue defect — wrap_cjk produces ≤max_chars lines.
+    if _is_cjk(text):
+        if _cjk_count(text) <= max_chars:
+            return [text]
+        return _wrap_cjk(text, max_chars, max_lines)
 
     if len(text) <= max_chars:
         return [text]
