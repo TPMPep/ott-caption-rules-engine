@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.12.0-cps-aware-micro-merge"
+VERSION = "5.13.0-operator-confirmed-language"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -615,11 +615,17 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
         media_url = str(payload_data["mediaUrl"])
         speaker_labels = payload_data.get("speakerLabels", True)
         language_detection = payload_data.get("languageDetection", True)
+        # Operator-confirmed source language (ISO-639-1 for AAI). When present,
+        # submit_transcription_job pins it and forces detection OFF — the
+        # confirmed language is authoritative, no silent auto-detect fallback.
+        # None / "auto" → AAI auto-detects under language_detection. SOC 2 CC8.1.
+        source_language_code = payload_data.get("source_language_code") or None
         try:
             provider_transcript_id = submit_transcription_job(
                 media_url=media_url,
                 speaker_labels=speaker_labels,
                 language_detection=language_detection,
+                language_code=source_language_code,
             )
         except Exception as exc:
             update_job(job_id, status="failed", stage="failed", error={"message": str(exc)})
