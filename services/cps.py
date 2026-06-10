@@ -389,15 +389,82 @@ def trim_slow_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return cues
 
 
+# ─── (4) DURATION SPLIT ──────────────────────────────────────────────
+def split_overlong_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Split any dialogue cue exceeding max_display_ms into shorter cues at a
+    clause boundary, recursively, until every piece is within the duration
+    ceiling (or can't be split further). This is the DURATION driver: a caption
+    on screen for 8–13s is never spec-compliant regardless of CPS — Apple TV+
+    caps a cue at 6s. CJK splits by character at 、。 boundaries; Latin by word
+    at clause boundaries. Each accepted split preserves min_display + min_gap.
+    Runs BEFORE the CPS pass so the CPS driver then refines what's left."""
+    max_dur = _max_display_ms()
+    min_display = _min_display_ms()
+    min_gap = _merge_gap_ms()
+    max_chars = _max_chars()
+    max_lines = _max_lines()
+
+    # Iterate to a fixed point — a single split may still leave a half over the
+    # ceiling (a very long utterance). Bounded by cue count to avoid runaway.
+    for _ in range(8):
+        out: List[Dict[str, Any]] = []
+        changed = False
+        for cue in cues:
+            if cue.get("type") != "dialogue" or _duration_ms(cue) <= max_dur:
+                out.append(cue)
+                continue
+            meta = cue.get("meta") or {}
+            text = meta.get("dialogue_text") or " ".join(cue.get("lines", []))
+            split = None
+            if _is_cjk(text):
+                # Reuse the CJK clause splitter but with a permissive CPS ceiling
+                # (we're splitting for DURATION here, not CPS) so it always
+                # accepts a clause-boundary halving when room exists.
+                split = _split_cjk_cue(cue, max_cps=10_000, min_display=min_display,
+                                       min_gap=min_gap, max_chars=max_chars, max_lines=max_lines)
+            else:
+                words = _cue_words(cue)
+                if len(words) >= 2:
+                    i = _best_split_index(words)
+                    lw, rw = words[:i], words[i:]
+                    start, end = int(cue["start_ms"]), int(cue["end_ms"])
+                    span = max(2, end - start)
+                    cut = start + (span * len(lw)) // len(words)
+                    le = min(cut - (min_gap // 2), end - min_display)
+                    rs = max(cut + (min_gap // 2), start + min_display)
+                    if le - start >= min_display and end - rs >= min_display:
+                        lt, rt = " ".join(lw), " ".join(rw)
+                        runs = _primary_runs(cue)
+                        split = [
+                            {"idx": 0, "start_ms": start, "end_ms": int(le), "type": "dialogue",
+                             "lines": render_lines(lw, runs, max_lines, max_chars, lt),
+                             "meta": {"dialogue_text": lt, "runs": runs, "duration_split": True}},
+                            {"idx": 0, "start_ms": int(rs), "end_ms": end, "type": "dialogue",
+                             "lines": render_lines(rw, runs, max_lines, max_chars, rt),
+                             "meta": {"dialogue_text": rt, "runs": runs, "duration_split": True}},
+                        ]
+            if split:
+                out.extend(split)
+                changed = True
+            else:
+                out.append(cue)
+        cues = out
+        if not changed:
+            break
+    return cues
+
+
 # ─── Master pass ─────────────────────────────────────────────────────
 def enforce_cps_rules(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Apply the deterministic CPS drivers in priority order:
+    """Apply the deterministic drivers in priority order:
+      0. split cues exceeding max_display_ms at a clause boundary (duration),
       1. extend over-fast cues into idle gap (free),
-      2. split the still-over-fast cues at a clause boundary,
+      2. split the still-over-fast cues at a clause boundary (CPS),
       3. trim over-slow lingering cues.
     Then re-index. Anything still out of budget after this is a genuine
     editorial decision the QC gate (Phase 3) surfaces — the engine has done
     every deterministic thing it safely can."""
+    cues = split_overlong_cues(cues)
     cues = extend_fast_cues(cues)
     cues = split_fast_cues(cues)
     cues = trim_slow_cues(cues)
