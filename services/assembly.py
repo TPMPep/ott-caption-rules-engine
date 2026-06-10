@@ -70,14 +70,43 @@ def _transcription_prompt() -> Optional[str]:
 
 
 def submit_transcription_job(media_url: str, speaker_labels: bool = True,
-                             language_detection: bool = True) -> str:
+                             language_detection: bool = True,
+                             language_code: Optional[str] = None) -> str:
+    """Submit a media URL to AssemblyAI for transcription.
+
+    OPERATOR-CONFIRMED LANGUAGE (2026-06-09):
+      When `language_code` is a non-empty, non-"auto" ISO-639-1 code (e.g.
+      "ja", "no", "es"), the captioner has CONFIRMED the source language in the
+      CC preflight modal. AssemblyAI requires that a pinned `language_code` and
+      `language_detection` are MUTUALLY EXCLUSIVE — you cannot pin a language
+      and also ask AAI to detect one. So when a code is pinned we set
+      `language_code` and FORCE `language_detection` OFF, regardless of what the
+      caller passed. The Base44 dispatch layer already sends
+      language_detection=false in this case; forcing it here is defense in depth
+      so a stray true can never reach AAI alongside a pinned code.
+
+      When `language_code` is None/"auto", behaviour is unchanged: AAI
+      auto-detects under the `language_detection` flag (the operator's explicit
+      auto opt-out). SOC 2 CC8.1 — the source language AAI uses is the
+      attributed operator decision, never a silent re-detect.
+    """
+    pinned = (language_code or "").strip().lower()
+    if pinned in ("", "auto"):
+        pinned = None
+
     payload: Dict[str, Any] = {
         "audio_url": media_url,
         "speech_models": ["universal-3-pro", "universal-2"],
         "speaker_labels": speaker_labels,
         "format_text": True,
-        "language_detection": language_detection,
     }
+    if pinned:
+        # Pinned language is authoritative — detection OFF (AAI rejects both).
+        payload["language_code"] = pinned
+        payload["language_detection"] = False
+    else:
+        payload["language_detection"] = language_detection
+
     prompt = _transcription_prompt()
     if prompt:
         payload["prompt"] = prompt
