@@ -49,6 +49,25 @@ except Exception:  # pragma: no cover — defensive for alternate import roots
     def render_lines(words, runs, max_lines=None, max_chars=None, dialogue_text=None):
         return [dialogue_text if dialogue_text is not None else " ".join(words)]
 
+# CJK awareness — character-based measurement + splitting for no-space scripts.
+try:
+    from .cjk import is_cjk_text as _is_cjk, cjk_char_count as _cjk_count, CJK_CLAUSE_ENDERS, CJK_SENTENCE_ENDERS
+except Exception:  # pragma: no cover
+    def _is_cjk(text):
+        return False
+
+    def _cjk_count(text):
+        return len((text or "").replace(" ", ""))
+
+    CJK_CLAUSE_ENDERS = ("、", "，", "；", "：")
+    CJK_SENTENCE_ENDERS = ("。", "！", "？")
+
+
+def _measurement() -> str:
+    """The spec's cps_measurement: 'characters' | 'words' | 'characters_no_spaces'.
+    Sent from the spec via CPS_MEASUREMENT. Drives how _visible_chars counts."""
+    return (os.getenv("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
+
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
 def _env_int(name: str, default: int) -> int:
@@ -99,10 +118,20 @@ _SENTENCE_END = (".", "!", "?")
 
 
 def _visible_chars(cue: Dict[str, Any]) -> int:
-    """Character count actually on screen (joined lines, single-spaced, no \\n).
-    This is what the viewer reads, so it is what CPS must be measured against."""
-    text = " ".join(cue.get("lines", []))
-    return len(text.replace("\n", " ").strip())
+    """Character count actually on screen, measured per the spec's
+    CPS_MEASUREMENT. CJK always counts by character (no spaces). For Latin,
+    'characters' = total incl. spaces (industry default), 'characters_no_spaces'
+    drops spaces, 'words' counts whitespace tokens. This is what CPS is measured
+    against, so it must match the spec the deliverable is graded against."""
+    text = " ".join(cue.get("lines", [])).replace("\n", " ").strip()
+    if _is_cjk(text):
+        return _cjk_count(text)
+    mode = _measurement()
+    if mode == "characters_no_spaces":
+        return len(text.replace(" ", ""))
+    if mode == "words":
+        return len(text.split())
+    return len(text)
 
 
 def _duration_ms(cue: Dict[str, Any]) -> int:
@@ -191,6 +220,69 @@ def _best_split_index(words: List[str]) -> int:
     return max(1, mid)
 
 
+def _best_cjk_split_index(s: str) -> int:
+    """Pick a split point for a CJK string near the MIDDLE, preferring the
+    clause/sentence boundary (、。！？) closest to the middle. Returns a char
+    index in 1..len(s)-1; falls back to the exact middle when no boundary."""
+    n = len(s)
+    mid = n // 2
+    best = None
+    best_dist = n + 1
+    for i in range(n - 1):
+        if s[i] in CJK_CLAUSE_ENDERS or s[i] in CJK_SENTENCE_ENDERS:
+            idx = i + 1
+            if idx <= 0 or idx >= n:
+                continue
+            dist = abs(idx - mid)
+            if dist < best_dist:
+                best_dist = dist
+                best = idx
+    return best if best is not None else max(1, mid)
+
+
+def _split_cjk_cue(cue, max_cps, min_display, min_gap, max_chars, max_lines):
+    """Split an over-fast CJK dialogue cue into two cues at the nearest clause
+    boundary, interpolating timings by character count. Returns [left, right]
+    only when BOTH halves end up ≤ max_cps and ≥ min_display — otherwise None
+    (leave intact for the QC gate; never ship a worse state). Mirrors the Latin
+    split_fast_cues acceptance contract exactly, by character instead of word."""
+    meta = cue.get("meta") or {}
+    text = (meta.get("dialogue_text") or " ".join(cue.get("lines", []))).strip()
+    if len(text) < 2:
+        return None
+    split_i = _best_cjk_split_index(text)
+    left_text = text[:split_i].strip()
+    right_text = text[split_i:].strip()
+    if not left_text or not right_text:
+        return None
+
+    start = int(cue["start_ms"])
+    end = int(cue["end_ms"])
+    span = max(2, end - start)
+    cut = start + (span * len(left_text)) // max(1, len(text))
+    left_end = min(cut - (min_gap // 2), end - min_display)
+    right_start = max(cut + (min_gap // 2), start + min_display)
+    if left_end - start < min_display or end - right_start < min_display:
+        return None
+
+    runs = _primary_runs(cue)
+    left_cue = {
+        "idx": 0, "start_ms": start, "end_ms": int(left_end),
+        "lines": render_lines(left_text.split(), runs, max_lines, max_chars, left_text),
+        "type": "dialogue",
+        "meta": {"dialogue_text": left_text, "runs": runs, "cps_split": True},
+    }
+    right_cue = {
+        "idx": 0, "start_ms": int(right_start), "end_ms": end,
+        "lines": render_lines(right_text.split(), runs, max_lines, max_chars, right_text),
+        "type": "dialogue",
+        "meta": {"dialogue_text": right_text, "runs": runs, "cps_split": True},
+    }
+    if cue_cps(left_cue) <= max_cps and cue_cps(right_cue) <= max_cps:
+        return [left_cue, right_cue]
+    return None
+
+
 def split_fast_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """For dialogue cues STILL over max_cps after extension, split into two cues
     at the best clause boundary. Each half is re-rendered through the shared
@@ -208,6 +300,18 @@ def split_fast_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for cue in cues:
         if cue.get("type") != "dialogue" or cue_cps(cue) <= max_cps:
             out.append(cue)
+            continue
+
+        # CJK over-fast cues split by CHARACTER at 、。 boundaries — the
+        # space-word splitter below can't break a no-space Japanese string.
+        meta = cue.get("meta") or {}
+        cjk_text = meta.get("dialogue_text") or " ".join(cue.get("lines", []))
+        if _is_cjk(cjk_text):
+            split = _split_cjk_cue(cue, max_cps, min_display, min_gap, max_chars, max_lines)
+            if split:
+                out.extend(split)
+            else:
+                out.append(cue)
             continue
 
         words = _cue_words(cue)
