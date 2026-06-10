@@ -664,6 +664,23 @@ def process_caption_job(
     print(f"[FORMATTER] Initial cues built: {cues_in_count} "
           f"(native audio_events in: {len(audio_events or [])})")
 
+    # 5b. CAPTION SHAPING (universal, spec-driven "caption rhythm" stage).
+    # Splits over-rhythm dialogue cues toward the spec's TARGET duration at
+    # natural phrase boundaries (clause/sentence), using real word timings when
+    # present and interpolation as fallback. This is the professional layer that
+    # turns raw-utterance cues into broadcast-rhythm cues BEFORE editorial/CPS/
+    # readability run — the stage the engine was missing. Script-aware via the
+    # shared CJK helpers; identical pipeline for every language. Disabled per
+    # spec via CUSTOM_SHAPING_ENABLED=0 (1:1 import posture). SOC 2 CC8.1.
+    try:
+        from .shaping import shape_caption_rhythm
+        before_shape = len(cues)
+        cues = shape_caption_rhythm(cues)
+        print(f"[FORMATTER] After caption shaping: {len(cues)} cues "
+              f"(was {before_shape})")
+    except Exception as _e:
+        print(f"[FORMATTER] caption shaping skipped (non-fatal): {_e}")
+
     # 6. Editorial AI — pass the heartbeat through so each cue's OpenAI
     # call can pulse the job's updated_at timestamp. Closes the "engine
     # looks hung from outside even though it's still working" perception
@@ -887,6 +904,7 @@ def _build_dialogue_cues(
         if pack_words:
             cues.append(_finalize_dialogue_cue(
                 pack_words, pack_start, pack_end, pack_runs, max_lines, max_chars,
+                word_timings=_word_timings_in_window(tokens, pack_start, pack_end),
             ))
         pack_words = []
         pack_start = None
@@ -928,6 +946,7 @@ def _build_dialogue_cues(
                     cues.append(_finalize_dialogue_cue(
                         [c_str], int(c_start), int(max(c_end, c_start + 1)),
                         [{"speaker": g_speaker, "word_start": 0}], max_lines, max_chars,
+                        word_timings=_word_timings_in_window(tokens, int(c_start), int(max(c_end, c_start + 1))),
                     ))
             else:
                 chunk_list = _split_sentence_into_cue_chunks(g_words, max_chars, max_lines)
@@ -941,6 +960,7 @@ def _build_dialogue_cues(
                     cues.append(_finalize_dialogue_cue(
                         c_words, int(c_start), int(max(c_end, c_start + 1)),
                         [{"speaker": g_speaker, "word_start": 0}], max_lines, max_chars,
+                        word_timings=_word_timings_in_window(tokens, int(c_start), int(max(c_end, c_start + 1))),
                     ))
             continue
 
@@ -1075,6 +1095,28 @@ def _split_cjk_sentence_into_cue_chunks(
     return [c for c in chunks if c]
 
 
+def _word_timings_in_window(
+    tokens: List[Dict[str, Any]],
+    start_ms: int,
+    end_ms: int,
+) -> List[Dict[str, Any]]:
+    """Slice the per-word spoken tokens whose timing falls inside this cue's
+    [start_ms, end_ms] window. These real word timings are attached to the cue's
+    meta so the universal shaping stage can split at FRAME-FAITHFUL boundaries
+    (the enterprise-correct answer) instead of interpolating. Positional +
+    time-window match — no dependency on segmentation carrying timings through.
+    Returns [] when no tokens match (shaper then interpolates)."""
+    out = []
+    for t in tokens:
+        ts = int(t.get("start_ms", 0) or 0)
+        te = int(t.get("end_ms", ts) or ts)
+        # A token belongs to this cue when its midpoint sits in the window.
+        mid = (ts + te) // 2
+        if start_ms <= mid <= end_ms:
+            out.append({"text": t.get("text", ""), "start_ms": ts, "end_ms": te})
+    return out
+
+
 def _finalize_dialogue_cue(
     words: List[str],
     start_ms: int,
@@ -1082,6 +1124,7 @@ def _finalize_dialogue_cue(
     speaker_runs: List[Dict[str, Any]],
     max_lines: int,
     max_chars: int,
+    word_timings: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Wrap words into lines respecting max_chars and max_lines, then apply
     the deterministic speaker-render baseline (dash / off-camera labels).
@@ -1114,5 +1157,9 @@ def _finalize_dialogue_cue(
         "meta": {
             "dialogue_text": dialogue_text,
             "runs": speaker_runs,
+            # Real per-word timings for THIS cue's window (when available). The
+            # universal shaping stage prefers these for frame-faithful splits;
+            # empty list → shaper interpolates. SOC 2 CC8.1 — timing provenance.
+            "word_timings": word_timings or [],
         },
     }
