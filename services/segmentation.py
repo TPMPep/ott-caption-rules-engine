@@ -32,6 +32,12 @@ SOC 2 CC8.1 — identical input always yields identical sentence boundaries.
 import re
 from typing import Any, Dict, List, Optional
 
+# CJK awareness — the single source of truth for no-space-script handling.
+try:
+    from .cjk import is_cjk_text, CJK_SENTENCE_ENDERS
+except Exception:  # pragma: no cover — defensive for alternate import roots
+    from cjk import is_cjk_text, CJK_SENTENCE_ENDERS
+
 # ─── Canonical broadcast abbreviation set ────────────────────────────
 # Fixed, baked-in. A period immediately following any of these tokens is an
 # abbreviation period, NOT a sentence terminator. This is the standard set
@@ -87,6 +93,13 @@ def is_sentence_end(word: str, next_word: Optional[str] = None) -> bool:
     if not w:
         return False
 
+    # CJK sentence terminators (。！？) end a sentence with no abbreviation
+    # ambiguity — there is no "Mr." problem in Japanese. Check these FIRST so a
+    # Japanese token ending in 。 is always a sentence boundary even though it
+    # never matches the ASCII _SENTENCE_END_CHARS test below.
+    if w[-1] in ("。", "！", "？", "．"):
+        return True
+
     # Must end with a terminator at all.
     if not w.endswith(_SENTENCE_END_CHARS):
         return False
@@ -109,6 +122,43 @@ def is_sentence_end(word: str, next_word: Optional[str] = None) -> bool:
             return False
 
     return True
+
+
+def _explode_cjk_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Explode any CJK token carrying multiple 。-delimited sentences into one
+    sub-token per sentence, interpolating timings by character count over the
+    token's real window. Non-CJK tokens (and CJK tokens with ≤1 sentence) pass
+    through unchanged. This is what lets the existing per-token sentence-end
+    grouping produce one group per Japanese sentence instead of one giant group.
+    """
+    from .cjk import split_cjk_into_sentences  # local import (CI: no top-level cross-import drift)
+
+    out: List[Dict[str, Any]] = []
+    for token in tokens:
+        text = (token.get("text") or "").strip()
+        if not text or not is_cjk_text(text):
+            out.append(token)
+            continue
+        sentences = split_cjk_into_sentences(text)
+        if len(sentences) <= 1:
+            out.append(token)
+            continue
+        start = int(token.get("start_ms", 0) or 0)
+        end = int(token.get("end_ms", start) or start)
+        span = max(1, end - start)
+        total_chars = sum(len(s) for s in sentences) or 1
+        cursor = 0
+        for s in sentences:
+            s_start = start + (span * cursor) // total_chars
+            cursor += len(s)
+            s_end = start + (span * cursor) // total_chars
+            out.append({
+                "text": s,
+                "start_ms": int(s_start),
+                "end_ms": int(max(s_end, s_start + 1)),
+                "speaker": token.get("speaker"),
+            })
+    return out
 
 
 def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -137,6 +187,18 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
     structure so the renderer contract is unchanged and a future "merge tiny
     adjacent speakers" rule can populate it.
     """
+    # CJK PRE-SPLIT: Scribe/AAI emit Japanese as a few enormous tokens, each
+    # carrying many 。-delimited sentences with no spaces. The Latin grouping
+    # loop below keys off per-token sentence-end detection, so a single mega-
+    # token would collapse the whole utterance into ONE group (the 66-mega-cue
+    # bug). We first explode any CJK token into sentence-level sub-tokens, with
+    # timings interpolated proportionally to character count over the token's
+    # real [start_ms, end_ms]. Each sub-token then ends in 。！？ so the existing
+    # sentence-end logic opens a new group per sentence — exactly the behaviour
+    # the Latin path already has. Non-CJK tokens pass through untouched, so the
+    # English path is byte-identical. SOC 2 CC8.1 — deterministic, reproducible.
+    tokens = _explode_cjk_tokens(tokens)
+
     groups: List[Dict[str, Any]] = []
     cur_words: List[str] = []
     cur_start: Optional[int] = None
