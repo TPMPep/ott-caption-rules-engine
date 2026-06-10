@@ -11,6 +11,17 @@ import os
 import re
 from typing import Dict, List
 
+# CJK awareness — character-based measurement so Japanese/Chinese/Korean cues
+# are graded by the same character rule the engine enforced.
+try:
+    from .cjk import is_cjk_text as _is_cjk, cjk_char_count as _cjk_count
+except Exception:  # pragma: no cover — defensive for alternate import roots
+    def _is_cjk(text):
+        return False
+
+    def _cjk_count(text):
+        return len((text or "").replace(" ", ""))
+
 FUNCTION_WORDS = {
     "a", "an", "the", "of", "to", "and", "or", "but",
     "with", "from", "in", "on", "at", "for", "that",
@@ -60,9 +71,23 @@ def _min_cps() -> int:
     return _env_int("CUSTOM_MIN_CPS", 5)
 
 
+def _measurement() -> str:
+    return (os.getenv("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
+
+
 def _visible_chars(cue: Dict) -> int:
-    text = " ".join(cue.get("lines", []))
-    return len(text.replace("\n", " ").strip())
+    """On-screen character count, measured per the spec's CPS_MEASUREMENT so
+    the QC grade matches exactly what cps.py enforced. CJK always counts by
+    character (no spaces). SOC 2 CC8.1 — QC verdict mirrors the applied rule."""
+    text = " ".join(cue.get("lines", [])).replace("\n", " ").strip()
+    if _is_cjk(text):
+        return _cjk_count(text)
+    mode = _measurement()
+    if mode == "characters_no_spaces":
+        return len(text.replace(" ", ""))
+    if mode == "words":
+        return len(text.split())
+    return len(text)
 
 
 def _cue_cps(cue: Dict) -> float:
