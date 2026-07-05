@@ -692,6 +692,25 @@ def process_caption_job(
     cues = apply_readability_rules(cues)
     print(f"[FORMATTER] After readability: {len(cues)} cues")
 
+    # 7b. CONDENSATION — the "captions aren't transcripts" editorial stage.
+    # Runs AFTER the deterministic CPS extend/split (applied inside readability)
+    # and BEFORE the QC gate, so it fires ONLY on cues STILL over max_cps that
+    # timing alone couldn't rescue. Spec-gated via CONDENSATION_MODE:
+    #   off             → no-op (verbatim-required specs)
+    #   disfluency_only → deterministic filler/repeat removal (default, no AI)
+    #   condense_to_cps → + bounded, entity/number-locked LLM paraphrase
+    # Every changed cue is stamped meta.condensation={applied,kind,verbatim} so
+    # the Base44 ingester writes CaptionCue.original_verbatim_text + provenance
+    # and the editor can show a "Condensed — verify" chip with one-click revert.
+    # SOC 2 CC8.1 — words are never silently reworded; every change is attributed.
+    try:
+        from .condensation import condense_cues
+        before_condense = len(cues)
+        cues = condense_cues(cues, heartbeat=heartbeat)
+        print(f"[FORMATTER] After condensation: {len(cues)} cues (was {before_condense})")
+    except Exception as _e:
+        print(f"[FORMATTER] condensation skipped (non-fatal): {_e}")
+
     # 8. Timecode offset (UPDATED)
     cues = _apply_timecode_offset(cues)
 
