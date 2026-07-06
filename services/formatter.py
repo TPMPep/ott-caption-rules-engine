@@ -945,6 +945,13 @@ def _build_dialogue_cues(
         # across multiple cues. CJK splits by character at 、。 clause boundaries
         # (kinsoku-aware); Latin splits at clause boundaries by word. Both
         # interpolate timings proportionally over the group's real window.
+        #
+        # NOTE on label-aware fit: this is the COARSE body-only first pass. The
+        # authoritative delivered-fit (speaker-label-inclusive) enforcement is the
+        # caption-shaping stage (services.shaping), which runs immediately after
+        # this and owns the ONE shared cue_fits_delivered primitive plus clause-
+        # AND word-phrase splitting with a fixed-point loop. Keeping ONE owner for
+        # label-aware splitting avoids two stages half-solving it and drifting.
         if g_len > budget:
             _flush_pack()
             g_start = group["start_ms"]
