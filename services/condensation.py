@@ -66,9 +66,15 @@ except Exception:  # pragma: no cover
         return len((text or "").replace(" ", ""))
 
 try:
-    from .rendering import render_lines as _render_lines
+    from .rendering import (
+        render_lines as _render_lines,
+        merge_cue_meta as _merge_cue_meta,
+        cue_fits_delivered as _cue_fits_delivered,
+    )
 except Exception:
     _render_lines = None
+    _merge_cue_meta = None
+    _cue_fits_delivered = None
 
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
@@ -312,6 +318,140 @@ def _llm_condense_cue(client, model, system_prompt, verbatim: str, target_chars:
     return condensed
 
 
+# ─── Merge-then-condense for sentence-continuation slivers ──────────
+# THE PROFESSIONAL FIX for fast speech with no gaps. When rapid dialogue is
+# split at a clause boundary (shaping / CPS split), and the audio leaves no
+# idle gap to extend into, the result is two over-CPS fragments of ONE
+# sentence — e.g. 'Keep playing this,' (0.7s, 24.6cps) + 'You might make the
+# girls' field hockey team.' (1.5s, 29cps). No split can fix that: splitting
+# only redistributes a fixed time window. What a broadcast captioner actually
+# does is the REVERSE: merge the fragments back into one cue spanning the full
+# window, then CONDENSE the words to fit the reading budget of that window.
+# This pass does exactly that, and ONLY under mode='condense_to_cps' (the
+# posture that authorizes rewording).
+#
+# Merge eligibility (all must hold — deterministic, auditor-reproducible):
+#   • both cues are dialogue, same (non-null) speaker,
+#   • at least one of the pair is over max_cps,
+#   • the LEFT cue does NOT end a sentence (quote-aware) — they are provably
+#     fragments of one sentence, never two distinct utterances,
+#   • near-contiguous audio (gap ≤ CONDENSATION_MERGE_MAX_GAP_MS, default 500),
+#   • merged window ≤ max_display_ms,
+#   • Latin script only (merge_cue_meta is word-based; CJK handled upstream).
+#
+# ACCEPTANCE — never ship a worse state: the merged text is condensed
+# (deterministic disfluency + bounded LLM paraphrase against the merged
+# window's char budget) and the merge is kept ONLY if the final cue passes
+# BOTH max_cps AND the delivered-geometry fit (label included, via the shared
+# cue_fits_delivered primitive). Otherwise the original two cues are kept
+# untouched and fall through to the normal per-cue loop. Provenance: the
+# merged cue's meta.condensation.verbatim holds the JOINED raw originals, so
+# one-click revert restores the full verbatim sentence. SOC 2 CC8.1 /
+# FCC §79.1 — a words-changing merge is attributed, reversible, and gated on
+# the spec/project posture, never silent.
+_MC_TERMINALS = (".", "!", "?", "…", "。", "！", "？")
+_MC_TRAILING_CLOSERS = "\"'»”’)]}"
+
+
+def _mc_ends_sentence(text: str) -> bool:
+    t = (text or "").strip().rstrip(_MC_TRAILING_CLOSERS)
+    return bool(t) and t.endswith(_MC_TERMINALS)
+
+
+def _mc_primary_speaker(cue: Dict[str, Any]):
+    for run in ((cue.get("meta") or {}).get("runs") or []):
+        if run.get("speaker") is not None:
+            return run.get("speaker")
+    return None
+
+
+def _merge_condense_continuations(cues, client, model, system_prompt):
+    """Merge over-CPS same-speaker sentence-continuation pairs and condense the
+    merged text to the merged window's budget. Returns (cues, merged_count).
+    Pure over inputs except the bounded LLM call; every acceptance is verified
+    against max_cps + delivered geometry before the originals are replaced."""
+    if _merge_cue_meta is None or _render_lines is None:
+        return cues, 0
+    max_cps = _max_cps()
+    max_lines = _max_lines()
+    max_chars = _max_chars()
+    max_dur = _env_int("CUSTOM_MAX_DISPLAY_MS", 7000)
+    max_gap = _env_int("CONDENSATION_MERGE_MAX_GAP_MS", 500)
+
+    out: List[Dict[str, Any]] = []
+    merged_count = 0
+    i = 0
+    while i < len(cues):
+        cue = cues[i]
+        nxt = cues[i + 1] if i + 1 < len(cues) else None
+        left_text = _cue_dialogue_text(cue).strip()
+        eligible = (
+            nxt is not None
+            and cue.get("type") == "dialogue"
+            and nxt.get("type") == "dialogue"
+            and left_text
+            and not _is_cjk(left_text)
+            and not _mc_ends_sentence(left_text)
+            and _mc_primary_speaker(cue) is not None
+            and _mc_primary_speaker(cue) == _mc_primary_speaker(nxt)
+            and (_cue_cps(cue, left_text) > max_cps
+                 or _cue_cps(nxt, _cue_dialogue_text(nxt)) > max_cps)
+            and int(nxt.get("start_ms", 0)) - int(cue.get("end_ms", 0)) <= max_gap
+            and int(nxt.get("end_ms", 0)) - int(cue.get("start_ms", 0)) <= max_dur
+        )
+        if not eligible:
+            out.append(cue)
+            i += 1
+            continue
+
+        merged_meta = _merge_cue_meta(cue, nxt)
+        verbatim_joined = merged_meta["dialogue_text"]
+        candidate = {
+            "idx": 0,
+            "start_ms": int(cue["start_ms"]),
+            "end_ms": int(nxt["end_ms"]),
+            "type": "dialogue",
+            "lines": [],
+            "meta": {"dialogue_text": verbatim_joined, "runs": merged_meta["runs"]},
+        }
+
+        # Condense the MERGED text against the MERGED window's budget.
+        working = remove_disfluencies(verbatim_joined)
+        if client is not None and _cue_cps(candidate, working) > max_cps:
+            dur_s = max(0.001, (candidate["end_ms"] - candidate["start_ms"]) / 1000.0)
+            target_chars = int(max_cps * dur_s)
+            condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
+            if condensed:
+                working = condensed
+
+        _, body = _strip_leading_label(working)
+        candidate["meta"]["dialogue_text"] = working
+        candidate["lines"] = _render_lines(
+            body.split(), merged_meta["runs"], max_lines, max_chars, body
+        )
+        fits_geometry = (
+            _cue_fits_delivered(candidate, max_lines, max_chars)
+            if _cue_fits_delivered is not None else True
+        )
+        if _cue_cps(candidate, working) <= max_cps and fits_geometry:
+            if working != verbatim_joined:
+                candidate["meta"]["condensation"] = {
+                    "applied": True,
+                    "kind": "condense" if client is not None else "disfluency",
+                    "verbatim": verbatim_joined,
+                }
+            candidate["meta"]["continuation_merge"] = True
+            out.append(candidate)
+            merged_count += 1
+            i += 2
+            continue
+
+        # Merge couldn't be made compliant — keep the originals untouched.
+        out.append(cue)
+        i += 1
+    return out, merged_count
+
+
 # ─── Master pass ─────────────────────────────────────────────────────
 def condense_cues(
     cues: List[Dict[str, Any]],
@@ -355,6 +495,21 @@ def condense_cues(
             # No key / SDK → degrade to deterministic-only, but DON'T silently
             # claim condense_to_cps ran. The disfluency pass below still applies.
             use_llm = False
+
+    # ── Merge-then-condense pre-pass (condense_to_cps only) ──────────
+    # Fixes the no-gap fast-speech case where splitting produced over-CPS
+    # sentence fragments: merge same-speaker continuations back into one cue
+    # spanning the full window, condense to that window's budget, and accept
+    # only a fully-compliant result. Runs BEFORE the per-cue loop so anything
+    # it can't fix falls through to normal per-cue condensation.
+    merged_pairs = 0
+    if mode == "condense_to_cps":
+        cues, merged_pairs = _merge_condense_continuations(
+            cues, client if use_llm else None, model, system_prompt
+        )
+        if merged_pairs:
+            for i2, c2 in enumerate(cues):
+                c2["idx"] = i2 + 1
 
     run_budget_seconds = _env_int("CONDENSATION_RUN_BUDGET_SECONDS", 120)
     heartbeat_every = _env_int("CONDENSATION_HEARTBEAT_EVERY", 25)
@@ -450,7 +605,8 @@ def condense_cues(
             stats["still_over"] += 1
 
     print(
-        f"[CONDENSATION] mode={mode} disfluency={stats['disfluency']} "
+        f"[CONDENSATION] mode={mode} merged_pairs={merged_pairs} "
+        f"disfluency={stats['disfluency']} "
         f"llm={stats['llm']} llm_rejected={stats['llm_rejected']} "
         f"still_over_after={stats['still_over']} "
         f"llm_budget_exhausted={llm_budget_exhausted}"
