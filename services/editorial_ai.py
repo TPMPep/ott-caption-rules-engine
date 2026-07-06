@@ -170,76 +170,41 @@ def editorial_refine_cues(
     speaker_mode = _speaker_label_mode()
     system_prompt = _build_system_prompt(max_lines, max_chars, speaker_mode)
 
-    refined: List[Dict[str, Any]] = []
+    # ── Parallel fan-out (engine 5.22.0) ─────────────────────────────────
+    # The polish pass was previously ONE OpenAI call per cue, SERIALLY —
+    # ~1.5s × N cues, so the 120s run budget covered only ~80 cues of a
+    # 1000-cue feature and the rest shipped unpolished. Every cue's payload
+    # reads only the ORIGINAL neighbor texts (never another cue's polished
+    # result), so the calls are fully independent and now fan out through a
+    # bounded thread pool. Same budgets, same fidelity guards, deterministic
+    # assembly by index — just N-way concurrent. SOC 2 CC8.1: outcome per
+    # cue is identical to the serial pass; only wall-clock changes.
+    concurrency = _env_int("EDITORIAL_AI_CONCURRENCY", 8)
     total = len(cues)
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-    # Telemetry — printed once at the end so an operator scanning Railway
-    # logs can answer "did AI actually polish anything?" without grepping.
     stats = {
         "dialogue_attempted": 0,
         "ai_applied": 0,
         "ai_rejected_word_drift": 0,
         "ai_rejected_overflow": 0,
-        "ai_rejected_dash_rule": 0,
         "ai_error_timeout": 0,
         "ai_error_other": 0,
         "skipped_run_budget": 0,
         "skipped_error_rate_bailout": 0,
     }
 
-    start_time = time.monotonic()
-    bailed_out = False
-
+    # Build every cue's payload up front (serial, cheap, reads originals only).
+    jobs = []  # (idx, cue, dialogue_text, runs, payload)
     for idx, cue in enumerate(cues):
-        # Heartbeat — let the caller bump JOBS[job_id].updated_at so the
-        # Base44 poller's freshness watchdog stays honest even on long runs.
-        if heartbeat and idx > 0 and idx % heartbeat_every == 0:
-            try:
-                heartbeat(idx, total)
-            except Exception:
-                pass  # heartbeat is best-effort; never block the formatter
-
         if cue.get("type") != "dialogue":
-            refined.append(cue)
             continue
-
-        # Once any resilience budget trips, we stop calling the AI but
-        # KEEP appending the original cues. Output length is preserved
-        # exactly so downstream stages (readability, QC, export) cannot
-        # tell the difference. SOC 2 CC8.1: graceful degradation.
-        if bailed_out:
-            refined.append(cue)
-            continue
-
-        # Run-wall-clock budget. The rules engine already produced spec-
-        # correct output; further AI polish is not worth blocking delivery.
-        if time.monotonic() - start_time > run_budget_seconds:
-            stats["skipped_run_budget"] += (total - idx)
-            bailed_out = True
-            refined.append(cue)
-            continue
-
-        # Error-rate bailout. If OpenAI is having a bad day (>20% error
-        # rate after at least 25 attempts), keep the rest as-is. Catches
-        # the partial-outage case where some calls succeed but most don't.
-        attempted = stats["dialogue_attempted"]
-        errored = stats["ai_error_timeout"] + stats["ai_error_other"]
-        if attempted >= min_attempts_before_bailout:
-            error_pct = (errored * 100) // max(1, attempted)
-            if error_pct >= error_rate_bailout_pct:
-                stats["skipped_error_rate_bailout"] += (total - idx)
-                bailed_out = True
-                refined.append(cue)
-                continue
-
         runs = cue.get("meta", {}).get("runs", [])
         dialogue_text = cue.get("meta", {}).get(
             "dialogue_text", " ".join(cue.get("lines", []))
         ).strip()
         if not dialogue_text:
-            refined.append(cue)
             continue
-
         prev_text = ""
         next_text = ""
         if idx > 0 and cues[idx - 1].get("type") == "dialogue":
@@ -250,9 +215,6 @@ def editorial_refine_cues(
             next_text = cues[idx + 1].get("meta", {}).get(
                 "dialogue_text", " ".join(cues[idx + 1].get("lines", []))
             ).strip()
-
-        two_speaker_rule = speaker_mode == "dash"
-
         payload = {
             "dialogue_text": dialogue_text,
             "current_lines": cue.get("lines", []),
@@ -264,19 +226,22 @@ def editorial_refine_cues(
                 "max_lines": max_lines,
                 "max_chars_per_line": max_chars,
                 "speaker_mode": speaker_mode,
-                "two_speaker_lines_must_start_with_dash": two_speaker_rule,
+                "two_speaker_lines_must_start_with_dash": speaker_mode == "dash",
                 "preserve_words_exactly": True,
                 "fix_punctuation_and_capitalization_only": True,
                 "prefer_phrase_and_punctuation_boundaries": True,
                 "avoid_weak_function_word_line_endings": True,
             },
         }
+        jobs.append((idx, cue, dialogue_text, runs, payload))
 
-        stats["dialogue_attempted"] += 1
-
+    def _polish_one(idx, cue, dialogue_text, runs, payload):
+        """One cue's full polish → (idx, outcome, new_cue|None). Pure over its
+        inputs; validation + deterministic re-render happen in-worker so the
+        harvest loop only aggregates. Thread-safe (OpenAI client is httpx-based)."""
         try:
             response = client.responses.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+                model=model_name,
                 temperature=0,
                 input=[
                     {"role": "system", "content": system_prompt},
@@ -287,40 +252,20 @@ def editorial_refine_cues(
             data = json.loads(raw)
             ai_lines = [str(x).strip() for x in data.get("lines", []) if str(x).strip()]
         except APITimeoutError:
-            # Single slow call ≠ stuck run. Keep original; move on.
-            stats["ai_error_timeout"] += 1
-            refined.append(cue)
-            continue
+            return idx, "timeout", None
         except Exception:
-            stats["ai_error_other"] += 1
-            refined.append(cue)
-            continue
+            return idx, "error", None
 
         ai_lines = _normalize_lines(ai_lines)
         if not ai_lines:
-            refined.append(cue)
-            continue
-
-        # Strip ANY speaker label the AI emitted (dash, bracket, 'A:', 'NAME:')
-        # before the fidelity check — the label is NOT dialogue and must not be
-        # graded as word content. The deterministic renderer re-applies it below.
+            return idx, "noop", None
+        # Strip ANY speaker label the AI emitted before the fidelity check —
+        # the label is NOT dialogue; the deterministic renderer re-applies it.
         ai_text_lines = [_strip_leading_label(l) for l in ai_lines]
-
-        original_words = _word_fingerprint(dialogue_text)
-        ai_words = _word_fingerprint(" ".join(ai_text_lines))
-        if original_words != ai_words:
-            stats["ai_rejected_word_drift"] += 1
-            refined.append(cue)
-            continue
-
-        # ── Re-apply the speaker label/dash DETERMINISTICALLY ────────────────
-        # The AI is trusted ONLY for punctuation / capitalisation / line breaks
-        # of the spoken text. The speaker label is a hard invariant owned by the
-        # renderer (single source of truth), so we re-render the AI's polished
-        # text through render_lines with the cue's speaker runs. This guarantees
-        # the bracket tag ('[SPEAKER C:]') or dash is present in EVERY mode —
-        # the AI can never silently drop it (the production defect). When the
-        # renderer is unavailable we fall back to the AI lines as-is.
+        if _word_fingerprint(dialogue_text) != _word_fingerprint(" ".join(ai_text_lines)):
+            return idx, "word_drift", None
+        # Re-apply the speaker label/dash DETERMINISTICALLY via render_lines
+        # (single source of truth) — the AI can never drop or mangle it.
         if _render_lines is not None:
             polished_text = " ".join(ai_text_lines).strip()
             final_lines = _render_lines(
@@ -328,20 +273,69 @@ def editorial_refine_cues(
             )
         else:
             final_lines = ai_lines
-
-        if len(final_lines) > max_lines or any(_visible_len(line) > max_chars for line in final_lines):
-            stats["ai_rejected_overflow"] += 1
-            refined.append(cue)
-            continue
-
+        if len(final_lines) > max_lines or any(_visible_len(l) > max_chars for l in final_lines):
+            return idx, "overflow", None
         new_cue = dict(cue)
         new_cue["lines"] = final_lines
-        stats["ai_applied"] += 1
-        refined.append(new_cue)
+        return idx, "applied", new_cue
+
+    results: Dict[int, Dict[str, Any]] = {}
+    bailed_out = False
+    start_time = time.monotonic()
+    completed = 0
+
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_polish_one, *job): job[0] for job in jobs}
+            for fut in as_completed(futures):
+                completed += 1
+                if heartbeat and completed % heartbeat_every == 0:
+                    try:
+                        heartbeat(completed, len(jobs))
+                    except Exception:
+                        pass  # heartbeat is best-effort; never block
+                stats["dialogue_attempted"] += 1
+                try:
+                    idx, outcome, new_cue = fut.result()
+                except Exception:
+                    idx, outcome, new_cue = -1, "error", None
+                if outcome == "applied" and new_cue is not None:
+                    results[idx] = new_cue
+                    stats["ai_applied"] += 1
+                elif outcome == "timeout":
+                    stats["ai_error_timeout"] += 1
+                elif outcome == "error":
+                    stats["ai_error_other"] += 1
+                elif outcome == "word_drift":
+                    stats["ai_rejected_word_drift"] += 1
+                elif outcome == "overflow":
+                    stats["ai_rejected_overflow"] += 1
+
+                # Error-rate bailout — unchanged semantics, parallel-safe:
+                # if the provider is having a bad day, cancel what hasn't
+                # started and ship rules-engine output for the remainder.
+                errored = stats["ai_error_timeout"] + stats["ai_error_other"]
+                if completed >= min_attempts_before_bailout and \
+                        (errored * 100) // max(1, completed) >= error_rate_bailout_pct:
+                    stats["skipped_error_rate_bailout"] = len(jobs) - completed
+                    bailed_out = True
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                # Run wall-clock budget — unchanged.
+                if time.monotonic() - start_time > run_budget_seconds:
+                    stats["skipped_run_budget"] = len(jobs) - completed
+                    bailed_out = True
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+
+    # Deterministic assembly: AI-improved where accepted, original otherwise.
+    # Length always equals len(cues) — no cue is ever dropped.
+    refined = [results.get(i, cue) for i, cue in enumerate(cues)]
 
     elapsed_s = round(time.monotonic() - start_time, 1)
     print(
-        f"[EDITORIAL_AI] elapsed={elapsed_s}s "
+        f"[EDITORIAL_AI] elapsed={elapsed_s}s concurrency={concurrency} "
         f"applied={stats['ai_applied']}/{stats['dialogue_attempted']} "
         f"timeouts={stats['ai_error_timeout']} other_errors={stats['ai_error_other']} "
         f"bailed_out={bailed_out} "
