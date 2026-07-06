@@ -142,11 +142,20 @@ def _score_break(words: List[str], i: int, max_chars: int) -> Optional[float]:
     first_bare = _bare(first_word)
 
     if _preserve_clause():
-        # Reward breaking right AFTER clause/sentence punctuation.
-        if last_word.endswith(_CLAUSE_PUNCT):
-            score += 30.0
-        elif last_word.endswith(_SENTENCE_PUNCT):
-            score += 20.0
+        # Reward breaking right AFTER sentence/clause punctuation. A SENTENCE
+        # boundary (. ! ?) is the STRONGEST possible line ending — a complete
+        # grammatical unit — so it must outrank a mid-sentence CLAUSE boundary
+        # (, ; :). The previous ordering (clause 30 > sentence 20) inverted this
+        # and produced breaks like "Good work today," / "Hart. You've helped a
+        # lot." — orphaning "Hart." from its own sentence. Ending a line on a
+        # finished sentence and starting the next line with the next sentence is
+        # the professional-captioner default. Sentence 32 > clause 28 so a full
+        # stop always wins when both are feasible, but a lone clause break is
+        # still strongly preferred over a mid-phrase break.
+        if last_word.endswith(_SENTENCE_PUNCT):
+            score += 32.0
+        elif last_word.endswith(_CLAUSE_PUNCT):
+            score += 28.0
 
         # Reward line 2 LEADING with a conjunction/preposition/article — the
         # canonical "I went to the store / because I needed milk" fix.
