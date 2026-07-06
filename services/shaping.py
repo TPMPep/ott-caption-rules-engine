@@ -330,15 +330,68 @@ def _split_cue_once(cue: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     return [_mk(left_text, start, left_end), _mk(right_text, right_start, end)]
 
 
+def _rendered_lines_as_delivered(cue: Dict[str, Any]) -> List[str]:
+    """Render the cue EXACTLY as the deliverable will draw it — INCLUDING the
+    speaker label the spec's mode prepends. This is the single most important
+    correctness contract in the shaper: the stage that decides "does this fit?"
+    must ask the identical question the exported file answers.
+
+    Why not trust cue['lines']: the formatter stores a BODY-ONLY wrap on the cue
+    at build time; the label (e.g. '[SPEAKER B:] ', 13ch) is prepended later by
+    render_lines. So a 54ch body that wraps clean at 2×32 body-only becomes a
+    67ch labeled string that CANNOT fit 2×32 — and the greedy fallback ships a
+    38ch line that fails QC. Re-rendering here through the SAME render_lines the
+    formatter uses (with the cue's real speaker runs) makes the shaper measure
+    the label-inclusive line, so a labeled cue that overflows is split at a
+    phrase boundary until each labeled render fits. Falls back to the stored
+    lines only if render_lines is unavailable. SOC 2 CC8.1 / FCC §79.1 — the
+    delivered on-screen line never silently exceeds the per-line cap, label
+    included."""
+    words = _cue_words(cue)
+    runs = (cue.get("meta") or {}).get("runs") or []
+    dialogue_text = _cue_text(cue)
+    try:
+        return _render_lines(words, runs, _max_lines(), _max_chars(), dialogue_text)
+    except Exception:
+        return list(cue.get("lines") or [])
+
+
+def _wrap_overflows_cpl(cue: Dict[str, Any]) -> bool:
+    """True when the cue's LABEL-INCLUSIVE rendered lines exceed the spec's
+    max_chars_per_line — i.e. the deliverable's best wrap STILL leaves a line
+    over the CPL cap once the speaker label is on it. This catches two classes:
+      • the body-only overflow (cue 0030: 33ch body line against a 32 cap), and
+      • the LABEL-INDUCED overflow (cue 0002: a 54ch body that wraps clean
+        body-only, but '[SPEAKER B:] ' pushes the render to a 38ch line) — the
+        gap where the splitter's body-only budget disagreed with the renderer's
+        label-inclusive budget and shipped an over-wide line.
+    Splitting at a phrase boundary gives cues that each wrap within CPL WITH the
+    label. CJK counts by character (no spaces), Latin by raw length; both
+    compared to max_chars. Measured on the delivered render, not the stored
+    body-only lines."""
+    max_chars = _max_chars()
+    for line in _rendered_lines_as_delivered(cue):
+        s = str(line or "")
+        length = _cjk_count(s) if _is_cjk(s) else len(s)
+        if length > max_chars:
+            return True
+    return False
+
+
 def _needs_shaping(cue: Dict[str, Any], target_ms: int) -> bool:
-    """A dialogue cue needs rhythm-shaping when it runs noticeably longer than
-    the target reading rhythm. We use 1.5×target as the trigger so cues that are
-    only slightly over the target are left alone (splitting a 3.2s cue into two
-    1.6s cues adds churn for no readability gain); a 6s cue (2×target) clearly
-    reads better as two ~3s cues."""
+    """A dialogue cue needs rhythm-shaping when EITHER:
+      • it runs noticeably longer than the target reading rhythm (1.5×target, so
+        a slightly-over cue is left alone — splitting a 3.2s cue into two 1.6s
+        cues adds churn for no readability gain; a 6s cue clearly reads better as
+        two ~3s cues), OR
+      • its best 2-line wrap still overflows the spec's max_chars_per_line — a
+        genuine CPL violation the whole-cue budget check upstream missed. In this
+        case duration is irrelevant; the line simply doesn't fit and must be
+        split at a phrase boundary. SOC 2 CC8.1 / FCC §79.1 — the delivered line
+        never silently exceeds the spec's per-line cap."""
     if cue.get("type") != "dialogue":
         return False
-    return _cue_duration_ms(cue) > int(target_ms * 1.5)
+    return _cue_duration_ms(cue) > int(target_ms * 1.5) or _wrap_overflows_cpl(cue)
 
 
 # ─── Public entry ────────────────────────────────────────────────────
