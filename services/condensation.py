@@ -153,13 +153,16 @@ def _cue_cps(cue: Dict[str, Any], text: str) -> float:
 _FILLER_TOKENS = {
     # English
     "um", "uh", "erm", "er", "ah", "eh", "hmm", "mm", "mhm", "uh-huh", "huh",
-    "y'know", "ya", "like",  # 'like' handled contextually below (only mid-clause repeats)
+    "y'know", "like",  # 'like' handled contextually below (comma-bracketed only)
     # Spanish / Portuguese / Italian
     "eh", "este", "pues", "bueno",
     # French
     "euh", "ben", "bah",
     # German
-    "äh", "ähm", "also",
+    "äh", "ähm",
+    # NOTE: 'ya' (casual English 'you') and 'also' (common English adverb)
+    # were REMOVED — a language-blind always-drop list must never contain
+    # tokens that carry meaning in a major supported language.
 }
 # Multi-word filler phrases removed as a unit (case-insensitive, word-boundary).
 _FILLER_PHRASES = [
@@ -202,6 +205,7 @@ def remove_disfluencies(text: str) -> str:
     raw_tokens = body.split()
     out_tokens: List[str] = []
     prev_core = None
+    prev_raw = None
     for tok in raw_tokens:
         stripped = tok.strip(".,!?;:—–\"'")
         core = stripped.lower()
@@ -210,18 +214,28 @@ def remove_disfluencies(text: str) -> str:
         # a filler that ends a sentence is left in place, conservative by design.
         ends_sentence = tok.rstrip().endswith((".", "!", "?"))
         if core in _FILLER_TOKENS and not ends_sentence:
-            # 'like' is only dropped as a standalone filler, never at sentence start
-            # where it may be meaningful — conservative: skip dropping 'like' at idx 0.
-            if core == "like" and not out_tokens:
-                out_tokens.append(tok)
-                prev_core = core
-                continue
+            # 'like' is filler ONLY when comma-bracketed on both sides
+            # ("I was, like, so mad"). Comparative/prepositional 'like'
+            # ("keep playing like this") is MEANING — never dropped. This
+            # closed the real-world bug where 'Keep playing like this,' was
+            # mangled to 'Keep playing this,'.
+            if core == "like":
+                is_comma_filler = (
+                    tok.rstrip().endswith(",")
+                    and bool(prev_raw) and prev_raw.rstrip().endswith(",")
+                )
+                if not is_comma_filler:
+                    out_tokens.append(tok)
+                    prev_core = core
+                    prev_raw = tok
+                    continue
             continue
         # Immediate repeat (stutter 'I-I' arrives as 'I I', or doubled word) → collapse.
         if core and core == prev_core and core.isalpha():
             continue
         out_tokens.append(tok)
         prev_core = core
+        prev_raw = tok
 
     cleaned = " ".join(out_tokens)
     # 3. Normalize orphaned/duplicated punctuation and spacing produced by removals.
@@ -406,23 +420,48 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
 
         merged_meta = _merge_cue_meta(cue, nxt)
         verbatim_joined = merged_meta["dialogue_text"]
+        working = remove_disfluencies(verbatim_joined)
+
+        # EXTEND the merged window into the trailing idle gap before the
+        # following cue (mirrors cps.extend_fast_cues) — free reading time at
+        # zero editorial cost, and often the difference between an impossible
+        # char budget and a realistic one. Never overlaps the next cue, always
+        # preserves min_gap, never exceeds max_display_ms.
+        merged_start = int(cue["start_ms"])
+        merged_end = int(nxt["end_ms"])
+        min_gap = _env_int("CUSTOM_MERGE_GAP_MS", 80)
+        # CEILING division — int() truncation would leave the window a few ms
+        # short, putting the merged cue at e.g. 18.0007 cps against an 18 cap
+        # and failing the strict acceptance gate on a technicality.
+        needed_ms = -(-_visible_chars(working) * 1000 // max(1, max_cps))
+        ceiling = merged_start + max_dur
+        nxt2 = cues[i + 2] if i + 2 < len(cues) else None
+        if nxt2 is not None:
+            ceiling = min(ceiling, int(nxt2.get("start_ms", ceiling)) - min_gap)
+        merged_end = max(merged_end, min(merged_start + needed_ms, ceiling))
+
         candidate = {
             "idx": 0,
-            "start_ms": int(cue["start_ms"]),
-            "end_ms": int(nxt["end_ms"]),
+            "start_ms": merged_start,
+            "end_ms": merged_end,
             "type": "dialogue",
             "lines": [],
             "meta": {"dialogue_text": verbatim_joined, "runs": merged_meta["runs"]},
         }
 
-        # Condense the MERGED text against the MERGED window's budget.
-        working = remove_disfluencies(verbatim_joined)
+        # Condense the MERGED text against the (extended) window's budget.
+        # Up to two bounded LLM passes: if the first result is shorter but
+        # still over budget, the second pass condenses the result further.
         if client is not None and _cue_cps(candidate, working) > max_cps:
             dur_s = max(0.001, (candidate["end_ms"] - candidate["start_ms"]) / 1000.0)
             target_chars = int(max_cps * dur_s)
-            condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
-            if condensed:
+            for _attempt in range(2):
+                condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
+                if not condensed:
+                    break
                 working = condensed
+                if _visible_chars(working) <= target_chars:
+                    break
 
         _, body = _strip_leading_label(working)
         candidate["meta"]["dialogue_text"] = working
@@ -511,6 +550,25 @@ def condense_cues(
             for i2, c2 in enumerate(cues):
                 c2["idx"] = i2 + 1
 
+    # ── Sentence-fragment map (computed AFTER the merge pass) ─────────
+    # A cue is a FRAGMENT when it does not end a sentence (left half of a
+    # split) or when the previous dialogue cue did not end one (continuation).
+    # Rewording a fragment in ISOLATION breaks the sentence it belongs to —
+    # the exact defect that shipped 'Keep playing' / 'You might make…' as two
+    # broken halves. Per-cue LLM condensation is therefore fragment-gated:
+    # fragments only get the merge pass (full-sentence context) or ship
+    # verbatim for the QC gate. Deterministic disfluency removal remains safe.
+    fragment_flags: List[bool] = []
+    _prev_ended = True
+    for _c in cues:
+        if _c.get("type") != "dialogue":
+            fragment_flags.append(False)
+            continue
+        _t = _cue_dialogue_text(_c).strip()
+        _ends = _mc_ends_sentence(_t)
+        fragment_flags.append((not _ends) or (not _prev_ended))
+        _prev_ended = _ends
+
     run_budget_seconds = _env_int("CONDENSATION_RUN_BUDGET_SECONDS", 120)
     heartbeat_every = _env_int("CONDENSATION_HEARTBEAT_EVERY", 25)
     start_time = time.monotonic()
@@ -551,8 +609,10 @@ def condense_cues(
             applied_kind = "disfluency"
             stats["disfluency"] += 1
 
-        # 2. LLM paraphrase — only if still over CPS AND mode allows it.
-        if use_llm and not llm_budget_exhausted and _cue_cps(cue, working) > max_cps:
+        # 2. LLM paraphrase — only if still over CPS AND mode allows it AND the
+        # cue is a COMPLETE sentence (never reword a fragment in isolation).
+        if use_llm and not llm_budget_exhausted and not fragment_flags[idx] \
+                and _cue_cps(cue, working) > max_cps:
             if time.monotonic() - start_time > run_budget_seconds:
                 llm_budget_exhausted = True
             else:
