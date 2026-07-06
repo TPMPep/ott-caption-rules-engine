@@ -347,6 +347,47 @@ def _recased_first_line_body(first_line_body: str, old_full_body: str, new_full_
     return first_line_body
 
 
+def _sync_first_line_case(cue: Dict[str, Any], decided_body: str) -> bool:
+    """DEFENSE-IN-DEPTH: force the DELIVERED first line's leading word to carry
+    the same case as the decided body. The casing decision above is made on
+    meta.dialogue_text, but what ships is lines[] — if any upstream stage
+    recased a rendered line without updating dialogue_text (the 'This place'
+    defect), the decision would silently not reach the screen. This reconciler
+    makes lines[0] authoritative-consistent with the decided body even when the
+    body itself needed no change. Returns True when a line was corrected."""
+    words = decided_body.split()
+    lines = cue.get("lines") or []
+    if not words or not lines:
+        return False
+    decided_first = words[0]
+    f_label, f_body = _split_label(lines[0])
+    m = re.match(r"^(\s*)(\S+)(.*)$", f_body, re.DOTALL)
+    if not m:
+        return False
+    lead_ws, word, rest = m.group(1), m.group(2), m.group(3)
+    # Only reconcile when it IS the same word (bare, case-insensitive) — never
+    # touch a line that diverged in content rather than case.
+    if _bare(word).lower() != _bare(decided_first).lower():
+        return False
+    want_upper = None
+    for ch in decided_first:
+        if ch.isalpha():
+            want_upper = ch.isupper()
+            break
+    if want_upper is None:
+        return False
+    for i, ch in enumerate(word):
+        if ch.isalpha():
+            if ch.isupper() == want_upper:
+                return False  # already consistent
+            flipped = ch.upper() if want_upper else ch.lower()
+            cue["lines"] = [f_label + lead_ws + word[:i] + flipped + word[i + 1:] + rest] + list(lines[1:])
+            return True
+        if ch.isdigit():
+            return False
+    return False
+
+
 def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """DETERMINISTIC sentence-boundary capitalization — the final authority.
 
@@ -367,7 +408,7 @@ def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, 
 
     prev_ended_sentence = True  # first dialogue cue starts a sentence
     prev_last_word = ""         # previous DIALOGUE cue's last word (abbrev guard)
-    stats = {"lowered": 0, "raised": 0}
+    stats = {"lowered": 0, "raised": 0, "line_synced": 0}
 
     for cue in cues:
         if cue.get("type") != "dialogue":
@@ -390,6 +431,11 @@ def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, 
 
         if new_body != body:
             _apply_body(cue, new_body, body)
+        # Defense-in-depth: the delivered line must carry the decided casing
+        # even when dialogue_text was already correct (catches upstream
+        # line/meta divergence — the 'This place' defect class).
+        if _sync_first_line_case(cue, new_body):
+            stats["line_synced"] += 1
 
         # Update the continuation tracker from THIS cue's (post-recase) last word.
         final_body = _cue_text(cue)
@@ -397,5 +443,6 @@ def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, 
         prev_last_word = fb.split()[-1] if fb.split() else ""
         prev_ended_sentence = _ends_sentence(prev_last_word)
 
-    print(f"[CAPITALIZATION] lowered_continuations={stats['lowered']} raised_starts={stats['raised']}")
+    print(f"[CAPITALIZATION] lowered_continuations={stats['lowered']} "
+          f"raised_starts={stats['raised']} line_synced={stats['line_synced']}")
     return cues
