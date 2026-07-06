@@ -363,31 +363,53 @@ def cue_speakers(cue: Dict[str, Any]) -> set:
     return {r.get("speaker") for r in runs if r.get("speaker") is not None}
 
 
-# ─── first_occurrence_per_scene label suppression ───────────────────────────
+# ─── Repeat-speaker label suppression (universal, multi-mode) ────────────────
 # render_lines is intentionally STATELESS per cue (single source of truth, called
 # by the formatter AND the readability merge passes). It therefore cannot decide
-# "is this the speaker's FIRST cue in the scene?" — so on its own it renders a
-# bracket label on EVERY cue (correct for 'always' / 'every_change', wrong for
-# 'first_occurrence_per_scene', which is what the bug was: the catch-all branch
-# silently degraded first_occurrence to always).
+# "did the SAME speaker already get labeled on the previous cue?" — so on its own
+# it renders a bracket label on EVERY cue. Correct only for 'always' (which by
+# definition tags every cue). For every other labeling mode, repeating the label
+# on consecutive same-speaker cues is WRONG — the professional convention (and
+# what a real captioner does) is to identify a speaker once, then omit the tag
+# until the speaker changes or a new scene begins.
 #
 # The spec-faithful fix is a SINGLE stateful post-pass over the finished cue list.
 # It runs ONCE, after every cue is built/refined/readability-processed, walks the
-# cues in display order, and for label_mode='first_occurrence_per_scene' strips the
-# bracket/paren label from any cue whose speaker has already been labeled earlier
-# in the scene. MVP scene definition (per directive): the ENTIRE output is one
-# scene unless explicit scene boundaries are provided — so each speaker is labeled
-# exactly once, on their first cue.
+# cues in display order, and for every REPEAT-SUPPRESSING mode strips the
+# bracket/paren label from any cue whose speaker was already labeled per that
+# mode's rule:
+#
+#   • 'first_occurrence_per_scene' / 'named' : label each speaker ONCE per scene
+#     (the first cue of that speaker in the scene). MVP scene definition (per
+#     directive): the ENTIRE output is one scene unless explicit scene boundaries
+#     are provided — so each speaker is labeled exactly once, on their first cue.
+#     'named' is the project's per-project 'Named speakers' posture; it means
+#     "use the real diarized names" — NOT "tag literally every cue". So it
+#     suppresses repeats exactly like first_occurrence_per_scene. (This was the
+#     reported bug: SPEAKER B labeled on 4 consecutive back-to-back cues.)
+#
+#   • 'every_change' : label only when the speaker CHANGES from the previous cue.
+#     Consecutive same-speaker cues drop the tag; the tag re-appears the moment a
+#     different speaker speaks (no scene reset needed). This is the literal
+#     meaning of "every change".
+#
+# Modes NOT suppressed: 'always' (tag every cue, by design), 'dash' / 'none' /
+# 'alpha' / 'generic' (dash has no bracket tag to strip; none emits nothing;
+# alpha/generic are placeholder-label modes that intentionally re-assert the
+# placeholder each cue). SOC 2 CC8.1 / FCC §79.1 — speaker identification still
+# appears at every genuine speaker boundary; the pass is a deterministic,
+# reproducible function of (cues, mode, scene boundaries).
 #
 # Why this can never break layout: removing a leading label only ever SHORTENS a
 # line, never lengthens it, so no cue can newly overflow max_chars. We re-wrap the
 # stripped first line defensively anyway (free, deterministic) so a label that had
 # pushed text onto a second line collapses back to one when it now fits.
-#
-# Modes other than first_occurrence_per_scene are untouched (dash / alpha / generic
-# / named / every_camera / always / none all keep their current behaviour). SOC 2
-# CC8.1 / FCC §79.1 — speaker identification still appears (once), and the pass is
-# a deterministic, reproducible function of (cues, mode, scene boundaries).
+
+# Modes whose repeats are suppressed once-per-scene (identify each speaker once
+# per scene, then omit until the speaker changes OR a new scene begins).
+_PER_SCENE_SUPPRESS_MODES = frozenset({"first_occurrence_per_scene", "named"})
+# Mode that suppresses purely on same-as-previous-cue (re-label on any change).
+_EVERY_CHANGE_MODE = "every_change"
 
 # Match a leading bracket tag '[NAME:] ' or paren tag '(NAME): ' the renderer
 # emitted. Dash ('- ') is NOT stripped here — dash mode is a separate label_mode
@@ -416,47 +438,72 @@ def suppress_repeat_speaker_labels(
     cues: List[Dict[str, Any]],
     scene_boundary_idxs: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
-    """Enforce label_mode='first_occurrence_per_scene' across a finished cue list.
+    """Suppress repeated speaker labels across a finished cue list, UNIVERSALLY
+    for every repeat-suppressing label mode.
 
-    For each scene, the FIRST cue of each speaker keeps its rendered label; every
-    later cue of that same speaker in the same scene has its label stripped. No-op
-    for any other label_mode. Pure, deterministic, in-place-safe (returns the same
-    list mutated). `scene_boundary_idxs` is a set of cue indices that START a new
-    scene; when None/empty the entire output is treated as ONE scene (MVP).
+    Two suppression policies, selected by the resolved SPEAKER_LABEL_MODE:
+      • per-scene ('first_occurrence_per_scene' / 'named'): the FIRST cue of each
+        speaker in a scene keeps its rendered label; every later cue of that same
+        speaker in the SAME scene has its label stripped. The label re-appears on
+        a scene boundary.
+      • every-change ('every_change'): a cue keeps its label only when its speaker
+        DIFFERS from the immediately-preceding dialogue cue's speaker; consecutive
+        same-speaker cues have their label stripped. Re-appears on any change, no
+        scene reset required.
+
+    No-op for every other mode ('always' / 'dash' / 'none' / 'alpha' / 'generic').
+    Pure, deterministic, in-place-safe (returns the same list mutated).
+    `scene_boundary_idxs` is a set of cue indices that START a new scene; when
+    None/empty the entire output is treated as ONE scene (MVP).
     """
     mode = _speaker_label_mode()
-    if mode != "first_occurrence_per_scene":
+    per_scene = mode in _PER_SCENE_SUPPRESS_MODES
+    every_change = mode == _EVERY_CHANGE_MODE
+    if not (per_scene or every_change):
         return cues
 
     max_lines = _max_lines()
     max_chars = _max_chars()
     boundaries = scene_boundary_idxs or set()
-    seen_speakers: set = set()
+    seen_speakers: set = set()   # per-scene mode: speakers already labeled this scene
+    prev_speaker = None          # every_change mode: last dialogue cue's speaker
+
+    def _strip_cue_label(cue: Dict[str, Any]) -> None:
+        """Strip the leading bracket/paren label off this cue's lines and re-wrap
+        the now-shorter text. Shortening can never overflow, so this is safe."""
+        lines = cue.get("lines", [])
+        if any(_line_has_bracket_label(l) for l in lines):
+            spoken = " ".join(_strip_leading_bracket_label(l) for l in lines).strip()
+            cue["lines"] = wrap_text(spoken, max_chars, max_lines)
 
     for i, cue in enumerate(cues):
         if i in boundaries:
-            seen_speakers = set()  # new scene → labels re-appear
+            seen_speakers = set()   # new scene → per-scene labels re-appear
+            prev_speaker = None     # new scene → first cue re-asserts its label
         if cue.get("type") != "dialogue":
+            # A non-dialogue cue (music / SFX) does not carry a speaker identity
+            # and must not reset the every_change run — skip without touching
+            # prev_speaker so a music cue between two same-speaker lines doesn't
+            # spuriously re-label the second one.
             continue
         speaker = None
         for run in ((cue.get("meta") or {}).get("runs") or []):
             if run.get("speaker") is not None:
                 speaker = run.get("speaker")
                 break
-        # A cue with no resolvable speaker carries no first-occurrence identity;
-        # leave it exactly as rendered.
+        # A cue with no resolvable speaker carries no identity; leave it exactly
+        # as rendered and don't let it advance the every_change run.
         if speaker is None:
             continue
 
-        if speaker in seen_speakers:
-            # Repeat occurrence — strip the label off this cue's lines, then
-            # re-wrap the now-shorter spoken text so a label that had forced a
-            # 2nd line collapses cleanly. Shortening can never overflow.
-            lines = cue.get("lines", [])
-            if any(_line_has_bracket_label(l) for l in lines):
-                spoken = " ".join(_strip_leading_bracket_label(l) for l in lines).strip()
-                cue["lines"] = wrap_text(spoken, max_chars, max_lines)
-        else:
-            seen_speakers.add(speaker)
+        if per_scene:
+            if speaker in seen_speakers:
+                _strip_cue_label(cue)
+            else:
+                seen_speakers.add(speaker)
+        else:  # every_change
+            if speaker == prev_speaker:
+                _strip_cue_label(cue)
+            prev_speaker = speaker
 
     return cues
