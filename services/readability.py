@@ -20,7 +20,7 @@ import os
 # speakers on one line). This is what fixes the "A+B fused into one flat line"
 # defect — the merge passes no longer do naive string concatenation.
 try:
-    from .rendering import render_lines, merge_cue_meta, cue_speakers
+    from .rendering import render_lines, merge_cue_meta, cue_speakers, cue_fits_delivered
 except Exception:
     _HAVE_RENDERING = False
     # Defensive fallback — must never crash a job. Degrades to flat behaviour.
@@ -36,6 +36,12 @@ except Exception:
     def cue_speakers(cue):
         runs = (cue.get("meta") or {}).get("runs") or []
         return {r.get("speaker") for r in runs if r.get("speaker") is not None}
+
+    def cue_fits_delivered(cue, max_lines=None, max_chars=None):
+        lines = cue.get("lines", [])
+        ml = max_lines if max_lines is not None else 2
+        mc = max_chars if max_chars is not None else 32
+        return len(lines) <= ml and all(len(l) <= mc for l in lines)
 
 MICRO_WORD_LIMIT = 2
 MICRO_DURATION_MS = 1000
@@ -181,11 +187,12 @@ def _merge_improves(prev_cue, next_cue, merged):
     max_display = _max_display_ms()
     max_cps = _max_cps()
 
-    lines = merged.get("lines", [])
-    # (1) layout must stay within the spec geometry.
-    if len(lines) > max_lines:
-        return False
-    if any(len(l) > max_chars for l in lines):
+    # (1) layout must stay within the spec geometry — measured DELIVERED (speaker
+    # label included). A merge that produces a body that wraps clean but overflows
+    # once the label is prepended is rejected here, so a merge can never re-create
+    # the label-induced over-wide line the shaper just split apart. Shared
+    # primitive → identical to every other stage + the exported file.
+    if not cue_fits_delivered(merged, max_lines, max_chars):
         return False
 
     # (2) duration window.
@@ -310,7 +317,6 @@ def reflow_orphans(cues):
     if not cues:
         return cues
 
-    budget = _max_chars() * _max_lines()
     out = list(cues)
     i = 0
     while i < len(out):
@@ -323,14 +329,15 @@ def reflow_orphans(cues):
 
         # Try BACKWARD merge into the previous dialogue cue. SPEAKER GUARD +
         # RE-RENDER: only merge same-speaker (or unknown) cues, and draw the
-        # result through the shared renderer (correct \n / dash / label).
+        # result through the shared renderer (correct \n / dash / label). The
+        # fit test is DELIVERED (label included) via the shared primitive, so an
+        # orphan is never rejoined into a cue that then overflows once labeled.
         if (i > 0 and out[i - 1].get("type") == "dialogue"
                 and _speakers_compatible(out[i - 1], cue)):
             prev = out[i - 1]
-            prev_text = (prev.get("meta") or {}).get("dialogue_text") or " ".join(prev.get("lines", []))
-            combined = (prev_text.strip() + " " + orphan_text).strip()
-            if len(combined) <= budget:
-                out[i - 1] = _rerender_merged(prev, cue)
+            candidate = _rerender_merged(prev, cue)
+            if cue_fits_delivered(candidate, _max_lines(), _max_chars()):
+                out[i - 1] = candidate
                 del out[i]
                 continue  # re-check the same index (now the next cue)
 
@@ -338,10 +345,9 @@ def reflow_orphans(cues):
         if (i < len(out) - 1 and out[i + 1].get("type") == "dialogue"
                 and _speakers_compatible(cue, out[i + 1])):
             nxt = out[i + 1]
-            nxt_text = (nxt.get("meta") or {}).get("dialogue_text") or " ".join(nxt.get("lines", []))
-            combined = (orphan_text + " " + nxt_text.strip()).strip()
-            if len(combined) <= budget:
-                out[i + 1] = _rerender_merged(cue, nxt)
+            candidate = _rerender_merged(cue, nxt)
+            if cue_fits_delivered(candidate, _max_lines(), _max_chars()):
+                out[i + 1] = candidate
                 del out[i]
                 continue
 
@@ -388,11 +394,8 @@ def group_two_speaker_cues(cues):
                 and (nxt["start_ms"] - cue["end_ms"]) <= group_gap):
             combined = _rerender_merged(cue, nxt)
             # Only accept the grouping if it still fits the on-screen budget
-            # (≤ max_lines lines, each ≤ max_chars). Dash prefixes count.
-            fits = (len(combined.get("lines", [])) <= _max_lines()
-                    and all(len(l) <= _max_chars() for l in combined.get("lines", []))
-                    and len(combined.get("meta", {}).get("dialogue_text", "")) <= budget)
-            if fits:
+            # DELIVERED (label/dash prefixes included) — the ONE shared fit test.
+            if cue_fits_delivered(combined, _max_lines(), _max_chars()):
                 out.append(combined)
                 i += 2
                 continue
@@ -425,4 +428,16 @@ def apply_readability_rules(cues):
         def enforce_cps_rules(c):
             return c
     cues = enforce_cps_rules(cues)
+
+    # FINAL delivered-fit guarantee — the last structural pass. After every merge/
+    # extend/split above, split ANY cue that STILL doesn't fit DELIVERED (speaker
+    # label included) at a phrase boundary. This is the safety net that makes an
+    # over-label line impossible to ship regardless of what re-wrapped/re-merged
+    # upstream. Idempotent; a compliant cue is untouched. Runs LAST so nothing can
+    # re-introduce an overflow after it. SOC 2 CC8.1 / FCC §79.1.
+    try:
+        from .shaping import enforce_cpl_fit
+        cues = enforce_cpl_fit(cues)
+    except Exception as _e:
+        print(f"[READABILITY] final CPL-fit pass skipped (non-fatal): {_e}")
     return cues
