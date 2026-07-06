@@ -1,672 +1,509 @@
 """
-Main FastAPI application — OTT Caption Rules Engine.
+Rendering — the SINGLE SOURCE OF TRUTH for turning a cue's words + speaker
+structure into on-screen lines.
 
-This is the BRAIN of the CC Creation pipeline. Base44 only stores results.
+WHY THIS MODULE EXISTS
+──────────────────────
+Before this module, line-drawing lived inside formatter.py (`_speaker_render_lines`,
+`_segments_from_runs`, `_wrap_text`). The readability cleanup passes
+(merge_micro_cues, reflow_orphans) could NOT reach it, so when they glued two
+cues together they did naive string concatenation:
 
-Endpoints:
-  GET  /health           → liveness probe + version
-  POST /v1/jobs          → create a transcription/formatting job
-  GET  /v1/jobs/{job_id} → poll a job for status/result
+    cue["lines"] = [prev_text + " " + orphan_text]   # ← one flat line, no dash
 
-Job lifecycle (background thread):
-  queued
-    → submitting_to_provider          (transcription_provider: 'elevenlabs' | 'assemblyai')
-    → waiting_for_transcription       (assemblyai async)
-    → fetching_transcript             (reformat_only path)
-    → formatting
-    → completed | failed
+That single shortcut caused two production defects on the same cue:
+  • SPEAKER A and SPEAKER B got fused into one caption with NO dash / label
+    (the cleanup step never checked who was speaking).
+  • The line break (\n) was destroyed — the editor showed one long line even
+    though the spec said two.
 
-A completed job carries:
-  result.cues[]            — list of formatted CaptionCue dicts
-  result.srt               — SRT string
-  result.vtt               — VTT string
-  result.qc                — QC report dict
-  result.assemblyai.utterances[] — diarized utterances (AAI-shape, regardless
-                                    of provider — Scribe is normalized to
-                                    the same shape so the Base44 ingester is
-                                    provider-agnostic).
-  result.assemblyai.audio_events[] — structured non-dialogue events
-                                      (music, applause, laughter, ...) —
-                                      promoted into CaptionCue rows server-
-                                      side as cue_type='music'/'sound_effect'.
-  result.transcription_provider — 'elevenlabs' | 'assemblyai'
-  result.transcription_model    — 'scribe_v2' | 'universal-3-pro' | 'universal-2'
-  result._used_rules       — every env-driven rule value applied to this run.
+The professional fix (Iyuno / Pixelogic / Zoo / Deluxe grade) is to have ONE
+function that every stage calls to render lines. Formatter calls it when it
+first builds a cue; the readability merge passes call it again after they
+recombine words. They can never disagree because there is only one of them.
 
-Auth:
-  If env var ENGINE_SHARED_SECRET is set, every POST/GET must carry
-  X-Engine-Secret header matching it. If unset (today's default), the
-  service is open — relies on the obscure Railway URL.
+CONTRACT — every cue carries enough structure to be re-rendered losslessly:
+    cue["meta"]["dialogue_text"]  : the full spoken text (no dash/label markup)
+    cue["meta"]["runs"]           : [{speaker, word_start}, ...] speaker offsets
+The renderer reconstructs per-speaker segments from `runs` + the word list and
+applies the UNIVERSAL one-speaker-per-line invariant plus the spec's
+SPEAKER_LABEL_MODE (dash / none / named / etc.).
 
-Provider selection (auditor-grade default):
-  Scribe v2 is the DEFAULT transcription provider for CC projects because it
-  provides native diarization + native audio-event tagging (FCC 47 CFR §79.1
-  compliance — non-dialogue coverage is provider-emitted, not prompt-coaxed).
-  AssemblyAI is retained as an opt-in fallback for legacy projects and as a
-  diagnostic comparison path. The Base44 producer sets `transcription_provider`
-  on every POST.
+Pure functions only — no env writes, no I/O. Deterministic. SOC 2 CC8.1:
+identical (words, runs, spec) always renders identical lines, on every stage.
 """
 
-from fastapi import FastAPI, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-from typing import Optional, Dict, Any, List
-from datetime import datetime
 import os
-import threading
-import uuid
-import traceback
+from typing import Any, Dict, List, Optional
 
-from services.assembly import (
-    submit_transcription_job,
-    wait_for_transcription_result,
-    fetch_transcript_result,
-    build_caption_inputs,
-    extract_audio_events_from_assembly_result,
-)
-from services.scribe import transcribe as scribe_transcribe
-from services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
+try:
+    from services.linebreak import choose_two_line_break
+except ImportError:  # pragma: no cover — defensive for alternate import roots
+    from linebreak import choose_two_line_break
 
-import json
-import urllib.request
-
-# Bump this on every meaningful edit. /health reports it so Base44 can
-# verify a deploy landed without grepping Railway logs.
-VERSION = "5.16.0-editorial-condensation"
-
-app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# In-memory job store. For 100+ concurrent users this is fine — jobs are
-# transient and consumed by Base44's poller within minutes. If we ever need
-# durability we can swap this for Redis (Upstash is already in the stack).
-JOBS: Dict[str, Dict[str, Any]] = {}
-JOBS_LOCK = threading.Lock()
-
-
-# ─── Auth ───────────────────────────────────────────────────────────
-
-def _check_secret(x_engine_secret: Optional[str]) -> None:
-    expected = os.getenv("ENGINE_SHARED_SECRET", "").strip()
-    if not expected:
-        return  # open mode
-    if x_engine_secret != expected:
-        raise HTTPException(status_code=401, detail="invalid X-Engine-Secret")
-
-
-# ─── Request Models ─────────────────────────────────────────────────
-
-class CaptionRules(BaseModel):
-    max_chars_per_line: int = 32
-    max_lines: int = 2
-    max_cps: int = 17
-    min_duration_ms: int = 1000
-    max_duration_ms: int = 7000
-    min_gap_ms: int = 80
-    prefer_punctuation_breaks: bool = True
-    scc_frame_rate: float = 29.97
-    start_at_hour_00: bool = True
-
-
-class CreateJobRequest(BaseModel):
-    mediaUrl: Optional[HttpUrl] = None
-    transcript_id: Optional[str] = None
-    reformat_only: bool = False
-    speakerLabels: bool = True
-    languageDetection: bool = True
-    allowHttp: bool = True
-    captionRules: Optional[CaptionRules] = None
-    captionOptions: Optional[Dict[str, Any]] = None
-    env: Optional[Dict[str, Any]] = None
-    output_formats: Optional[List[str]] = None
-    protected_phrases: Optional[List[str]] = None
-    protectedPhrases: Optional[List[str]] = None  # camelCase alias
-
-    # ── Reformat-from-baseline mode (engine 5.0.0) ──────────────────────
-    # The auditor-grade re-format path. When `baselineUrl` is set, the engine
-    # SKIPS transcription entirely: it fetches the immutable baseline JSON
-    # (the same {utterances, words, audio_events} shape produced by Scribe/AAI
-    # and persisted by Base44 at cc-baselines/{project_id}/aai-baseline.json),
-    # and runs the FULL formatting pipeline against it — including the
-    # editorial-AI grammar pass. This is what powers a spec swap (e.g. 32×2 →
-    # 42×3): the new spec geometry flows in via captionOptions/env, so the
-    # grammar-AI re-decides line breaks for the new width (killing orphan
-    # lines), NOT a crude mechanical re-wrap. Provider-agnostic — works for
-    # any baseline regardless of which provider originally transcribed it.
-    #
-    # baselineUrl is a short-TTL signed S3 GET URL (Base44 signs it; the
-    # engine fetches it). We use a signed URL instead of an inline body so a
-    # feature-length show's multi-MB baseline never bloats the request body —
-    # mirrors how mediaUrl is handed to the transcription path.
-    baselineUrl: Optional[HttpUrl] = None
-    reformat_from_baseline: bool = False
-
-    # Transcription provider selection (auditor-grade default: scribe_v2).
-    # 'elevenlabs' → ElevenLabs Scribe v2 (native diarization + audio events)
-    # 'assemblyai' → AssemblyAI universal-3-pro / universal-2 fallback chain
-    # When omitted, defaults to 'elevenlabs' so a misconfigured producer
-    # never silently degrades to a less auditable model.
-    transcription_provider: Optional[str] = "elevenlabs"
-    # ISO 639-3 (Scribe) or auto-detect (AAI). Producer derives this from the
-    # project's source_language. None / "auto" → provider auto-detects.
-    source_language_code: Optional[str] = None
-
-    # Base44-side audit anchors. Echoed verbatim into the job record and
-    # the result so the Base44 ingester can correlate the engine job with
-    # the originating Project / CCFormatRun without out-of-band tracking.
-    project_id: Optional[str] = None
-    cc_format_run_id: Optional[str] = None
-    request_id: Optional[str] = None
-
-    # ── Fast-path completion callback (engine 5.2.0+) ───────────────────
-    # When set, the engine POSTs { job_id, engine_job_id, status } to
-    # callbackUrl the instant a job reaches a terminal state (completed /
-    # failed), carrying X-Callback-Secret: callbackSecret. This collapses
-    # Base44's up-to-5-min poll gap to ~1-2s. The callback is BEST-EFFORT —
-    # Base44's ccPollRailwayJobs scheduled sweep remains the durable
-    # guarantee, so a failed/dropped callback never strands a run. We never
-    # retry the callback and never block job completion on it.
-    # `base44_job_run_id` is the Base44 JobRun.id (NOT our internal job_id),
-    # echoed back so the callback can locate the run with zero external lookup.
-    callbackUrl: Optional[HttpUrl] = None
-    callbackSecret: Optional[str] = None
-    base44_job_run_id: Optional[str] = None
-
-
-# ─── Helpers ────────────────────────────────────────────────────────
-
-def utc_now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
-
-
-def parse_output_formats(payload: Dict[str, Any]) -> Optional[List[str]]:
-    if isinstance(payload.get("output_formats"), list) and payload.get("output_formats"):
-        return [str(f).strip().lower() for f in payload["output_formats"] if str(f).strip()]
-    env = payload.get("env") or payload.get("captionOptions") or {}
-    if isinstance(env, dict):
-        raw = env.get("OUTPUT_FORMATS")
-        if raw:
-            return [f.strip().lower() for f in str(raw).split(",") if f.strip()]
-    return None
-
-
-def get_protected_phrases(payload: Dict[str, Any]) -> List[str]:
-    phrases = payload.get("protected_phrases") or payload.get("protectedPhrases") or []
-    if isinstance(phrases, str):
-        phrases = [p.strip() for p in phrases.split(",") if p.strip()]
-    return phrases
-
-
-def get_env_overrides(payload: Dict[str, Any]) -> Dict[str, Any]:
-    env_dict: Dict[str, Any] = {}
-    if isinstance(payload.get("env"), dict):
-        env_dict.update(payload["env"])
-    if isinstance(payload.get("captionOptions"), dict):
-        env_dict.update(payload["captionOptions"])
-    return env_dict
-
-
-def _normalize_provider(raw: Optional[str]) -> str:
-    """Normalize the transcription_provider field. Default = 'elevenlabs'."""
-    if not raw:
-        return "elevenlabs"
-    p = str(raw).strip().lower()
-    if p in ("elevenlabs", "scribe", "scribe_v2", "el"):
-        return "elevenlabs"
-    if p in ("assemblyai", "aai"):
-        return "assemblyai"
-    return "elevenlabs"
-
-
-def _provider_model_id(provider: str) -> str:
-    """For auditor evidence — pin the exact model used by this run."""
-    if provider == "elevenlabs":
-        return os.getenv("ELEVENLABS_SCRIBE_MODEL", "scribe_v2")
-    return "universal-3-pro"  # AAI primary; engine sets a fallback chain
-
-
-# Max baseline JSON we will fetch — a guard against a malformed / unbounded
-# signed URL pointing at something enormous. A feature-length show's baseline
-# is typically a few MB; 128MB is a generous safety ceiling.
-BASELINE_FETCH_MAX_BYTES = 128 * 1024 * 1024
-BASELINE_FETCH_TIMEOUT_SECONDS = int(
-    os.getenv("BASELINE_FETCH_TIMEOUT_SECONDS", "120") or 120
-)
-
-
-def fetch_baseline_json(baseline_url: str) -> Dict[str, Any]:
-    """
-    Fetch + parse the immutable baseline JSON from a signed S3 GET URL.
-
-    The baseline is the {utterances, words, audio_events, ...} object Base44
-    persisted at transcription time. This is the EXACT shape the formatter's
-    `build_caption_inputs()` already consumes — so reformat-from-baseline runs
-    the identical pipeline transcription does, just with the provider call
-    skipped. No new formatting logic; the engine's editorial brain is reused
-    verbatim. SOC 2 CC8.1 — every reformat traces to the same immutable
-    evidence the original transcription produced.
-    """
-    req = urllib.request.Request(baseline_url, method="GET")
-    with urllib.request.urlopen(req, timeout=BASELINE_FETCH_TIMEOUT_SECONDS) as resp:
-        raw = resp.read(BASELINE_FETCH_MAX_BYTES + 1)
-    if len(raw) > BASELINE_FETCH_MAX_BYTES:
-        raise ValueError(
-            f"Baseline JSON exceeds {BASELINE_FETCH_MAX_BYTES} byte safety ceiling"
-        )
-    data = json.loads(raw.decode("utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError(f"Baseline JSON is not an object: {type(data).__name__}")
-    utterances = data.get("utterances")
-    if not isinstance(utterances, list) or len(utterances) == 0:
-        raise ValueError("Baseline JSON has no utterances — cannot reformat")
-    return data
-
-
-def baseline_to_assembly_result(baseline: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Map a stored baseline dict into the canonical `assembly_result` shape the
-    formatter + audio-event extractor expect. The baseline was WRITTEN from
-    that same shape by the Base44 ingester, so this is a near-identity mapping
-    — we just normalize the keys the formatter reads and carry the native
-    audio_events through verbatim (so non-dialogue cues reproduce exactly).
-    """
-    return {
-        "id": baseline.get("transcript_id"),
-        "language_code": baseline.get("language_code"),
-        "audio_duration": baseline.get("audio_duration_sec") or baseline.get("audio_duration"),
-        "utterances": baseline.get("utterances") or [],
-        "words": baseline.get("words") or [],
-        "audio_events": baseline.get("audio_events") or [],
-        # Mark provenance so build_caption_inputs never cross-calls a provider
-        # for the backbone SRT (it builds locally from utterances).
-        "_provider": baseline.get("transcription_provider") or "",
-    }
-
-
-def update_job(job_id: str, **fields: Any) -> None:
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            return
-        job.update(fields)
-        job["updated_at"] = utc_now()
-
-
-# ── Fast-path completion callback ────────────────────────────────────
-# POST { job_id, engine_job_id, status } to the Base44 callback URL the
-# instant a job terminates. BEST-EFFORT: a short timeout, no retries, every
-# failure swallowed + logged. Base44's ccPollRailwayJobs sweep is the durable
-# guarantee — this only ACCELERATES the happy path. Never block job completion.
-CALLBACK_TIMEOUT_SECONDS = int(os.getenv("CALLBACK_TIMEOUT_SECONDS", "10") or 10)
-
-
-def fire_completion_callback(job_id: str, status: str) -> None:
-    """Notify Base44 that an engine job reached a terminal state. The callback
-    carries the Base44 JobRun.id (base44_job_run_id) so the receiver locates
-    the run with no lookup; it then re-fetches the full result via GET
-    /v1/jobs/:id. We send only the tiny signal, never the multi-MB payload."""
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            return
-        payload_in = job.get("input") or {}
-        callback_url = payload_in.get("callbackUrl")
-        callback_secret = payload_in.get("callbackSecret")
-        base44_job_run_id = payload_in.get("base44_job_run_id")
-
-    if not callback_url or not callback_secret or not base44_job_run_id:
-        return  # Callback not configured for this job — poller covers it.
-
+# CJK awareness — route no-space-script text to the character-aware wrapper.
+try:
+    from services.cjk import is_cjk_text as _is_cjk, wrap_cjk as _wrap_cjk, cjk_char_count as _cjk_count
+except ImportError:  # pragma: no cover
     try:
-        body = json.dumps({
-            "job_id": base44_job_run_id,   # Base44 JobRun.id (what the receiver keys on)
-            "engine_job_id": job_id,       # our internal Railway job id
-            "status": status,              # 'completed' | 'failed'
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            str(callback_url), data=body, method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "X-Callback-Secret": callback_secret,
-            },
-        )
-        with urllib.request.urlopen(req, timeout=CALLBACK_TIMEOUT_SECONDS) as resp:
-            print(f"[{job_id}] Completion callback → HTTP {resp.status} (status={status})")
-    except Exception as e:
-        # Swallow — the poller is the durable path. Log for observability only.
-        print(f"[{job_id}] Completion callback failed (non-fatal, poller will cover): {e}")
+        from cjk import is_cjk_text as _is_cjk, wrap_cjk as _wrap_cjk, cjk_char_count as _cjk_count
+    except ImportError:
+        def _is_cjk(text):
+            return False
+
+        def _wrap_cjk(text, max_chars, max_lines):
+            return [text]
+
+        def _cjk_count(text):
+            return len((text or "").replace(" ", ""))
 
 
-def start_job_worker(job_id: str, payload: Dict[str, Any]) -> None:
-    worker = threading.Thread(
-        target=run_caption_job,
-        args=(job_id, payload),
-        daemon=True,
-        name=f"caption-job-{job_id[:8]}",
-    )
-    worker.start()
-
-
-# ─── Background Job Runner ──────────────────────────────────────────
-
-def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
-    env_snapshot = None
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
     try:
-        print(f"[{job_id}] Starting caption job")
+        return int(raw)
+    except Exception:
+        return default
 
-        env_overrides = get_env_overrides(payload)
-        env_snapshot = apply_env_overrides(env_overrides)
 
-        output_formats = parse_output_formats(payload)
-        protected_phrases = get_protected_phrases(payload)
+def _max_lines() -> int:
+    return _env_int("CUSTOM_MAX_LINES", 2)
 
-        provider = _normalize_provider(payload.get("transcription_provider"))
-        model_id = _provider_model_id(provider)
-        transcript_id = JOBS.get(job_id, {}).get("provider_transcript_id") or payload.get("transcript_id")
 
-        # ── Transcription branch ─────────────────────────────────────────
-        # `assembly_result` is intentionally the canonical name for the
-        # normalized result regardless of provider — the formatter and the
-        # downstream Base44 ingester both consume this shape. Scribe v2 is
-        # normalized by services.scribe.normalize_scribe_result to match.
-        assembly_result: Dict[str, Any]
-        if payload.get("reformat_from_baseline"):
-            # ── Reformat-from-baseline (engine 5.0.0) ────────────────────
-            # Skip transcription entirely. Fetch the immutable baseline JSON
-            # from the signed S3 URL and run the FULL formatting pipeline
-            # (formatter → editorial-AI → readability → QC) against it. The
-            # new spec geometry arrived via captionOptions/env (already
-            # applied above), so the editorial-AI rebalances line breaks for
-            # the new width — the orphan-line fix on a spec swap.
-            baseline_url = payload.get("baselineUrl")
-            if not baseline_url:
-                raise ValueError("baselineUrl is required when reformat_from_baseline=true")
-            update_job(job_id, status="processing", stage="fetching_transcript",
-                       transcription_provider=provider,
-                       transcription_model=model_id)
-            print(f"[{job_id}] Reformat-from-baseline: fetching baseline JSON")
-            baseline = fetch_baseline_json(str(baseline_url))
-            assembly_result = baseline_to_assembly_result(baseline)
-            print(f"[{job_id}] Baseline loaded: {len(assembly_result.get('utterances') or [])} utterances, "
-                  f"{len(assembly_result.get('audio_events') or [])} audio events")
-        elif payload.get("reformat_only"):
-            if not transcript_id:
-                raise ValueError("transcript_id is required when reformat_only=true")
-            if provider != "assemblyai":
-                # Scribe v2 is synchronous — there is no transcript_id to
-                # rehydrate against. Reformat-only is an AssemblyAI-only path
-                # (the workflow's original use case was pure re-format runs).
-                raise ValueError("reformat_only=true requires transcription_provider='assemblyai'")
-            update_job(job_id, status="processing", stage="fetching_transcript",
-                       provider_transcript_id=transcript_id,
-                       transcription_provider=provider,
-                       transcription_model=model_id)
-            print(f"[{job_id}] Reformat-only: fetching AAI transcript {transcript_id}")
-            assembly_result = fetch_transcript_result(transcript_id, require_completed=True)
-        elif provider == "elevenlabs":
-            update_job(job_id, status="processing", stage="submitting_to_provider",
-                       transcription_provider=provider,
-                       transcription_model=model_id)
-            media_url = str(payload["mediaUrl"])
-            lang = payload.get("source_language_code") or None
-            print(f"[{job_id}] Submitting to ElevenLabs Scribe (lang={lang or 'auto'})")
-            update_job(job_id, status="processing", stage="waiting_for_transcription")
-            assembly_result = scribe_transcribe(media_url, language_code=lang)
+def _max_chars() -> int:
+    return _env_int("CUSTOM_MAX_CHARS", 32)
+
+
+def _speaker_label_mode() -> str:
+    return (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
+
+
+def _label_case() -> str:
+    return (os.getenv("SPEAKER_LABEL_CASE", "uppercase") or "uppercase").strip().lower()
+
+
+def _format_speaker_name(raw: Optional[str], mode: str) -> str:
+    """Turn a raw diarization speaker id (e.g. 'A', 'SPEAKER_01', 'John') into
+    the display name the spec's mode wants:
+      • alpha   → 'SPEAKER A'  (letter from the id, A/B/C…)
+      • generic → 'SPEAKER 1'  (1-indexed number from the id)
+      • named / first_occurrence / every_change / always → the real name as-is
+    Case is applied per SPEAKER_LABEL_CASE (broadcast default uppercase)."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+
+    if mode == "alpha":
+        # Pull a single A–Z letter. AssemblyAI/Scribe ids are usually already
+        # 'A','B','C' or 'SPEAKER_A'; fall back to the first alpha char.
+        letter = next((ch for ch in s.upper() if ch.isalpha()), "A")
+        name = f"SPEAKER {letter}"
+    elif mode == "generic":
+        digits = "".join(ch for ch in s if ch.isdigit())
+        if digits:
+            num = int(digits) + (0 if digits != "0" else 1)
         else:
-            # AssemblyAI path (legacy fallback)
-            update_job(job_id, status="processing", stage="submitting_to_provider",
-                       transcription_provider=provider,
-                       transcription_model=model_id)
-            if not transcript_id:
-                # AAI is submitted up front by the request handler — if we
-                # got here without one, that's a programmer error.
-                raise ValueError("AssemblyAI transcript_id missing before worker start")
-            update_job(job_id, status="processing", stage="waiting_for_transcription",
-                       provider_transcript_id=transcript_id)
-            print(f"[{job_id}] Waiting for AssemblyAI result...")
-            assembly_result = wait_for_transcription_result(transcript_id)
+            # Map a letter id to a 1-based number (A→1, B→2…).
+            first = next((ch for ch in s.upper() if ch.isalpha()), "A")
+            num = ord(first) - ord("A") + 1
+        name = f"SPEAKER {num}"
+    else:
+        # named / first_occurrence_per_scene / every_change / always
+        name = s
 
-        update_job(job_id, status="processing", stage="formatting")
+    case = _label_case()
+    if case == "uppercase":
+        return name.upper()
+    if case == "title":
+        return name.title()
+    return name
 
-        backbone_srt_text, timestamps_json = build_caption_inputs(assembly_result)
 
-        # ── Audio events — computed BEFORE formatting so the formatter can
-        # turn them into real sound cues (rendered per the spec's MUSIC_CUE_
-        # FORMAT / SOUND_EFFECT_FORMAT). Scribe v2 / baseline carry them
-        # natively; AAI is best-effort extracted from bracket tags. Previously
-        # this ran AFTER process_caption_job and was only attached to the
-        # result side-channel — so the reformat ingester (which reads
-        # result.cues[]) never saw them. That was the "no sound cues" bug.
-        if payload.get("reformat_from_baseline") or provider == "elevenlabs":
-            audio_events = list(assembly_result.get("audio_events") or [])
+def _label_format(off_camera: bool = False) -> str:
+    """Tag template from the spec. {name} is substituted. Off-camera speakers
+    may use a distinct template (Pluto: '({name}):')."""
+    if off_camera:
+        oc = (os.getenv("OFF_CAMERA_LABEL_FORMAT", "") or "").strip()
+        if oc:
+            return oc
+    return (os.getenv("SPEAKER_LABEL_FORMAT", "[{name}:]") or "[{name}:]").strip()
+
+
+def _render_speaker_tag(raw_speaker: Optional[str], mode: str) -> str:
+    """Build the full speaker tag string (e.g. '[SPEAKER A:]') for a cue's
+    speaker, per the spec's mode + format template. Returns '' when the mode
+    emits no tag ('none') or there is no speaker."""
+    if mode in ("none", "dash"):
+        return ""  # 'dash' is handled separately (prefix, not a name tag)
+    name = _format_speaker_name(raw_speaker, mode)
+    if not name:
+        return ""
+    template = _label_format()
+    return template.replace("{name}", name)
+
+
+def segments_from_runs(words: List[str], speaker_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Split the flat word list into per-speaker text segments using each
+    run's `word_start` offset. Returns [{speaker, text}, ...] in order."""
+    if not speaker_runs:
+        return [{"speaker": None, "text": " ".join(words)}]
+    out: List[Dict[str, Any]] = []
+    for i, run in enumerate(speaker_runs):
+        start = run.get("word_start", 0)
+        end = speaker_runs[i + 1].get("word_start", len(words)) if i + 1 < len(speaker_runs) else len(words)
+        seg_words = words[start:end]
+        if seg_words:
+            out.append({"speaker": run.get("speaker"), "text": " ".join(seg_words)})
+    return out
+
+
+def _greedy_wrap(words: List[str], max_chars: int, max_lines: int) -> List[str]:
+    """Greedy left-to-right fill. The deterministic fallback used for the
+    1-line case, the 3+-line case, and whenever the syntax-aware 2-line breaker
+    finds no feasible balanced split. Word-faithful (enumerate-based slice)."""
+    lines: List[str] = []
+    current_line = ""
+    for idx, word in enumerate(words):
+        test = (current_line + " " + word).strip() if current_line else word
+        if len(test) <= max_chars:
+            current_line = test
         else:
-            audio_events = extract_audio_events_from_assembly_result(assembly_result)
-
-        # Heartbeat closure — editorial_ai calls this every N cues so the
-        # job's updated_at timestamp advances during the long AI polish
-        # pass. Without this, the formatter could correctly grind through
-        # 400 cues over 90 seconds and look "hung" to Base44's poller
-        # (which reads updated_at as the freshness signal). SOC 2 CC8.1 —
-        # engine progress must be observable in real time.
-        def _formatter_heartbeat(idx: int, total: int) -> None:
-            update_job(job_id, stage="formatting",
-                       formatter_progress={"cues_processed": idx, "cues_total": total})
-
-        caption_result = process_caption_job(
-            backbone_srt_text=backbone_srt_text,
-            timestamps=timestamps_json,
-            protected_phrases=protected_phrases,
-            output_formats=output_formats,
-            heartbeat=_formatter_heartbeat,
-            audio_events=audio_events,
-        )
-
-        # Attach diarization + audio events so Base44 can derive CCSpeaker
-        # rows and non-dialogue cues without re-fetching from the provider.
-        # SOC 2 CC8.1 — the engine result is self-contained chain-of-custody
-        # evidence. The key stays 'assemblyai' to keep the Base44 ingester
-        # contract stable; the provider fingerprint lives in
-        # caption_result.transcription_provider / transcription_model.
-        # CRITICAL: include per-utterance `words` (word-level timings) AND a
-        # flat top-level `words` array. The Base44 ingester writes these into
-        # the immutable S3 baseline, and every future Apply Spec re-run rebuilds
-        # its input cues from them via `_splitUtteranceByPauses`. Dropping them
-        # here (the prior bug) produced a baseline with words:[] — which made
-        # Apply Spec fail with "AAI baseline contained no utterances" on EVERY
-        # project. The normalizer (scribe.py / assembly.py) already populates
-        # utterance["words"]; we now carry it through verbatim. SOC 2 CC8.1 —
-        # the engine result is self-contained chain-of-custody evidence.
-        caption_result["assemblyai"] = {
-            "transcript_id": assembly_result.get("id"),
-            "language_code": assembly_result.get("language_code"),
-            "audio_duration": assembly_result.get("audio_duration"),
-            "utterances": [
-                {
-                    "speaker": u.get("speaker"),
-                    "start": u.get("start"),
-                    "end": u.get("end"),
-                    "text": u.get("text"),
-                    "confidence": u.get("confidence"),
-                    "words": u.get("words") or [],
-                }
-                for u in (assembly_result.get("utterances") or [])
-            ],
-            "audio_events": audio_events,
-        }
-        # Flat word list — the secondary baseline source. Mirrors the
-        # normalizer's `words` output (already provider-agnostic). The ingester
-        # prefers this when present; the per-utterance words above are the
-        # fallback. Carrying both makes the baseline robust to either reader.
-        caption_result["words"] = list(assembly_result.get("words") or [])
-        # Echo Base44-side audit anchors for the ingester to correlate.
-        caption_result["base44"] = {
-            "project_id": payload.get("project_id"),
-            "cc_format_run_id": payload.get("cc_format_run_id"),
-            "request_id": payload.get("request_id"),
-        }
-        caption_result["engine_version"] = VERSION
-        # Auditor fingerprint — pinned per-run, not derived.
-        caption_result["transcription_provider"] = provider
-        caption_result["transcription_model"] = model_id
-
-        update_job(job_id, status="completed", stage="completed",
-                   result=caption_result, error=None,
-                   transcription_provider=provider,
-                   transcription_model=model_id,
-                   provider_transcript_id=assembly_result.get("id") or transcript_id)
-
-    except Exception as e:
-        print(f"[{job_id}] Caption job FAILED: {e}")
-        print(traceback.format_exc())
-        update_job(job_id, status="failed", stage="failed", result=None,
-                   error={"message": str(e), "trace": traceback.format_exc()[:4000]})
-    finally:
-        if env_snapshot is not None:
-            restore_env_overrides(env_snapshot)
-        # Fast-path completion callback — fired AFTER the job's terminal state
-        # is committed to the store (so the GET the receiver does sees the
-        # final result) and AFTER env restore (so a callback hang can never
-        # leave env vars dirty). Best-effort, swallows all errors; the poller
-        # remains the durable guarantee.
-        with JOBS_LOCK:
-            terminal_status = (JOBS.get(job_id) or {}).get("status")
-        if terminal_status in ("completed", "failed"):
-            fire_completion_callback(job_id, terminal_status)
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+            if len(lines) >= max_lines - 1:
+                # Last allowed line — dump remaining words from the CURRENT
+                # index (never words.index(word), which finds the first match).
+                lines.append(" ".join(words[idx:]))
+                return lines[:max_lines]
+    if current_line:
+        lines.append(current_line)
+    return lines[:max_lines]
 
 
-# ─── Routes ─────────────────────────────────────────────────────────
+def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
+    """
+    Wrap text into lines respecting max_chars per line.
 
-@app.get("/health")
-def health():
+    For the common 2-line case the SYNTAX-AWARE breaker (services.linebreak)
+    chooses the break that preserves clause/phrase integrity AND balances the
+    two line lengths — the professional-captioner behaviour (honors the spec's
+    PREFER_BALANCED_LINES + PRESERVE_CLAUSE_INTEGRITY flags). For 1-line, 3+
+    lines, or when no feasible balanced split exists, falls back to greedy fill.
+    Both paths are deterministic and word-faithful. SOC 2 CC8.1.
+    """
+    text = (text or "").strip()
+    if not text:
+        return [""]
+
+    # CJK (no-space script): wrap by CHARACTER count at 、。 boundaries with
+    # kinsoku, never by space-split words. This is the core fix for the Japanese
+    # 54-char-line / mega-cue defect — wrap_cjk produces ≤max_chars lines.
+    if _is_cjk(text):
+        if _cjk_count(text) <= max_chars:
+            return [text]
+        return _wrap_cjk(text, max_chars, max_lines)
+
+    if len(text) <= max_chars:
+        return [text]
+
+    words = text.split()
+
+    # ── Syntax-aware balanced break — only the exact-2-line case ──────────
+    # When max_lines >= 2 and the whole string fits across two lines, prefer the
+    # clause-aware balanced split over greedy. choose_two_line_break returns None
+    # if no feasible two-line split exists (e.g. content needs 3 lines), in which
+    # case we fall through to greedy below.
+    if max_lines >= 2:
+        two = choose_two_line_break(text, max_chars)
+        if two is not None:
+            return two
+
+    return _greedy_wrap(words, max_chars, max_lines)
+
+
+def render_lines(
+    words: List[str],
+    speaker_runs: List[Dict[str, Any]],
+    max_lines: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    dialogue_text: Optional[str] = None,
+) -> List[str]:
+    """
+    UNIVERSAL speaker-aware line builder, parameterised by the spec's
+    SPEAKER_LABEL_MODE. The engine never names a client — it only obeys the
+    mode the spec sent.
+
+    Two universal hard invariants (every mode, never configurable):
+      • One speaker per line. Two distinct speakers are NEVER placed on the
+        same physical line.
+      • A speaker label is emitted at the start of each speaker's text, in the
+        style the spec's mode dictates. This is the FCC/industry baseline
+        ("signal a new speaker with a hyphen or a clear label") — true for
+        every spec, not just Pluto. The DETERMINISTIC renderer owns this so
+        labels are present even when the editorial-AI is skipped / times out /
+        hits its run budget under 100-user load. SOC 2 CC8.1 / FCC §79.1 —
+        speaker identification is never silently lost.
+
+    Styles (the ONLY per-spec variation — the glyph, never whether a label
+    appears):
+      • 'dash'    : prefix each speaker's line with '- '  (Pluto/FAST).
+      • 'alpha'   : '[SPEAKER A:]' bracket tag.
+      • 'generic' : '[SPEAKER 1:]' bracket tag.
+      • 'named' / 'first_occurrence_per_scene' / 'every_change' / 'always'
+                  : '[NAME:]' bracket tag using the real diarized name.
+      • 'none'    : no label (plain wrap) — the only mode that omits a label.
+
+    NOTE on "every speaker change": render_lines is per-cue and the packer
+    guarantees one speaker per dialogue cue (the speaker-integrity invariant),
+    so labelling the cue's speaker == labelling on every change. A genuine
+    multi-speaker cue (intentional dash grouping) labels each segment.
+    """
+    max_lines = max_lines if max_lines is not None else _max_lines()
+    max_chars = max_chars if max_chars is not None else _max_chars()
+    dialogue_text = dialogue_text if dialogue_text is not None else " ".join(words)
+
+    mode = _speaker_label_mode()
+    segments = segments_from_runs(words, speaker_runs)
+    distinct_speakers = len({
+        s.get("speaker") for s in (speaker_runs or []) if s.get("speaker") is not None
+    })
+
+    # The cue's single speaker (for single-speaker cues, which is most cues).
+    primary_speaker = None
+    for run in (speaker_runs or []):
+        if run.get("speaker") is not None:
+            primary_speaker = run.get("speaker")
+            break
+
+    # ── Single speaker (the common case) ─────────────────────────────────
+    if distinct_speakers <= 1 or len(segments) <= 1:
+        if mode == "none" or primary_speaker is None:
+            return wrap_text(dialogue_text, max_chars, max_lines)
+        if mode == "dash":
+            # Dash mode does NOT prefix a single-speaker cue (the dash only
+            # disambiguates a multi-speaker exchange). Plain wrap.
+            return wrap_text(dialogue_text, max_chars, max_lines)
+        # Bracket-style modes (alpha / generic / named / first_occurrence /
+        # every_change / always): prepend the tag to the wrapped text so the
+        # label rides on the first line. The tag counts toward the char budget
+        # of line 1 — wrap the tagged text as a whole so QC stays honest.
+        tag = _render_speaker_tag(primary_speaker, mode)
+        if not tag:
+            return wrap_text(dialogue_text, max_chars, max_lines)
+        return wrap_text(f"{tag} {dialogue_text}".strip(), max_chars, max_lines)
+
+    # ── Multi-speaker cue — one speaker per line + per-speaker label ──────
+    lines: List[str] = []
+    for seg in segments:
+        seg_text = seg["text"].strip()
+        if not seg_text:
+            continue
+        if mode == "dash":
+            lines.append(f"- {seg_text}")
+        elif mode == "none":
+            lines.append(seg_text)
+        else:
+            tag = _render_speaker_tag(seg.get("speaker"), mode)
+            lines.append(f"{tag} {seg_text}".strip() if tag else seg_text)
+
+    if not lines:
+        return wrap_text(dialogue_text, max_chars, max_lines)
+    return lines
+
+
+def merge_cue_meta(prev_cue: Dict[str, Any], next_cue: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Combine the word + speaker structure of two ADJACENT cues into a single
+    meta block, preserving per-speaker run offsets so the merged cue can be
+    re-rendered losslessly by render_lines.
+
+    Returns { "dialogue_text": str, "runs": [{speaker, word_start}, ...],
+              "words": [str, ...] }. The caller decides whether the merge is
+    allowed (speaker compatibility, budget) BEFORE calling this.
+    """
+    prev_meta = prev_cue.get("meta") or {}
+    next_meta = next_cue.get("meta") or {}
+
+    prev_text = (prev_meta.get("dialogue_text") or " ".join(prev_cue.get("lines", []))).strip()
+    next_text = (next_meta.get("dialogue_text") or " ".join(next_cue.get("lines", []))).strip()
+
+    prev_words = prev_text.split()
+    next_words = next_text.split()
+    combined_words = prev_words + next_words
+
+    prev_runs = prev_meta.get("runs") or [{"speaker": None, "word_start": 0}]
+    next_runs = next_meta.get("runs") or [{"speaker": None, "word_start": 0}]
+
+    # Re-base the next cue's run offsets by the prev cue's word count, then
+    # collapse a redundant boundary run if the two adjoining speakers match
+    # (so "same speaker" merges stay a single run = single line).
+    offset = len(prev_words)
+    combined_runs = list(prev_runs)
+    for run in next_runs:
+        rebased = {"speaker": run.get("speaker"), "word_start": run.get("word_start", 0) + offset}
+        if combined_runs and combined_runs[-1].get("speaker") == rebased["speaker"]:
+            # Same speaker continues — no new run boundary.
+            continue
+        combined_runs.append(rebased)
+
     return {
-        "ok": True,
-        "service": "ott-caption-rules-engine",
-        "version": VERSION,
-        "time": utc_now(),
-        "default_transcription_provider": "elevenlabs",
-        "scribe_model_id": os.getenv("ELEVENLABS_SCRIBE_MODEL", "scribe_v2"),
+        "dialogue_text": (prev_text + " " + next_text).strip(),
+        "runs": combined_runs,
+        "words": combined_words,
     }
 
 
-@app.post("/v1/jobs")
-def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Header(default=None)):
-    _check_secret(x_engine_secret)
-
-    job_id = str(uuid.uuid4())
-    payload_data = payload.model_dump(mode="json")
-    provider = _normalize_provider(payload_data.get("transcription_provider"))
-    model_id = _provider_model_id(provider)
-
-    if payload_data.get("reformat_from_baseline"):
-        if not payload_data.get("baselineUrl"):
-            raise HTTPException(status_code=400, detail="baselineUrl is required when reformat_from_baseline=true")
-    elif payload_data.get("reformat_only"):
-        if not payload_data.get("transcript_id"):
-            raise HTTPException(status_code=400, detail="transcript_id is required when reformat_only=true")
-        if provider != "assemblyai":
-            raise HTTPException(status_code=400, detail="reformat_only=true requires transcription_provider='assemblyai'")
-    else:
-        if not payload_data.get("mediaUrl"):
-            raise HTTPException(status_code=400, detail="mediaUrl is required for new transcription jobs")
-
-    created_at = utc_now()
-    provider_transcript_id = payload_data.get("transcript_id")
-
-    with JOBS_LOCK:
-        JOBS[job_id] = {
-            "id": job_id,
-            "status": "queued",
-            "stage": "queued",
-            "created_at": created_at,
-            "updated_at": created_at,
-            "input": payload_data,
-            "transcription_provider": provider,
-            "transcription_model": model_id,
-            # Back-compat alias used by older Base44 poller paths.
-            "assemblyai_transcript_id": provider_transcript_id if provider == "assemblyai" else None,
-            "provider_transcript_id": provider_transcript_id,
-            "project_id": payload_data.get("project_id"),
-            "cc_format_run_id": payload_data.get("cc_format_run_id"),
-            "result": None,
-            "error": None,
-        }
-
-    # ── AAI path: kick off the async transcription up front so the response
-    # carries assemblyai_transcript_id (the poller chains off this).
-    # ── Scribe path: synchronous — we just start the worker; no upfront ID.
-    if payload_data.get("reformat_from_baseline"):
-        # Synchronous-style background worker; no upfront provider ID. The
-        # worker fetches the baseline + formats. Poller reads /v1/jobs/:id.
-        update_job(job_id, status="processing", stage="fetching_transcript")
-        start_job_worker(job_id, payload_data)
-    elif payload_data.get("reformat_only"):
-        update_job(job_id, status="processing", stage="fetching_transcript",
-                   provider_transcript_id=provider_transcript_id,
-                   assemblyai_transcript_id=provider_transcript_id)
-        start_job_worker(job_id, payload_data)
-    elif provider == "assemblyai":
-        media_url = str(payload_data["mediaUrl"])
-        speaker_labels = payload_data.get("speakerLabels", True)
-        language_detection = payload_data.get("languageDetection", True)
-        # Operator-confirmed source language (ISO-639-1 for AAI). When present,
-        # submit_transcription_job pins it and forces detection OFF — the
-        # confirmed language is authoritative, no silent auto-detect fallback.
-        # None / "auto" → AAI auto-detects under language_detection. SOC 2 CC8.1.
-        source_language_code = payload_data.get("source_language_code") or None
-        try:
-            provider_transcript_id = submit_transcription_job(
-                media_url=media_url,
-                speaker_labels=speaker_labels,
-                language_detection=language_detection,
-                language_code=source_language_code,
-            )
-        except Exception as exc:
-            update_job(job_id, status="failed", stage="failed", error={"message": str(exc)})
-            return {
-                "id": job_id, "status": "failed", "stage": "failed",
-                "created_at": created_at,
-                "assemblyai_transcript_id": None,
-                "transcription_provider": provider,
-                "transcription_model": model_id,
-                "error": {"message": str(exc)},
-            }
-        update_job(job_id, status="processing", stage="waiting_for_transcription",
-                   provider_transcript_id=provider_transcript_id,
-                   assemblyai_transcript_id=provider_transcript_id)
-        start_job_worker(job_id, payload_data)
-    else:
-        # ElevenLabs Scribe path — worker thread does the synchronous POST.
-        update_job(job_id, status="processing", stage="submitting_to_provider")
-        start_job_worker(job_id, payload_data)
-
-    job = JOBS[job_id]
-    return {
-        "id": job_id,
-        "status": job["status"],
-        "stage": job.get("stage"),
-        "created_at": job["created_at"],
-        # AAI-back-compat field — null for Scribe runs (the AAI poller branch
-        # in Base44 looks for non-null before it tries to call AAI directly).
-        "assemblyai_transcript_id": job.get("assemblyai_transcript_id"),
-        "provider_transcript_id": job.get("provider_transcript_id"),
-        "transcription_provider": provider,
-        "transcription_model": model_id,
-        "engine_version": VERSION,
-    }
+def cue_speakers(cue: Dict[str, Any]) -> set:
+    """Return the set of distinct speaker ids present in a cue's meta.runs.
+    Empty set when the cue has no speaker structure (treated as 'unknown')."""
+    runs = (cue.get("meta") or {}).get("runs") or []
+    return {r.get("speaker") for r in runs if r.get("speaker") is not None}
 
 
-@app.get("/v1/jobs/{job_id}")
-def get_job(job_id: str, x_engine_secret: Optional[str] = Header(default=None)):
-    _check_secret(x_engine_secret)
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return job
+# ─── Repeat-speaker label suppression (universal, multi-mode) ────────────────
+# render_lines is intentionally STATELESS per cue (single source of truth, called
+# by the formatter AND the readability merge passes). It therefore cannot decide
+# "did the SAME speaker already get labeled on the previous cue?" — so on its own
+# it renders a bracket label on EVERY cue. Correct only for 'always' (which by
+# definition tags every cue). For every other labeling mode, repeating the label
+# on consecutive same-speaker cues is WRONG — the professional convention (and
+# what a real captioner does) is to identify a speaker once, then omit the tag
+# until the speaker changes or a new scene begins.
+#
+# The spec-faithful fix is a SINGLE stateful post-pass over the finished cue list.
+# It runs ONCE, after every cue is built/refined/readability-processed, walks the
+# cues in display order, and for every REPEAT-SUPPRESSING mode strips the
+# bracket/paren label from any cue whose speaker was already labeled per that
+# mode's rule:
+#
+#   • 'first_occurrence_per_scene' / 'named' : label each speaker ONCE per scene
+#     (the first cue of that speaker in the scene). MVP scene definition (per
+#     directive): the ENTIRE output is one scene unless explicit scene boundaries
+#     are provided — so each speaker is labeled exactly once, on their first cue.
+#     'named' is the project's per-project 'Named speakers' posture; it means
+#     "use the real diarized names" — NOT "tag literally every cue". So it
+#     suppresses repeats exactly like first_occurrence_per_scene. (This was the
+#     reported bug: SPEAKER B labeled on 4 consecutive back-to-back cues.)
+#
+#   • 'every_change' : label only when the speaker CHANGES from the previous cue.
+#     Consecutive same-speaker cues drop the tag; the tag re-appears the moment a
+#     different speaker speaks (no scene reset needed). This is the literal
+#     meaning of "every change".
+#
+# Modes NOT suppressed: 'always' (tag every cue, by design), 'dash' / 'none' /
+# 'alpha' / 'generic' (dash has no bracket tag to strip; none emits nothing;
+# alpha/generic are placeholder-label modes that intentionally re-assert the
+# placeholder each cue). SOC 2 CC8.1 / FCC §79.1 — speaker identification still
+# appears at every genuine speaker boundary; the pass is a deterministic,
+# reproducible function of (cues, mode, scene boundaries).
+#
+# Why this can never break layout: removing a leading label only ever SHORTENS a
+# line, never lengthens it, so no cue can newly overflow max_chars. We re-wrap the
+# stripped first line defensively anyway (free, deterministic) so a label that had
+# pushed text onto a second line collapses back to one when it now fits.
+
+# Modes whose repeats are suppressed once-per-scene (identify each speaker once
+# per scene, then omit until the speaker changes OR a new scene begins).
+_PER_SCENE_SUPPRESS_MODES = frozenset({"first_occurrence_per_scene", "named"})
+# Mode that suppresses purely on same-as-previous-cue (re-label on any change).
+_EVERY_CHANGE_MODE = "every_change"
+
+# Match a leading bracket tag '[NAME:] ' or paren tag '(NAME): ' the renderer
+# emitted. Dash ('- ') is NOT stripped here — dash mode is a separate label_mode
+# and is never first_occurrence_per_scene.
+import re as _re_for_labels
+# CRITICAL: the inner class must be LAZY ([^\]]*?). The rendered label is
+# '[SPEAKER A:]' — the ':' is itself a non-']' char, so a GREEDY [^\]]* eats
+# 'SPEAKER A:' and leaves only ']', making the required ':\]' suffix unmatchable.
+# A greedy class therefore NEVER matches a real label (the silent no-op bug).
+# Lazy expansion stops at the first ':]' and matches correctly.
+_BRACKET_LABEL_RE = _re_for_labels.compile(r"^\s*\[[^\]]*?:\]\s*")
+_PAREN_LABEL_RE = _re_for_labels.compile(r"^\s*\([^)]*?\):\s*")
+
+
+def _strip_leading_bracket_label(line: str) -> str:
+    s = _BRACKET_LABEL_RE.sub("", line or "", count=1)
+    s = _PAREN_LABEL_RE.sub("", s, count=1)
+    return s
+
+
+def _line_has_bracket_label(line: str) -> bool:
+    return _strip_leading_bracket_label(line) != (line or "")
+
+
+def suppress_repeat_speaker_labels(
+    cues: List[Dict[str, Any]],
+    scene_boundary_idxs: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """Suppress repeated speaker labels across a finished cue list, UNIVERSALLY
+    for every repeat-suppressing label mode.
+
+    Two suppression policies, selected by the resolved SPEAKER_LABEL_MODE:
+      • per-scene ('first_occurrence_per_scene' / 'named'): the FIRST cue of each
+        speaker in a scene keeps its rendered label; every later cue of that same
+        speaker in the SAME scene has its label stripped. The label re-appears on
+        a scene boundary.
+      • every-change ('every_change'): a cue keeps its label only when its speaker
+        DIFFERS from the immediately-preceding dialogue cue's speaker; consecutive
+        same-speaker cues have their label stripped. Re-appears on any change, no
+        scene reset required.
+
+    No-op for every other mode ('always' / 'dash' / 'none' / 'alpha' / 'generic').
+    Pure, deterministic, in-place-safe (returns the same list mutated).
+    `scene_boundary_idxs` is a set of cue indices that START a new scene; when
+    None/empty the entire output is treated as ONE scene (MVP).
+    """
+    mode = _speaker_label_mode()
+    per_scene = mode in _PER_SCENE_SUPPRESS_MODES
+    every_change = mode == _EVERY_CHANGE_MODE
+    if not (per_scene or every_change):
+        return cues
+
+    max_lines = _max_lines()
+    max_chars = _max_chars()
+    boundaries = scene_boundary_idxs or set()
+    seen_speakers: set = set()   # per-scene mode: speakers already labeled this scene
+    prev_speaker = None          # every_change mode: last dialogue cue's speaker
+
+    def _strip_cue_label(cue: Dict[str, Any]) -> None:
+        """Strip the leading bracket/paren label off this cue's lines and re-wrap
+        the now-shorter text. Shortening can never overflow, so this is safe."""
+        lines = cue.get("lines", [])
+        if any(_line_has_bracket_label(l) for l in lines):
+            spoken = " ".join(_strip_leading_bracket_label(l) for l in lines).strip()
+            cue["lines"] = wrap_text(spoken, max_chars, max_lines)
+
+    for i, cue in enumerate(cues):
+        if i in boundaries:
+            seen_speakers = set()   # new scene → per-scene labels re-appear
+            prev_speaker = None     # new scene → first cue re-asserts its label
+        if cue.get("type") != "dialogue":
+            # A non-dialogue cue (music / SFX) does not carry a speaker identity
+            # and must not reset the every_change run — skip without touching
+            # prev_speaker so a music cue between two same-speaker lines doesn't
+            # spuriously re-label the second one.
+            continue
+        speaker = None
+        for run in ((cue.get("meta") or {}).get("runs") or []):
+            if run.get("speaker") is not None:
+                speaker = run.get("speaker")
+                break
+        # A cue with no resolvable speaker carries no identity; leave it exactly
+        # as rendered and don't let it advance the every_change run.
+        if speaker is None:
+            continue
+
+        if per_scene:
+            if speaker in seen_speakers:
+                _strip_cue_label(cue)
+            else:
+                seen_speakers.add(speaker)
+        else:  # every_change
+            if speaker == prev_speaker:
+                _strip_cue_label(cue)
+            prev_speaker = speaker
+
+    return cues
