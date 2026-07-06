@@ -92,6 +92,22 @@ _ALWAYS_CAP_LOWER = {"i", "i'm", "i've", "i'll", "i'd"}
 # Terminal punctuation that closes a sentence (mirrors segmentation).
 _TERMINALS = (".", "!", "?", "…", "。", "！", "？")
 
+# Closing quotes/brackets that can trail terminal punctuation ('win."', 'done!)').
+# The sentence-end check must see through these — otherwise a mid-cue sentence
+# that closes with a quote poisons the proper-noun harvest (the word after it
+# looks "mid-sentence capitalized") and the continuation tracker misreads a
+# quote-closed cue as unfinished.
+_TRAILING_CLOSERS = "\"'»”’)]}"
+
+
+def _ends_sentence(token: str) -> bool:
+    """Quote-aware sentence-end check: strip trailing closing quotes/brackets,
+    then defer to the ONE shared abbreviation-aware primitive. 'state."' → True;
+    'Mr.' → False; 'ago,' → False. Used by both the evidence harvest and the
+    continuation tracker so they can never disagree."""
+    w = (token or "").strip().rstrip(_TRAILING_CLOSERS)
+    return _is_sentence_end(w)
+
 
 def _split_label(text: str):
     """Return (label, body). Label is the verbatim leading speaker tag (or '')."""
@@ -187,7 +203,16 @@ def _collect_case_evidence(cue_texts: List[str]):
                 continue
             if not core[0].isupper() or low in _ALWAYS_CAP_LOWER:
                 continue
-            if i > 0 and not _is_sentence_end(tokens[i - 1]):
+            # CLOSED-CLASS GUARD: pronouns/function words ("they", "this", "and")
+            # are NEVER proper nouns in English — a capitalized mid-cue occurrence
+            # is itself a casing artifact (ellipsis continuation, quote-closed
+            # sentence, transcript noise), and one such occurrence must not
+            # globally protect the word across the whole file. This closed the
+            # real-world bug where a single stray "They" capital protected every
+            # continuation "They" in a 1000-cue show.
+            if low in _COMMON_WORDS:
+                continue
+            if i > 0 and not _ends_sentence(tokens[i - 1]):
                 proper.add(low)
     return proper, lowercase_seen
 
@@ -370,7 +395,7 @@ def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, 
         final_body = _cue_text(cue)
         _, fb = _split_label(final_body)
         prev_last_word = fb.split()[-1] if fb.split() else ""
-        prev_ended_sentence = _is_sentence_end(prev_last_word)
+        prev_ended_sentence = _ends_sentence(prev_last_word)
 
     print(f"[CAPITALIZATION] lowered_continuations={stats['lowered']} raised_starts={stats['raised']}")
     return cues
