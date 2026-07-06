@@ -296,7 +296,10 @@ def _llm_condense_cue(client, model, system_prompt, verbatim: str, target_chars:
     payload = {
         "caption_text": verbatim,
         "target_max_characters": target_chars,
-        "instruction": "Condense to fit the reading limit while preserving meaning.",
+        "instruction": (
+            f"Condense to AT MOST {target_chars} characters — this is a HARD "
+            "limit — while preserving the full meaning."
+        ),
     }
     try:
         response = client.responses.create(
@@ -455,7 +458,7 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
         if client is not None and _cue_cps(candidate, working) > max_cps:
             dur_s = max(0.001, (candidate["end_ms"] - candidate["start_ms"]) / 1000.0)
             target_chars = int(max_cps * dur_s)
-            for _attempt in range(2):
+            for _attempt in range(3):
                 condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
                 if not condensed:
                     break
@@ -486,6 +489,16 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
             continue
 
         # Merge couldn't be made compliant — keep the originals untouched.
+        # Diagnostic for Railway logs: exactly WHY the pair shipped as
+        # fragments (LLM couldn't reach budget vs geometry overflow), so a
+        # rejected merge is answerable from the run log alone. SOC 2 CC8.1.
+        print(
+            f"[CONDENSATION] merge_rejected pair=({cue.get('idx')},{nxt.get('idx')}) "
+            f"final_cps={_cue_cps(candidate, working):.1f} max_cps={max_cps} "
+            f"final_chars={_visible_chars(working)} "
+            f"window_ms={candidate['end_ms'] - candidate['start_ms']} "
+            f"fits_geometry={fits_geometry}"
+        )
         out.append(cue)
         i += 1
     return out, merged_count
@@ -574,7 +587,8 @@ def condense_cues(
     start_time = time.monotonic()
     llm_budget_exhausted = False
 
-    stats = {"disfluency": 0, "llm": 0, "still_over": 0, "llm_rejected": 0}
+    stats = {"disfluency": 0, "llm": 0, "still_over": 0, "llm_rejected": 0,
+             "llm_skipped_short": 0}
     total = len(cues)
     out: List[Dict[str, Any]] = []
 
@@ -618,13 +632,25 @@ def condense_cues(
             else:
                 dur_s = max(0.001, (int(cue.get("end_ms", 0)) - int(cue.get("start_ms", 0))) / 1000.0)
                 target_chars = int(max_cps * dur_s)
-                condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
-                if condensed:
-                    working = condensed
-                    applied_kind = "condense" if applied_kind == "disfluency" else "condense"
-                    stats["llm"] += 1
+                # ABSURD-BUDGET / SHORT-INTERJECTION GUARD: a 0.3s cue yields
+                # a ~5-char budget — asking the LLM to "condense" a 2-word
+                # line ('By who?') into that can only DELETE dialogue
+                # ('Who?') while the cue still fails min-duration. Below the
+                # floor, no rewording can help; timing is the only remedy, so
+                # ship verbatim for the honest QC flag instead of mutilating
+                # words. Floor is spec-tunable via CONDENSATION_MIN_TARGET_CHARS.
+                body_words = _strip_leading_label(working)[1].split()
+                if target_chars < _env_int("CONDENSATION_MIN_TARGET_CHARS", 16) \
+                        or len(body_words) <= 3:
+                    stats["llm_skipped_short"] += 1
                 else:
-                    stats["llm_rejected"] += 1
+                    condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
+                    if condensed:
+                        working = condensed
+                        applied_kind = "condense" if applied_kind == "disfluency" else "condense"
+                        stats["llm"] += 1
+                    else:
+                        stats["llm_rejected"] += 1
 
         if applied_kind is None or working == verbatim:
             if _cue_cps(cue, verbatim) > max_cps:
@@ -668,6 +694,7 @@ def condense_cues(
         f"[CONDENSATION] mode={mode} merged_pairs={merged_pairs} "
         f"disfluency={stats['disfluency']} "
         f"llm={stats['llm']} llm_rejected={stats['llm_rejected']} "
+        f"llm_skipped_short={stats['llm_skipped_short']} "
         f"still_over_after={stats['still_over']} "
         f"llm_budget_exhausted={llm_budget_exhausted}"
     )
