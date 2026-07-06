@@ -61,10 +61,13 @@ import os
 from typing import Any, Dict, List, Optional
 
 try:
-    from .rendering import render_lines as _render_lines
+    from .rendering import render_lines as _render_lines, cue_fits_delivered as _cue_fits_delivered
 except Exception:  # pragma: no cover
     def _render_lines(words, runs, max_lines=None, max_chars=None, dialogue_text=None):
         return [dialogue_text if dialogue_text is not None else " ".join(words)]
+
+    def _cue_fits_delivered(cue, max_lines=None, max_chars=None):
+        return True
 
 try:
     from .cjk import (
@@ -82,6 +85,19 @@ except Exception:  # pragma: no cover
 
     CJK_CLAUSE_ENDERS = ("、", "，", "；", "：", "・", ",", ";", ":")
     CJK_SENTENCE_ENDERS = ("。", "！", "？", "．", "!", "?", ".")
+
+# Phrase-boundary word classes — the SAME linguistic tables the line-breaker uses,
+# so a punctuation-free cue is split at a real phrase point (before a preposition/
+# conjunction/article, never stranding a function word at a cue end) rather than a
+# blind midpoint. Shared import keeps segmentation identical to line-break logic.
+try:
+    from .linebreak import _LEADING_WORDS, _DETERMINERS, _bare as _bare_word
+except Exception:  # pragma: no cover
+    _LEADING_WORDS = frozenset()
+    _DETERMINERS = frozenset()
+
+    def _bare_word(w):
+        return (w or "").strip(".,;:!?—–\"')]}").lower()
 
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
@@ -214,6 +230,37 @@ def _pick_balanced_boundary(bounds: List[int], n: int) -> Optional[int]:
     return None
 
 
+def _pick_word_phrase_boundary(words: List[str]) -> Optional[int]:
+    """FALLBACK when a cue has no clause/sentence punctuation to split at (the
+    "no interior boundary" cases like "your head will be adorned in crimson and
+    gold at the"). Pick the word split index nearest the middle that produces a
+    GOOD phrase break — one where the second half LEADS with a preposition/
+    conjunction/article/determiner (so the break lands before a natural phrase
+    start) and the first half does NOT end on a stranded function word. Same
+    word-class intelligence the line-breaker uses, applied to CUE splitting so a
+    punctuation-free line still divides at a real phrase point, never a blind
+    midpoint. Returns a split index in 1..len-1, or None if too short (≤1 word)."""
+    n = len(words)
+    if n < 2:
+        return None
+    mid = n / 2.0
+    scored: List[tuple] = []
+    for i in range(1, n):
+        last_bare = _bare_word(words[i - 1])
+        first_bare = _bare_word(words[i])
+        score = 0.0
+        if first_bare in _LEADING_WORDS or first_bare in _DETERMINERS:
+            score += 10.0
+        if last_bare in _LEADING_WORDS or last_bare in _DETERMINERS:
+            score -= 12.0
+        score -= abs(i - mid) * 1.0
+        scored.append((score, i))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return scored[0][1]
+
+
 # ─── Timing at a split point ─────────────────────────────────────────
 def _split_time_at(
     cue: Dict[str, Any],
@@ -289,7 +336,14 @@ def _split_cue_once(cue: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         bounds = _latin_phrase_boundaries(words)
         widx = _pick_balanced_boundary(bounds, len(words))
         if widx is None:
-            return None
+            # No clause/sentence punctuation to split at — fall back to the best
+            # WORD-level phrase boundary (before a preposition/conjunction/article,
+            # never stranding a function word). This is what lets a punctuation-
+            # free overflow like "your head will be adorned in crimson and gold at
+            # the" split cleanly instead of shipping a broken labeled line.
+            widx = _pick_word_phrase_boundary(words)
+            if widx is None:
+                return None
         left_words = words[:widx]
         right_words = words[widx:]
         left_text = " ".join(left_words)
@@ -330,52 +384,16 @@ def _split_cue_once(cue: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     return [_mk(left_text, start, left_end), _mk(right_text, right_start, end)]
 
 
-def _rendered_lines_as_delivered(cue: Dict[str, Any]) -> List[str]:
-    """Render the cue EXACTLY as the deliverable will draw it — INCLUDING the
-    speaker label the spec's mode prepends. This is the single most important
-    correctness contract in the shaper: the stage that decides "does this fit?"
-    must ask the identical question the exported file answers.
-
-    Why not trust cue['lines']: the formatter stores a BODY-ONLY wrap on the cue
-    at build time; the label (e.g. '[SPEAKER B:] ', 13ch) is prepended later by
-    render_lines. So a 54ch body that wraps clean at 2×32 body-only becomes a
-    67ch labeled string that CANNOT fit 2×32 — and the greedy fallback ships a
-    38ch line that fails QC. Re-rendering here through the SAME render_lines the
-    formatter uses (with the cue's real speaker runs) makes the shaper measure
-    the label-inclusive line, so a labeled cue that overflows is split at a
-    phrase boundary until each labeled render fits. Falls back to the stored
-    lines only if render_lines is unavailable. SOC 2 CC8.1 / FCC §79.1 — the
-    delivered on-screen line never silently exceeds the per-line cap, label
-    included."""
-    words = _cue_words(cue)
-    runs = (cue.get("meta") or {}).get("runs") or []
-    dialogue_text = _cue_text(cue)
-    try:
-        return _render_lines(words, runs, _max_lines(), _max_chars(), dialogue_text)
-    except Exception:
-        return list(cue.get("lines") or [])
-
-
 def _wrap_overflows_cpl(cue: Dict[str, Any]) -> bool:
-    """True when the cue's LABEL-INCLUSIVE rendered lines exceed the spec's
-    max_chars_per_line — i.e. the deliverable's best wrap STILL leaves a line
-    over the CPL cap once the speaker label is on it. This catches two classes:
-      • the body-only overflow (cue 0030: 33ch body line against a 32 cap), and
-      • the LABEL-INDUCED overflow (cue 0002: a 54ch body that wraps clean
-        body-only, but '[SPEAKER B:] ' pushes the render to a 38ch line) — the
-        gap where the splitter's body-only budget disagreed with the renderer's
-        label-inclusive budget and shipped an over-wide line.
-    Splitting at a phrase boundary gives cues that each wrap within CPL WITH the
-    label. CJK counts by character (no spaces), Latin by raw length; both
-    compared to max_chars. Measured on the delivered render, not the stored
-    body-only lines."""
-    max_chars = _max_chars()
-    for line in _rendered_lines_as_delivered(cue):
-        s = str(line or "")
-        length = _cjk_count(s) if _is_cjk(s) else len(s)
-        if length > max_chars:
-            return True
-    return False
+    """True when the cue, RENDERED AS DELIVERED (speaker label included), does NOT
+    fit the spec geometry — its best labeled wrap still leaves a line over the CPL
+    cap or exceeds max_lines. Delegates to the ONE shared fit primitive
+    (rendering.cue_fits_delivered) so the shaper's "does this fit?" question is
+    byte-identical to the formatter's, the readability merge's, and the exported
+    file's. Catches both the body-only overflow (33ch line) and the LABEL-INDUCED
+    overflow (54ch body that wraps clean body-only, but '[SPEAKER B:]' pushes the
+    render to 38ch). SOC 2 CC8.1 / FCC §79.1."""
+    return not _cue_fits_delivered(cue, _max_lines(), _max_chars())
 
 
 def _needs_shaping(cue: Dict[str, Any], target_ms: int) -> bool:
@@ -431,6 +449,39 @@ def shape_caption_rhythm(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not changed:
             break
 
+    for i, cue in enumerate(cues):
+        cue["idx"] = i + 1
+    return cues
+
+
+def enforce_cpl_fit(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """FINAL delivered-fit guarantee, run at the very END of the readability
+    pipeline (after CPS extend/split/merge). Splits ANY dialogue cue that still
+    doesn't fit DELIVERED (speaker label included) at a phrase boundary — clause
+    first, word-phrase fallback — until every cue fits or can't be split further.
+    Pure CPL: the duration trigger is ignored here (a cue can be perfectly-timed
+    yet still overflow its line once labeled). This is the safety net that
+    guarantees no over-label line survives any later stage that re-wrapped or
+    re-merged after the initial shaping pass. Idempotent — a cue that already
+    fits is never touched. Bounded fixed-point loop. SOC 2 CC8.1 / FCC §79.1."""
+    if not cues:
+        return cues
+    for _ in range(8):
+        out: List[Dict[str, Any]] = []
+        changed = False
+        for cue in cues:
+            if cue.get("type") != "dialogue" or not _wrap_overflows_cpl(cue):
+                out.append(cue)
+                continue
+            split = _split_cue_once(cue)
+            if split:
+                out.extend(split)
+                changed = True
+            else:
+                out.append(cue)
+        cues = out
+        if not changed:
+            break
     for i, cue in enumerate(cues):
         cue["idx"] = i + 1
     return cues
