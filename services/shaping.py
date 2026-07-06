@@ -118,6 +118,14 @@ def _shaping_enabled() -> bool:
     return os.getenv("CUSTOM_SHAPING_ENABLED", "1") not in ("0", "false", "False")
 
 
+def _condensation_mode() -> str:
+    """CONDENSATION_MODE gate for the condense-to-fit-before-split attempt.
+    'off' → verbatim spec, NEVER trim to avoid a split (go straight to split).
+    Any other value permits the deterministic disfluency trim that can let a
+    marginally-overflowing sentence stay ONE cue instead of being split."""
+    return (os.getenv("CONDENSATION_MODE", "disfluency_only") or "disfluency_only").strip().lower()
+
+
 def _max_chars() -> int:
     return _env_int("CUSTOM_MAX_CHARS", 32)
 
@@ -539,6 +547,84 @@ def _needs_shaping(cue: Dict[str, Any], target_ms: int) -> bool:
     return _cue_duration_ms(cue) > int(target_ms * 1.5) or _wrap_overflows_cpl(cue)
 
 
+# ─── Condense-to-fit-before-split (C when needed) ────────────────────
+def _try_condense_to_fit(
+    cue: Dict[str, Any],
+    target_ms: int,
+) -> Optional[Dict[str, Any]]:
+    """Attempt to keep a marginally-overflowing sentence as ONE cue by trimming
+    trivial disfluency, instead of splitting it across two cues.
+
+    Only fires when the cue needs shaping PURELY for CPL fit — i.e. it is NOT
+    genuinely too long to read (duration ≤ 1.5×target) but its best delivered
+    wrap overflows the per-line cap. A cue that is also over-rhythm (too long)
+    genuinely needs the split; we don't paper over that with a trim.
+
+    Spec-gated: CONDENSATION_MODE='off' (verbatim spec) → return None (no trim;
+    caller splits). Otherwise run the DETERMINISTIC disfluency remover (no AI —
+    the reproducible layer) and, if the trimmed text now fits delivered, return
+    a single condensed cue with meta.condensation provenance so the Base44
+    ingester records the original verbatim + one-click revert. Returns None when
+    a trim can't achieve fit (caller falls through to the split)."""
+    # Verbatim spec → never trim to avoid a split.
+    if _condensation_mode() == "off":
+        return None
+    # Only for cues that overflow CPL but are NOT over-rhythm (those must split).
+    if _cue_duration_ms(cue) > int(target_ms * 1.5):
+        return None
+    if not _wrap_overflows_cpl(cue):
+        return None
+
+    try:
+        from .condensation import remove_disfluencies
+    except Exception:
+        return None
+
+    verbatim = _cue_text(cue)
+    if not verbatim:
+        return None
+    trimmed = remove_disfluencies(verbatim)
+    if not trimmed or trimmed == verbatim:
+        return None  # nothing to trim → can't rescue → split
+
+    speaker = _primary_speaker(cue)
+    runs = [{"speaker": speaker, "word_start": 0}]
+    max_chars = _max_chars()
+    max_lines = _max_lines()
+    label, body = "", trimmed
+    # Preserve a leading speaker label if the cue text carried one.
+    m = None
+    try:
+        import re as _re
+        m = _re.match(r"^\s*(?:-\s+|\[[^\]]*\]:?\s*|[^\s:]{1,24}:\s+)", trimmed)
+    except Exception:
+        m = None
+    if m:
+        label, body = trimmed[:m.end()], trimmed[m.end():]
+
+    candidate = {
+        "idx": cue.get("idx", 0),
+        "start_ms": int(cue.get("start_ms", 0)),
+        "end_ms": int(cue.get("end_ms", 0)),
+        "lines": _render_lines(body.split(), runs, max_lines, max_chars, body),
+        "type": "dialogue",
+        "meta": {
+            "dialogue_text": trimmed,
+            "runs": runs,
+            "word_timings": _word_timings(cue),
+            "condensation": {
+                "applied": True,
+                "kind": "disfluency",
+                "verbatim": verbatim,
+            },
+        },
+    }
+    # Only accept the trim if it ACTUALLY fits delivered now (else split reads better).
+    if _wrap_overflows_cpl(candidate):
+        return None
+    return candidate
+
+
 # ─── Public entry ────────────────────────────────────────────────────
 def shape_caption_rhythm(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Universal caption-rhythm pass. Iteratively splits over-rhythm dialogue
@@ -565,6 +651,21 @@ def shape_caption_rhythm(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for cue in cues:
             if not _needs_shaping(cue, target_ms):
                 out.append(cue)
+                continue
+            # CONDENSE-TO-FIT-BEFORE-SPLIT ("A always, C when needed"). If this
+            # cue needs shaping ONLY because its wrap marginally overflows CPL
+            # (not because it's genuinely too long to read), first try a
+            # deterministic disfluency trim to make the WHOLE sentence fit one
+            # cue — the professional captioner's move. Keeps a single readable
+            # cue instead of minting a split fragment + fail-cue. Spec-gated on
+            # CONDENSATION_MODE (verbatim specs skip straight to the split). If
+            # the trim achieves fit, keep the one condensed cue; otherwise fall
+            # through to the split. SOC 2 CC8.1 — the trim is attributed via
+            # meta.condensation, exactly like the condensation stage.
+            fitted = _try_condense_to_fit(cue, target_ms)
+            if fitted is not None:
+                out.append(fitted)
+                changed = True
                 continue
             split = _split_cue_once(cue)
             if split:
