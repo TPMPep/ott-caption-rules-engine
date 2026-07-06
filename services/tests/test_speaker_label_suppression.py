@@ -73,7 +73,9 @@ def _first_line_has_label(cue):
 # ── all repeat-suppressing modes are turn-based (parametrized) ───────
 # 'named', 'first_occurrence_per_scene', and 'every_change' resolve to the SAME
 # turn-based rule: label only on a speaker change from the previous dialogue cue.
-_TURN_BASED_MODES = ["named", "first_occurrence_per_scene", "every_change"]
+# Placeholder modes ('alpha' / 'generic') follow the same turn-based rule —
+# '[SPEAKER B:]' repeating on consecutive same-speaker cues reads as noise.
+_TURN_BASED_MODES = ["named", "first_occurrence_per_scene", "every_change", "alpha", "generic"]
 
 
 @pytest.mark.parametrize("mode", _TURN_BASED_MODES)
