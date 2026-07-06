@@ -277,6 +277,16 @@ def editorial_refine_cues(
             return idx, "overflow", None
         new_cue = dict(cue)
         new_cue["lines"] = final_lines
+        # KEEP META IN SYNC (2026-07-06): the AI's casing/punctuation fixes must
+        # land on meta.dialogue_text too, not just the rendered lines. Leaving
+        # dialogue_text stale was the 'This place' defect: the AI capitalized
+        # the LINE, downstream deterministic passes (sentence capitalization,
+        # condensation) read dialogue_text, saw lowercase 'this', concluded
+        # nothing to fix — and the delivered line shipped the wrong capital.
+        # Lines and dialogue_text must never diverge. SOC 2 CC8.1.
+        new_meta = dict(cue.get("meta") or {})
+        new_meta["dialogue_text"] = " ".join(ai_text_lines).strip()
+        new_cue["meta"] = new_meta
         return idx, "applied", new_cue
 
     results: Dict[int, Dict[str, Any]] = {}
