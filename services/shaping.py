@@ -386,7 +386,14 @@ def _pick_rebalanced_latin_boundary(
     full_text = " ".join(words)
 
     # Candidate clause boundaries, cleanest-and-most-balanced first.
-    clause = [b for b in _latin_phrase_boundaries(words) if _clause_boundary_ok(words, b)]
+    # MIN-SIDE GUARD (2026-07-06, Pluto 0062): a clause boundary that strands a
+    # tiny side (< 3 words, e.g. splitting "No, I'm not gonna call…" after
+    # "No,") is editorially unusable as a standalone caption — it is excluded
+    # so the picker falls through to a balanced word-phrase boundary instead.
+    clause = [
+        b for b in _latin_phrase_boundaries(words)
+        if _clause_boundary_ok(words, b) and min(b, len(words) - b) >= 3
+    ]
     mid = len(words) / 2.0
     clause.sort(key=lambda b: abs(b - mid))
     for idx in clause:
@@ -504,9 +511,25 @@ def _split_cue_once(
         # window and split anyway (each child gets whatever window remains).
         if require_readable_windows:
             return None
-        cut = max(start + 1, min(cut, end - 1))
-        left_end = cut
-        right_start = cut
+        # CPL SAFETY-NET timing (2026-07-06, Pluto sliver defect): a forced
+        # split must NEVER mint a near-zero-duration child. When the parent
+        # window can host two readable cues, clamp the cut so BOTH children
+        # get at least min_display — a pop-on caption may legitimately outlive
+        # the exact speech frames (standard broadcast practice; readability
+        # outranks frame-exactness on a forced split). When the window is too
+        # small for two readable cues, place the cut proportionally to text so
+        # each child gets its fair share, never 1ms.
+        span = end - start
+        if span >= (2 * min_display + min_gap):
+            cut = max(start + min_display + (min_gap // 2),
+                      min(cut, end - min_display - (min_gap // 2)))
+            left_end = cut - (min_gap // 2)
+            right_start = cut + (min_gap // 2)
+        else:
+            frac = len(left_text) / max(1, len(left_text) + len(right_text))
+            cut = start + max(1, int(span * frac))
+            left_end = cut
+            right_start = cut
 
     runs = [{"speaker": speaker, "word_start": 0}]
     timing_source = "word_timings" if _word_timings(cue) else "interpolated"
