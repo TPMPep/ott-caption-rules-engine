@@ -396,7 +396,21 @@ def _pick_rebalanced_latin_boundary(
         ):
             return idx
 
-    # Word-phrase fallback (punctuation-free cues), also window-checked.
+    # GRAMMAR OUTRANKS THE WINDOW HEURISTIC (2026-07-06). When clean clause
+    # boundaries EXIST but none passes the readable-window preference, split at
+    # the most balanced clause boundary anyway rather than falling through to a
+    # word split. The window check is a preference, not a law: a clause split
+    # with a slightly tight window is professionally correct, while a mid-
+    # phrase word split ('…25 laps around' | 'this place,') breaks the
+    # universal phrase-integrity rule AND still fails CPS. The caller's own
+    # min-window recheck still vetoes the split in rhythm posture (cue stays
+    # whole); the CPL safety net (enforce_cpl_fit) then force-splits at this
+    # same clause boundary when geometry demands it. Downstream stages (CPS
+    # extend, sliver absorb, condensation, QC) own the timing remedy.
+    if clause:
+        return clause[0]
+
+    # Word-phrase fallback — ONLY for punctuation-free cues, window-checked.
     widx = _pick_word_phrase_boundary(words)
     if widx is not None and _child_windows_readable(
         cue, " ".join(words[:widx]), " ".join(words[widx:]),
