@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.20.1-sentence-cap-authority"
+VERSION = "5.20.2-label-turns-pronoun-guard"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
