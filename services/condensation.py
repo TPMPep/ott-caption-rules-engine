@@ -395,10 +395,21 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
     max_dur = _env_int("CUSTOM_MAX_DISPLAY_MS", 7000)
     max_gap = _env_int("CONDENSATION_MERGE_MAX_GAP_MS", 500)
 
+    # Merge-pass wall-clock budget — previously UNBOUNDED: hundreds of
+    # eligible pairs × up to 3 LLM attempts each could grind for many
+    # minutes. Once exceeded, remaining cues ship untouched (fragments get
+    # the honest QC flag instead of blocking delivery).
+    merge_budget_s = _env_int("CONDENSATION_MERGE_BUDGET_SECONDS", 120)
+    merge_start = time.monotonic()
+
     out: List[Dict[str, Any]] = []
     merged_count = 0
     i = 0
     while i < len(cues):
+        if time.monotonic() - merge_start > merge_budget_s:
+            print(f"[CONDENSATION] merge_budget_exhausted after {merged_count} merges")
+            out.extend(cues[i:])
+            break
         cue = cues[i]
         nxt = cues[i + 1] if i + 1 < len(cues) else None
         left_text = _cue_dialogue_text(cue).strip()
@@ -584,106 +595,123 @@ def condense_cues(
 
     run_budget_seconds = _env_int("CONDENSATION_RUN_BUDGET_SECONDS", 120)
     heartbeat_every = _env_int("CONDENSATION_HEARTBEAT_EVERY", 25)
+    concurrency = _env_int("CONDENSATION_CONCURRENCY", 8)
     start_time = time.monotonic()
     llm_budget_exhausted = False
 
     stats = {"disfluency": 0, "llm": 0, "still_over": 0, "llm_rejected": 0,
              "llm_skipped_short": 0}
-    total = len(cues)
-    out: List[Dict[str, Any]] = []
 
+    # ── Phase 1: deterministic per-cue analysis (serial, cheap) ──────────
+    # Decide per over-CPS cue: disfluency-cleaned text + whether a bounded
+    # LLM condense is warranted (fragment-gated, short-interjection-gated).
+    plans: Dict[int, Dict[str, Any]] = {}
     for idx, cue in enumerate(cues):
-        if heartbeat and idx > 0 and idx % heartbeat_every == 0:
-            try:
-                heartbeat(idx, total)
-            except Exception:
-                pass
-
         if cue.get("type") != "dialogue":
-            out.append(cue)
             continue
-
         verbatim = _cue_dialogue_text(cue).strip()
         if not verbatim:
-            out.append(cue)
             continue
-
         # Only act on cues STILL over the reading limit after CPS extend/split.
         if _cue_cps(cue, verbatim) <= max_cps:
-            out.append(cue)
             continue
-
         applied_kind = None
         working = verbatim
-
-        # 1. Deterministic disfluency removal (always, for over-CPS cues).
-        disfluent_removed = remove_disfluencies(working)
-        if disfluent_removed != working and disfluent_removed.strip():
-            working = disfluent_removed
+        cleaned = remove_disfluencies(working)
+        if cleaned != working and cleaned.strip():
+            working = cleaned
             applied_kind = "disfluency"
             stats["disfluency"] += 1
-
-        # 2. LLM paraphrase — only if still over CPS AND mode allows it AND the
-        # cue is a COMPLETE sentence (never reword a fragment in isolation).
-        if use_llm and not llm_budget_exhausted and not fragment_flags[idx] \
-                and _cue_cps(cue, working) > max_cps:
-            if time.monotonic() - start_time > run_budget_seconds:
-                llm_budget_exhausted = True
+        llm_target = None
+        # LLM only for COMPLETE sentences (never reword a fragment in isolation).
+        if use_llm and not fragment_flags[idx] and _cue_cps(cue, working) > max_cps:
+            dur_s = max(0.001, (int(cue.get("end_ms", 0)) - int(cue.get("start_ms", 0))) / 1000.0)
+            target_chars = int(max_cps * dur_s)
+            # ABSURD-BUDGET / SHORT-INTERJECTION GUARD (5.21.3): below the
+            # floor, no rewording can help — timing is the only remedy, so
+            # ship verbatim for the honest QC flag instead of mutilating words.
+            body_words = _strip_leading_label(working)[1].split()
+            if target_chars < _env_int("CONDENSATION_MIN_TARGET_CHARS", 16) \
+                    or len(body_words) <= 3:
+                stats["llm_skipped_short"] += 1
             else:
-                dur_s = max(0.001, (int(cue.get("end_ms", 0)) - int(cue.get("start_ms", 0))) / 1000.0)
-                target_chars = int(max_cps * dur_s)
-                # ABSURD-BUDGET / SHORT-INTERJECTION GUARD: a 0.3s cue yields
-                # a ~5-char budget — asking the LLM to "condense" a 2-word
-                # line ('By who?') into that can only DELETE dialogue
-                # ('Who?') while the cue still fails min-duration. Below the
-                # floor, no rewording can help; timing is the only remedy, so
-                # ship verbatim for the honest QC flag instead of mutilating
-                # words. Floor is spec-tunable via CONDENSATION_MIN_TARGET_CHARS.
-                body_words = _strip_leading_label(working)[1].split()
-                if target_chars < _env_int("CONDENSATION_MIN_TARGET_CHARS", 16) \
-                        or len(body_words) <= 3:
-                    stats["llm_skipped_short"] += 1
-                else:
-                    condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
-                    if condensed:
-                        working = condensed
-                        applied_kind = "condense" if applied_kind == "disfluency" else "condense"
-                        stats["llm"] += 1
-                    else:
-                        stats["llm_rejected"] += 1
+                llm_target = target_chars
+        plans[idx] = {"verbatim": verbatim, "working": working,
+                      "applied_kind": applied_kind, "llm_target": llm_target}
 
-        if applied_kind is None or working == verbatim:
-            if _cue_cps(cue, verbatim) > max_cps:
+    # ── Phase 2: PARALLEL LLM condensation (engine 5.22.0) ───────────────
+    # Serial per-cue calls covered only ~80 cues inside the 120s budget on a
+    # feature-length show. Each cue is condensed independently, so the calls
+    # fan out through a bounded thread pool — same budget, same guards
+    # (entity/number locks live inside _llm_condense_cue), ~8× coverage.
+    llm_idxs = [i for i, p in plans.items() if p["llm_target"]]
+    if llm_idxs and client is not None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        done_count = 0
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {
+                pool.submit(_llm_condense_cue, client, model, system_prompt,
+                            plans[i]["working"], plans[i]["llm_target"]): i
+                for i in llm_idxs
+            }
+            for fut in as_completed(futures):
+                done_count += 1
+                if heartbeat and done_count % heartbeat_every == 0:
+                    try:
+                        heartbeat(done_count, len(llm_idxs))
+                    except Exception:
+                        pass
+                i = futures[fut]
+                try:
+                    condensed = fut.result()
+                except Exception:
+                    condensed = None
+                if condensed:
+                    plans[i]["working"] = condensed
+                    plans[i]["applied_kind"] = "condense"
+                    stats["llm"] += 1
+                else:
+                    stats["llm_rejected"] += 1
+                if time.monotonic() - start_time > run_budget_seconds:
+                    llm_budget_exhausted = True
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+
+    # ── Phase 3: deterministic apply (serial) ────────────────────────────
+    out: List[Dict[str, Any]] = []
+    for idx, cue in enumerate(cues):
+        p = plans.get(idx)
+        if p is None:
+            out.append(cue)
+            continue
+        working = p["working"]
+        if p["applied_kind"] is None or working == p["verbatim"]:
+            if _cue_cps(cue, p["verbatim"]) > max_cps:
                 stats["still_over"] += 1
             out.append(cue)
             continue
-
-        # Re-render the condensed text through the shared renderer so line
-        # geometry + speaker label stay spec-correct (single source of truth).
+        # Re-render through the shared renderer so line geometry + speaker
+        # label stay spec-correct (single source of truth).
         label, body = _strip_leading_label(working)
         runs = (cue.get("meta") or {}).get("runs") or []
         if _render_lines is not None:
             new_lines = _render_lines(body.split(), runs, max_lines, max_chars, body)
         else:
             new_lines = [working]
-
         new_cue = dict(cue)
         new_cue["lines"] = new_lines
         new_meta = dict(cue.get("meta") or {})
         new_meta["dialogue_text"] = working
-        # Provenance — the Base44 ingester maps this onto CaptionCue.
-        # CHAIN-OF-CUSTODY GUARD: if an EARLIER stage (the shaper's condense-to-
-        # fit) already condensed this cue, its meta.condensation.verbatim holds
-        # the TRUE raw original. We must keep THAT as the revert target — never
-        # overwrite it with our intermediate input, or the operator's one-click
-        # revert would restore an already-trimmed text and the raw original
-        # would be unrecoverable. Kind escalates to the strongest edit applied.
+        # CHAIN-OF-CUSTODY GUARD: if an EARLIER stage already condensed this
+        # cue, its meta.condensation.verbatim holds the TRUE raw original —
+        # keep THAT as the revert target so one-click revert restores the
+        # genuine verbatim, never an intermediate. SOC 2 CC8.1.
         prior_cond = (cue.get("meta") or {}).get("condensation") or {}
-        true_verbatim = prior_cond.get("verbatim") or verbatim
+        true_verbatim = prior_cond.get("verbatim") or p["verbatim"]
         new_meta["condensation"] = {
             "applied": True,
-            "kind": applied_kind,           # 'disfluency' | 'condense'
-            "verbatim": true_verbatim,      # the exact RAW original, for revert + audit
+            "kind": p["applied_kind"],
+            "verbatim": true_verbatim,
         }
         new_cue["meta"] = new_meta
         out.append(new_cue)
@@ -692,6 +720,7 @@ def condense_cues(
 
     print(
         f"[CONDENSATION] mode={mode} merged_pairs={merged_pairs} "
+        f"concurrency={concurrency} "
         f"disfluency={stats['disfluency']} "
         f"llm={stats['llm']} llm_rejected={stats['llm_rejected']} "
         f"llm_skipped_short={stats['llm_skipped_short']} "
