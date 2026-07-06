@@ -74,6 +74,14 @@ _LEADING_WORDS = {
     "of", "to", "in", "on", "at", "by", "with", "from", "into", "onto",
     "upon", "about", "over", "under", "through", "between", "among",
     "during", "without", "within", "toward", "towards", "against",
+    # Prepositions (second tier — previously missing; the '…25 laps around |
+    # this place' defect: 'around' wasn't listed, so nothing penalized
+    # stranding it at a line/cue end or splitting inside its phrase).
+    # Deliberately EXCLUDES phrasal-verb particles (off/up/down/out) — those
+    # legitimately end a line ('take off', 'sit down').
+    "around", "across", "along", "behind", "beside", "besides", "beyond",
+    "near", "past", "despite", "except", "inside", "outside", "underneath",
+    "via", "amid", "atop",
     # Relative / possessive that bind tightly to what follows
     "which", "who", "whom", "whose",
 }
