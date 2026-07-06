@@ -230,6 +230,37 @@ def _pick_balanced_boundary(bounds: List[int], n: int) -> Optional[int]:
     return None
 
 
+def _clause_boundary_ok(words: List[str], idx: int) -> bool:
+    """Guard a Latin CLAUSE/SENTENCE boundary against the SAME orphaned-function-
+    word defect the word-fallback path already prevents. A boundary at word index
+    `idx` (line 1 = words[:idx], line 2 = words[idx:]) is REJECTED when the tail
+    half LEADS with a stranded preposition/conjunction/article/determiner — e.g.
+    '...the regeneration' / 'of glutathione' orphans 'of'. Because clause enders
+    sit AFTER a word, the punctuation itself already guarantees the head doesn't
+    end on a bare function word; the remaining risk is purely the tail's leading
+    word. Returns True when the split reads cleanly."""
+    if idx <= 0 or idx >= len(words):
+        return False
+    first_bare = _bare_word(words[idx])
+    if first_bare in _LEADING_WORDS or first_bare in _DETERMINERS:
+        return False
+    return True
+
+
+def _pick_clause_boundary(words: List[str]) -> Optional[int]:
+    """Pick the best Latin clause/sentence boundary — nearest the middle for
+    balance — that ALSO passes the orphaned-function-word guard. This routes the
+    clause path through the same word-class intelligence the word-fallback path
+    uses, so a punctuated cue never strands 'of'/'the'/'and' on the tail cue.
+    Returns a split index in 1..len-1, or None when no clean clause boundary
+    exists (caller falls back to the word-phrase splitter)."""
+    bounds = _latin_phrase_boundaries(words)
+    if not bounds:
+        return None
+    clean = [b for b in bounds if _clause_boundary_ok(words, b)]
+    return _pick_balanced_boundary(clean, len(words))
+
+
 def _pick_word_phrase_boundary(words: List[str]) -> Optional[int]:
     """FALLBACK when a cue has no clause/sentence punctuation to split at (the
     "no interior boundary" cases like "your head will be adorned in crimson and
@@ -302,11 +333,91 @@ def _split_time_at(
     return start + int(span * (left_len / full_len))
 
 
+# ─── Re-balance a split so neither child is a too-short, over-CPS cue ──
+def _child_windows_readable(
+    cue: Dict[str, Any],
+    left_text: str,
+    right_text: str,
+    full_text: str,
+    is_cjk: bool,
+    min_display: int,
+    min_gap: int,
+) -> bool:
+    """True when splitting `cue` at the boundary between left_text/right_text
+    yields TWO children that each clear the min reading window (min_display).
+
+    This is the RE-BALANCE guard: the naive "boundary nearest the middle by word
+    count" can hand a short-text half a tiny audio window (e.g. 'It's riboflavin,
+    honey.' → 0.9s → 25.9 cps FAIL) when speech at that boundary is fast. By
+    resolving the REAL boundary timestamp and checking both child durations, we
+    reject a split that would create an unreadable sliver and let the caller try
+    the next-best boundary instead — so text and window scale together. SOC 2
+    CC8.1 — the split decision is provably duration-aware, not blind midpoint."""
+    start = int(cue.get("start_ms", 0))
+    end = int(cue.get("end_ms", start + 1))
+    cut = _split_time_at(cue, left_text, full_text, is_cjk)
+    left_end = min(cut - (min_gap // 2), end - min_display)
+    right_start = max(cut + (min_gap // 2), start + min_display)
+    return (left_end - start) >= min_display and (end - right_start) >= min_display
+
+
+def _pick_rebalanced_latin_boundary(
+    cue: Dict[str, Any],
+    words: List[str],
+    is_cjk: bool,
+    min_display: int,
+    min_gap: int,
+) -> Optional[int]:
+    """Choose the Latin split index that (a) reads cleanly (clause-guarded, no
+    orphaned function word) AND (b) gives BOTH children a readable window. Tries
+    clause/sentence boundaries first — ranked by balance — keeping only those
+    where both halves clear min_display; then the word-phrase fallback under the
+    same window check. Returns the best index, or None to signal 'no split that
+    both reads well and times legally' (caller leaves the cue intact rather than
+    minting a tiny fail-cue)."""
+    full_text = " ".join(words)
+
+    # Candidate clause boundaries, cleanest-and-most-balanced first.
+    clause = [b for b in _latin_phrase_boundaries(words) if _clause_boundary_ok(words, b)]
+    mid = len(words) / 2.0
+    clause.sort(key=lambda b: abs(b - mid))
+    for idx in clause:
+        if _child_windows_readable(
+            cue, " ".join(words[:idx]), " ".join(words[idx:]),
+            full_text, is_cjk, min_display, min_gap,
+        ):
+            return idx
+
+    # Word-phrase fallback (punctuation-free cues), also window-checked.
+    widx = _pick_word_phrase_boundary(words)
+    if widx is not None and _child_windows_readable(
+        cue, " ".join(words[:widx]), " ".join(words[widx:]),
+        full_text, is_cjk, min_display, min_gap,
+    ):
+        return widx
+    return None
+
+
 # ─── Core: split one over-rhythm cue into two ────────────────────────
-def _split_cue_once(cue: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
-    """Split a single dialogue cue into two cues at the best phrase boundary
-    nearest the middle. Returns [left, right] or None when no clean split is
-    possible (no interior boundary, or the halves would violate min_display).
+def _split_cue_once(
+    cue: Dict[str, Any],
+    require_readable_windows: bool = True,
+) -> Optional[List[Dict[str, Any]]]:
+    """Split a single dialogue cue into two cues at the best phrase boundary.
+    Returns [left, right] or None when no clean split is possible.
+
+    require_readable_windows (default True — the RHYTHM-shaping posture): the
+    Latin split must give BOTH children a readable window (min_display), so a
+    split is only taken when it improves rhythm without minting a tiny over-CPS
+    sliver. When no such split exists the cue is left intact (a long-but-legal
+    cue beats a fail-cue).
+
+    require_readable_windows=False (the CPL SAFETY-NET posture, used by
+    enforce_cpl_fit): a cue that overflows the hard per-line char cap MUST be
+    broken — CPL is an FCC hard limit that outranks the rhythm-window preference.
+    The clause-orphan guard still applies (breaking well never hurts fit), but
+    the min-window balance check is relaxed so an over-CPL line is always split.
+
     Script-aware ONLY in which boundary list is used; everything else is shared."""
     text = _cue_text(cue)
     if not text:
@@ -333,15 +444,23 @@ def _split_cue_once(cue: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         words = _cue_words(cue)
         if len(words) < 2:
             return None
-        bounds = _latin_phrase_boundaries(words)
-        widx = _pick_balanced_boundary(bounds, len(words))
+        # Re-balanced, clause-guarded boundary: prefers a clause/sentence break
+        # that (a) never orphans a leading function word onto the tail cue and
+        # (b) gives BOTH children a readable window (no tiny over-CPS sliver like
+        # 'It's riboflavin, honey.' @ 0.9s). Falls back to the word-phrase
+        # splitter under the same guards. None → no split both reads and times
+        # cleanly, so leave the cue intact rather than mint a fail-cue.
+        widx = _pick_rebalanced_latin_boundary(cue, words, is_cjk, min_display, min_gap)
         if widx is None:
-            # No clause/sentence punctuation to split at — fall back to the best
-            # WORD-level phrase boundary (before a preposition/conjunction/article,
-            # never stranding a function word). This is what lets a punctuation-
-            # free overflow like "your head will be adorned in crimson and gold at
-            # the" split cleanly instead of shipping a broken labeled line.
-            widx = _pick_word_phrase_boundary(words)
+            if require_readable_windows:
+                return None
+            # CPL SAFETY-NET posture: an over-CPL line MUST break even if neither
+            # child clears the rhythm window. Use the clause-guarded boundary
+            # (still no orphaned function word), then the word-phrase fallback,
+            # WITHOUT the min-window balance check. CPL is a hard FCC limit.
+            widx = _pick_clause_boundary(words)
+            if widx is None:
+                widx = _pick_word_phrase_boundary(words)
             if widx is None:
                 return None
         left_words = words[:widx]
@@ -357,7 +476,15 @@ def _split_cue_once(cue: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     left_end = min(cut - (min_gap // 2), end - min_display)
     right_start = max(cut + (min_gap // 2), start + min_display)
     if left_end - start < min_display or end - right_start < min_display:
-        return None  # no room to split cleanly — leave intact
+        # No room for two readable windows. In the RHYTHM posture, leave intact
+        # (a long-but-legal cue beats a fail-cue). In the CPL SAFETY-NET posture,
+        # an over-CPL line must still break — clamp the boundary to the cue
+        # window and split anyway (each child gets whatever window remains).
+        if require_readable_windows:
+            return None
+        cut = max(start + 1, min(cut, end - 1))
+        left_end = cut
+        right_start = cut
 
     runs = [{"speaker": speaker, "word_start": 0}]
     timing_source = "word_timings" if _word_timings(cue) else "interpolated"
@@ -473,7 +600,9 @@ def enforce_cpl_fit(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if cue.get("type") != "dialogue" or not _wrap_overflows_cpl(cue):
                 out.append(cue)
                 continue
-            split = _split_cue_once(cue)
+            # CPL is a hard FCC limit — force the break even if neither child
+            # clears the rhythm window (require_readable_windows=False).
+            split = _split_cue_once(cue, require_readable_windows=False)
             if split:
                 out.extend(split)
                 changed = True
