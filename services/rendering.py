@@ -363,6 +363,84 @@ def cue_speakers(cue: Dict[str, Any]) -> set:
     return {r.get("speaker") for r in runs if r.get("speaker") is not None}
 
 
+# ─── THE shared label-aware fit primitive (single source of truth) ───────────
+# Every stage that used to ask "does this text fit max_chars × max_lines?" was
+# measuring the BODY ONLY. But render_lines prepends the speaker label at the
+# end, so the DELIVERED first line is `label + body` — e.g. '[SPEAKER B:] For
+# the town of Everwood,' is 38ch, over a 32 cap, even though the 25ch body wrapped
+# clean. That label width (up to ~13ch) was stolen from line 1's budget by every
+# stage, and each stage re-derived the budget naively, so they all under-counted
+# identically. The result: cues the formatter thought fit, the CPS splitter
+# thought fit, and the readability merge thought fit — all shipped an over-wide
+# labeled line, and the merge passes even RE-FUSED shaper-split halves back into
+# over-budget cues.
+#
+# The fix is ONE primitive the whole pipeline shares: render the cue EXACTLY as
+# the deliverable will (label included, via render_lines) and judge fit on THAT.
+# No stage re-derives a budget anymore — they all ask this one question, which is
+# byte-identical to what the exported file contains. SOC 2 CC8.1 / FCC §79.1 — the
+# delivered on-screen line provably never exceeds the spec's per-line / line-count
+# caps, label included, at every stage.
+
+def rendered_lines_delivered(
+    cue: Dict[str, Any],
+    max_lines: Optional[int] = None,
+    max_chars: Optional[int] = None,
+) -> List[str]:
+    """Render the cue's meta (words + speaker runs) exactly as the deliverable
+    draws it — INCLUDING the speaker label the spec's mode prepends. Falls back
+    to the cue's stored lines only if render_lines is unavailable/raises."""
+    meta = cue.get("meta") or {}
+    dialogue_text = (meta.get("dialogue_text") or " ".join(cue.get("lines", []))).strip()
+    words = dialogue_text.split()
+    runs = meta.get("runs") or []
+    ml = max_lines if max_lines is not None else _max_lines()
+    mc = max_chars if max_chars is not None else _max_chars()
+    try:
+        return render_lines(words, runs, ml, mc, dialogue_text)
+    except Exception:
+        return list(cue.get("lines") or [])
+
+
+def cue_fits_delivered(
+    cue: Dict[str, Any],
+    max_lines: Optional[int] = None,
+    max_chars: Optional[int] = None,
+) -> bool:
+    """True when the cue, RENDERED AS DELIVERED (speaker label included), fits the
+    spec geometry: ≤ max_lines lines AND every line ≤ max_chars. This is the ONE
+    fit test the entire pipeline shares (formatter split, readability merge/reflow,
+    cps/shaping split). CJK counts by character (no spaces); Latin by raw length."""
+    ml = max_lines if max_lines is not None else _max_lines()
+    mc = max_chars if max_chars is not None else _max_chars()
+    lines = rendered_lines_delivered(cue, ml, mc)
+    if len(lines) > ml:
+        return False
+    for line in lines:
+        s = str(line or "")
+        length = _cjk_count(s) if _is_cjk(s) else len(s)
+        if length > mc:
+            return False
+    return True
+
+
+def text_fits_delivered_as_speaker(
+    text: str,
+    speaker: Optional[str],
+    max_lines: Optional[int] = None,
+    max_chars: Optional[int] = None,
+) -> bool:
+    """Convenience wrapper: would this raw dialogue `text`, spoken by `speaker`,
+    fit the spec geometry once rendered WITH its label? Used by the formatter's
+    packer where a cue object isn't built yet. Constructs the minimal meta and
+    defers to cue_fits_delivered so the answer is identical to every other stage."""
+    synthetic = {
+        "meta": {"dialogue_text": text, "runs": [{"speaker": speaker, "word_start": 0}]},
+        "lines": [text],
+    }
+    return cue_fits_delivered(synthetic, max_lines, max_chars)
+
+
 # ─── Repeat-speaker label suppression (universal, multi-mode) ────────────────
 # render_lines is intentionally STATELESS per cue (single source of truth, called
 # by the formatter AND the readability merge passes). It therefore cannot decide
