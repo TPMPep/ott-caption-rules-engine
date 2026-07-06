@@ -78,7 +78,10 @@ def _measurement() -> str:
 def _visible_chars(cue: Dict) -> int:
     """On-screen character count, measured per the spec's CPS_MEASUREMENT so
     the QC grade matches exactly what cps.py enforced. CJK always counts by
-    character (no spaces). SOC 2 CC8.1 — QC verdict mirrors the applied rule."""
+    character (no spaces). POLICY (2026-07-06): every on-screen character
+    counts — speaker labels INCLUDED (Netflix TTSG / BBC posture; the viewer
+    reads the label too). Parity with cps.py + the Base44 graders.
+    SOC 2 CC8.1 — QC verdict mirrors the applied rule."""
     text = " ".join(cue.get("lines", [])).replace("\n", " ").strip()
     if _is_cjk(text):
         return _cjk_count(text)
