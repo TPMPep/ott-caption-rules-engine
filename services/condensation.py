@@ -431,10 +431,18 @@ def condense_cues(
         new_meta = dict(cue.get("meta") or {})
         new_meta["dialogue_text"] = working
         # Provenance — the Base44 ingester maps this onto CaptionCue.
+        # CHAIN-OF-CUSTODY GUARD: if an EARLIER stage (the shaper's condense-to-
+        # fit) already condensed this cue, its meta.condensation.verbatim holds
+        # the TRUE raw original. We must keep THAT as the revert target — never
+        # overwrite it with our intermediate input, or the operator's one-click
+        # revert would restore an already-trimmed text and the raw original
+        # would be unrecoverable. Kind escalates to the strongest edit applied.
+        prior_cond = (cue.get("meta") or {}).get("condensation") or {}
+        true_verbatim = prior_cond.get("verbatim") or verbatim
         new_meta["condensation"] = {
             "applied": True,
             "kind": applied_kind,           # 'disfluency' | 'condense'
-            "verbatim": verbatim,           # the exact original, for revert + audit
+            "verbatim": true_verbatim,      # the exact RAW original, for revert + audit
         }
         new_cue["meta"] = new_meta
         out.append(new_cue)
