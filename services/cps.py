@@ -62,6 +62,12 @@ except Exception:  # pragma: no cover
     CJK_CLAUSE_ENDERS = ("、", "，", "；", "：")
     CJK_SENTENCE_ENDERS = ("。", "！", "？")
 
+# Shared delivered-geometry fit check for the sliver-absorb merge acceptance.
+try:
+    from .rendering import cue_fits_delivered as _cue_fits
+except Exception:  # pragma: no cover
+    _cue_fits = None
+
 
 def _measurement() -> str:
     """The spec's cps_measurement: 'characters' | 'words' | 'characters_no_spaces'.
@@ -122,7 +128,12 @@ def _visible_chars(cue: Dict[str, Any]) -> int:
     CPS_MEASUREMENT. CJK always counts by character (no spaces). For Latin,
     'characters' = total incl. spaces (industry default), 'characters_no_spaces'
     drops spaces, 'words' counts whitespace tokens. This is what CPS is measured
-    against, so it must match the spec the deliverable is graded against."""
+    against, so it must match the spec the deliverable is graded against.
+    POLICY (2026-07-06, operator-confirmed): EVERY character that renders on
+    screen counts toward reading speed — speaker labels and dash prefixes
+    INCLUDED. The viewer must read the label to know who is talking (Netflix
+    TTSG / BBC posture: CPS is computed on the full delivered subtitle event).
+    Parity with qc.py, condensation.py, and the Base44 graders."""
     text = " ".join(cue.get("lines", [])).replace("\n", " ").strip()
     if _is_cjk(text):
         return _cjk_count(text)
@@ -454,19 +465,121 @@ def split_overlong_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return cues
 
 
+# ─── (5) SLIVER ABSORB ───────────────────────────────────────────────
+def _make_sliver_merge(start_ms, end_ms, joined_text, runs_source, max_lines, max_chars):
+    """Build the merged candidate for a sliver absorption. Accepted only when
+    the merged cue still fits the delivered line geometry (label included) —
+    otherwise None and the sliver ships flagged for QC (never a worse state)."""
+    runs = _primary_runs(runs_source)
+    candidate = {
+        "idx": 0, "start_ms": int(start_ms), "end_ms": int(end_ms),
+        "type": "dialogue",
+        "lines": render_lines(joined_text.split(), runs, max_lines, max_chars, joined_text),
+        "meta": {"dialogue_text": joined_text, "runs": runs, "sliver_absorbed": True},
+    }
+    if _cue_fits is not None and not _cue_fits(candidate, max_lines, max_chars):
+        return None
+    return candidate
+
+
+def absorb_sliver_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """SLIVER GUARD — a dialogue cue below min_display_ms (e.g. an 80ms
+    'Well,' fragment left behind by an upstream split) must never ship as-is:
+    it is unreadable at ANY speed. Deterministic remedies, in order:
+      (a) EXTEND into the trailing idle gap up to min_display (free);
+      (b) MERGE into the adjacent same-speaker dialogue cue (next preferred —
+          a sliver is usually the head of the following utterance; prev as
+          fallback), re-rendered through the shared renderer, accepted only
+          when the merged cue fits the delivered geometry and stays within
+          max_display_ms;
+      (c) leave it for the QC gate to flag honestly (a human must decide).
+    Pure + reproducible. SOC 2 CC8.1 / FCC 47 CFR §79.1 (readability)."""
+    min_display = _min_display_ms()
+    min_gap = _merge_gap_ms()
+    max_dur = _max_display_ms()
+    max_chars = _max_chars()
+    max_lines = _max_lines()
+
+    def _speaker(c):
+        for r in ((c.get("meta") or {}).get("runs") or []):
+            if r.get("speaker") is not None:
+                return r.get("speaker")
+        return None
+
+    def _text(c):
+        return ((c.get("meta") or {}).get("dialogue_text") or " ".join(c.get("lines", []))).strip()
+
+    out: List[Dict[str, Any]] = []
+    absorbed = 0
+    i = 0
+    while i < len(cues):
+        cue = cues[i]
+        if cue.get("type") != "dialogue" or _duration_ms(cue) >= min_display:
+            out.append(cue)
+            i += 1
+            continue
+        # (a) extend into the trailing idle gap
+        ceiling = int(cue["start_ms"]) + max_dur
+        nxt = cues[i + 1] if i + 1 < len(cues) else None
+        if nxt is not None:
+            ceiling = min(ceiling, int(nxt.get("start_ms", ceiling)) - min_gap)
+        needed_end = int(cue["start_ms"]) + min_display
+        if needed_end <= ceiling:
+            cue["end_ms"] = max(int(cue["end_ms"]), needed_end)
+            out.append(cue)
+            i += 1
+            continue
+        # (b) merge into a same-speaker neighbor
+        sliver_text = _text(cue)
+        joiner = "" if _is_cjk(sliver_text) else " "
+        if (nxt is not None and nxt.get("type") == "dialogue"
+                and _speaker(nxt) == _speaker(cue)
+                and int(nxt["end_ms"]) - int(cue["start_ms"]) <= max_dur):
+            merged = _make_sliver_merge(
+                cue["start_ms"], nxt["end_ms"],
+                (sliver_text + joiner + _text(nxt)).strip(),
+                cue, max_lines, max_chars)
+            if merged is not None:
+                out.append(merged)
+                absorbed += 1
+                i += 2
+                continue
+        prev = out[-1] if out else None
+        if (prev is not None and prev.get("type") == "dialogue"
+                and _speaker(prev) == _speaker(cue)
+                and int(cue["end_ms"]) - int(prev["start_ms"]) <= max_dur):
+            merged = _make_sliver_merge(
+                prev["start_ms"], cue["end_ms"],
+                (_text(prev) + joiner + sliver_text).strip(),
+                prev, max_lines, max_chars)
+            if merged is not None:
+                out[-1] = merged
+                absorbed += 1
+                i += 1
+                continue
+        # (c) leave — QC flags it honestly
+        out.append(cue)
+        i += 1
+    if absorbed:
+        print(f"[CPS] sliver_absorb merged {absorbed} sub-min-duration fragment(s)")
+    return out
+
+
 # ─── Master pass ─────────────────────────────────────────────────────
 def enforce_cps_rules(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Apply the deterministic drivers in priority order:
       0. split cues exceeding max_display_ms at a clause boundary (duration),
       1. extend over-fast cues into idle gap (free),
       2. split the still-over-fast cues at a clause boundary (CPS),
-      3. trim over-slow lingering cues.
+      3. absorb sub-min-duration sliver fragments into neighbors,
+      4. trim over-slow lingering cues.
     Then re-index. Anything still out of budget after this is a genuine
     editorial decision the QC gate (Phase 3) surfaces — the engine has done
     every deterministic thing it safely can."""
     cues = split_overlong_cues(cues)
     cues = extend_fast_cues(cues)
     cues = split_fast_cues(cues)
+    cues = absorb_sliver_cues(cues)
     cues = trim_slow_cues(cues)
     for i, cue in enumerate(cues):
         cue["idx"] = i + 1
