@@ -244,8 +244,11 @@ def remove_disfluencies(text: str) -> str:
     cleaned = re.sub(r"\s+([.,!?;:])", r"\1", cleaned)
     cleaned = re.sub(r"([,;:])\1+", r"\1", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-    # 4. Capitalize the first letter if the removal exposed a new sentence start.
-    if cleaned and cleaned[0].islower() and not label:
+    # 4. Re-capitalize ONLY when the ORIGINAL body started uppercase (a leading
+    # capitalized filler was removed, exposing a new sentence start). A body
+    # that started lowercase is a mid-sentence CONTINUATION cue — force-
+    # capitalizing it was the "The Prozac pens?" mid-sentence-capital defect.
+    if cleaned and cleaned[0].islower() and not label and body.strip()[:1].isupper():
         cleaned = cleaned[0].upper() + cleaned[1:]
 
     return (label + cleaned).strip() if cleaned else text
@@ -322,6 +325,15 @@ def _llm_condense_cue(client, model, system_prompt, verbatim: str, target_chars:
         return None
     # Never ACCEPT a rewrite that is longer than what we started with.
     if _visible_chars(condensed) >= _visible_chars(verbatim):
+        return None
+    # MEANING-RETENTION GUARD (2026-07-06, Pluto 0068: "Yeah, well, plenty
+    # lesson that could be you." → "Yeah, many lessons." — meaning destroyed).
+    # Entity/number locks can't catch a paraphrase that guts the sentence, so
+    # a deterministic floor: the condensed text must retain at least half the
+    # verbatim's words. Condensation trims redundancy — it never halves a
+    # sentence. A rewrite below the floor is rejected and the deterministic
+    # result ships instead (the honest QC flag beats a nonsense caption).
+    if len(condensed.split()) < max(2, (len(verbatim.split()) + 1) // 2):
         return None
     # Meaning-preservation guards — reject if an entity/number was dropped.
     if _preserve_named_entities():
