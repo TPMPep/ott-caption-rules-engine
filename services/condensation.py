@@ -121,6 +121,8 @@ def _cps_measurement() -> str:
 
 # ─── CPS helpers (mirrors cps.py measurement contract) ───────────────
 def _visible_chars(text: str) -> int:
+    # POLICY (2026-07-06): every on-screen character counts toward reading
+    # speed — speaker labels included (parity with cps.py / qc.py / Base44).
     text = (text or "").replace("\n", " ").strip()
     if _is_cjk(text):
         return _cjk_count(text)
@@ -335,6 +337,36 @@ def _llm_condense_cue(client, model, system_prompt, verbatim: str, target_chars:
     return condensed
 
 
+def _llm_condense_iterative(client, model, system_prompt, text, target_chars,
+                            max_attempts=3):
+    """Up to max_attempts bounded LLM passes on ONE cue — the same iterative
+    budget the merge pass has always had (engine 5.23.0: the per-cue path
+    previously got a single attempt, which is why hittable budgets like
+    'Yeah, stop doing this.' were missed). Strips the leading speaker label
+    before condensing (labels are recognition glyphs, never reading text) and
+    re-attaches it verbatim so the LLM can neither drop nor reword it. Each
+    pass condenses the previous accepted result further; stops early once the
+    body fits target_chars. Returns the labeled result, or None when no
+    attempt produced an accepted rewrite (entity/number guards live inside
+    _llm_condense_cue). SOC 2 CC8.1 — same guards, more persistence."""
+    label, body = _strip_leading_label(text)
+    if not body.strip():
+        return None
+    working = body
+    improved = False
+    for _ in range(max_attempts):
+        condensed = _llm_condense_cue(client, model, system_prompt, working, target_chars)
+        if not condensed:
+            break
+        working = condensed
+        improved = True
+        if _visible_chars(working) <= target_chars:
+            break
+    if not improved:
+        return None
+    return (label + working).strip()
+
+
 # ─── Merge-then-condense for sentence-continuation slivers ──────────
 # THE PROFESSIONAL FIX for fast speech with no gaps. When rapid dialogue is
 # split at a clause boundary (shaping / CPS split), and the audio leaves no
@@ -486,7 +518,10 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
             _cue_fits_delivered(candidate, max_lines, max_chars)
             if _cue_fits_delivered is not None else True
         )
-        if _cue_cps(candidate, working) <= max_cps and fits_geometry:
+        # Acceptance is graded on the DELIVERED text — labels count (policy
+        # 2026-07-06), so a merge only ships if the rendered cue passes.
+        delivered_m = " ".join(candidate["lines"]).strip() or working
+        if _cue_cps(candidate, delivered_m) <= max_cps and fits_geometry:
             if working != verbatim_joined:
                 candidate["meta"]["condensation"] = {
                     "applied": True,
@@ -505,7 +540,7 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
         # rejected merge is answerable from the run log alone. SOC 2 CC8.1.
         print(
             f"[CONDENSATION] merge_rejected pair=({cue.get('idx')},{nxt.get('idx')}) "
-            f"final_cps={_cue_cps(candidate, working):.1f} max_cps={max_cps} "
+            f"final_cps={_cue_cps(candidate, delivered_m):.1f} max_cps={max_cps} "
             f"final_chars={_visible_chars(working)} "
             f"window_ms={candidate['end_ms'] - candidate['start_ms']} "
             f"fits_geometry={fits_geometry}"
@@ -519,6 +554,7 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
 def condense_cues(
     cues: List[Dict[str, Any]],
     heartbeat: Optional[Callable[[int, int], None]] = None,
+    stats_out: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Apply the spec-gated condensation stage.
 
@@ -533,6 +569,8 @@ def condense_cues(
     preserved exactly."""
     mode = _mode()
     if mode == "off":
+        if stats_out is not None:
+            stats_out.update({"mode": "off"})
         return cues
 
     max_cps = _max_cps()
@@ -600,7 +638,7 @@ def condense_cues(
     llm_budget_exhausted = False
 
     stats = {"disfluency": 0, "llm": 0, "still_over": 0, "llm_rejected": 0,
-             "llm_skipped_short": 0}
+             "llm_skipped_short": 0, "fragment_gated": 0}
 
     # ── Phase 1: deterministic per-cue analysis (serial, cheap) ──────────
     # Decide per over-CPS cue: disfluency-cleaned text + whether a bounded
@@ -612,9 +650,18 @@ def condense_cues(
         verbatim = _cue_dialogue_text(cue).strip()
         if not verbatim:
             continue
-        # Only act on cues STILL over the reading limit after CPS extend/split.
-        if _cue_cps(cue, verbatim) <= max_cps:
+        # POLICY (2026-07-06): reading speed is graded on the DELIVERED text —
+        # every on-screen character counts, speaker labels included (Netflix
+        # TTSG / BBC posture). Trigger on the rendered lines (what QC will
+        # grade), never the bare dialogue body.
+        delivered = " ".join(cue.get("lines", [])).strip() or verbatim
+        if _cue_cps(cue, delivered) <= max_cps:
             continue
+        # Render overhead the label adds on screen. The LLM condenses the BODY
+        # only (labels are never reworded), so the body's char budget is the
+        # total budget MINUS this overhead — the delivered cue, label included,
+        # is what must hit the limit.
+        label_overhead = max(0, _visible_chars(delivered) - _visible_chars(verbatim))
         applied_kind = None
         working = verbatim
         cleaned = remove_disfluencies(working)
@@ -623,10 +670,16 @@ def condense_cues(
             applied_kind = "disfluency"
             stats["disfluency"] += 1
         llm_target = None
+        dur_s = max(0.001, (int(cue.get("end_ms", 0)) - int(cue.get("start_ms", 0))) / 1000.0)
+        total_budget = int(max_cps * dur_s)
+        still_over = (_visible_chars(working) + label_overhead) > total_budget
+        # Fragment gating is a words-changing safety decision — count it so the
+        # audit row can answer "why wasn't this over-CPS cue condensed?".
+        if use_llm and fragment_flags[idx] and still_over:
+            stats["fragment_gated"] += 1
         # LLM only for COMPLETE sentences (never reword a fragment in isolation).
-        if use_llm and not fragment_flags[idx] and _cue_cps(cue, working) > max_cps:
-            dur_s = max(0.001, (int(cue.get("end_ms", 0)) - int(cue.get("start_ms", 0))) / 1000.0)
-            target_chars = int(max_cps * dur_s)
+        if use_llm and not fragment_flags[idx] and still_over:
+            target_chars = max(1, total_budget - label_overhead)
             # ABSURD-BUDGET / SHORT-INTERJECTION GUARD (5.21.3): below the
             # floor, no rewording can help — timing is the only remedy, so
             # ship verbatim for the honest QC flag instead of mutilating words.
@@ -650,7 +703,7 @@ def condense_cues(
         done_count = 0
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {
-                pool.submit(_llm_condense_cue, client, model, system_prompt,
+                pool.submit(_llm_condense_iterative, client, model, system_prompt,
                             plans[i]["working"], plans[i]["llm_target"]): i
                 for i in llm_idxs
             }
@@ -686,7 +739,8 @@ def condense_cues(
             continue
         working = p["working"]
         if p["applied_kind"] is None or working == p["verbatim"]:
-            if _cue_cps(cue, p["verbatim"]) > max_cps:
+            # still_over is graded on the DELIVERED text (labels count).
+            if _cue_cps(cue, " ".join(cue.get("lines", [])).strip() or p["verbatim"]) > max_cps:
                 stats["still_over"] += 1
             out.append(cue)
             continue
@@ -715,7 +769,8 @@ def condense_cues(
         }
         new_cue["meta"] = new_meta
         out.append(new_cue)
-        if _cue_cps(new_cue, working) > max_cps:
+        # still_over is graded on the DELIVERED text (labels count).
+        if _cue_cps(new_cue, " ".join(new_lines).strip() or working) > max_cps:
             stats["still_over"] += 1
 
     print(
@@ -727,4 +782,24 @@ def condense_cues(
         f"still_over_after={stats['still_over']} "
         f"llm_budget_exhausted={llm_budget_exhausted}"
     )
+    # ── Auditor-grade stats surfacing (engine 5.23.0) ────────────────────
+    # Previously these verdicts existed ONLY in the Railway console log —
+    # invisible to the operator and gone after log retention. Now they ride
+    # the result into CCFormatRun.summary so "why is this cue still over?"
+    # is answerable from the app. SOC 2 CC8.1.
+    if stats_out is not None:
+        stats_out.update({
+            "mode": mode,
+            "llm_client_available": client is not None,
+            "merged_pairs": merged_pairs,
+            "over_cps_candidates": len(plans),
+            "llm_attempted": len(llm_idxs) if client is not None else 0,
+            "disfluency_removed": stats["disfluency"],
+            "llm_condensed": stats["llm"],
+            "llm_rejected": stats["llm_rejected"],
+            "llm_skipped_short_budget": stats["llm_skipped_short"],
+            "fragment_gated": stats["fragment_gated"],
+            "still_over_after": stats["still_over"],
+            "llm_budget_exhausted": llm_budget_exhausted,
+        })
     return out
