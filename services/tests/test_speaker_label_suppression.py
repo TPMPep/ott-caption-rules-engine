@@ -1,22 +1,31 @@
 """
 Regression tests for services.rendering.suppress_repeat_speaker_labels — the
-UNIVERSAL repeat-speaker-label suppression pass.
+UNIVERSAL, TURN-BASED repeat-speaker-label suppression pass.
 
 The bug this locks: a project pinned to the 'named' speaker posture rendered
 '[SPEAKER B:]' on every one of 4 consecutive back-to-back Speaker-B cues. The
 professional convention (and every named / first-occurrence / every-change spec)
-is to identify a speaker once and then omit the tag until the speaker changes or
-a new scene begins.
+is to identify a speaker once and then omit the tag until the speaker CHANGES —
+re-labeling the moment a different speaker speaks, INCLUDING when the original
+speaker returns after an interruption (A…A…A…A → B → A re-labels A).
+
+All repeat-suppressing modes ('named' / 'first_occurrence_per_scene' /
+'every_change') resolve to the SAME turn-based rule. They differ only in what the
+label SAYS (decided at render time), never in how often it appears. Once-per-scene
+labeling would require real VISUAL scene detection, which the CC pipeline does not
+do — so it is a future opt-in, not the default.
 
 Coverage:
-  • 'named' + 'first_occurrence_per_scene' → label once per scene per speaker.
-  • 'every_change' → label only when the speaker differs from the previous cue.
-  • scene boundaries re-assert labels.
+  • all three modes → label only on a speaker turn (re-label on any change).
+  • the original speaker returning after another speaker → re-labeled.
+  • scene boundaries re-assert labels (forward-looking hook).
   • 'always' / 'dash' → NEVER suppressed (no-op).
   • a non-dialogue cue between two same-speaker cues does NOT re-label the second.
 
 All deterministic; env knobs set explicitly and restored after each test.
 """
+
+import pytest  # noqa: E402  (import after module docstring is intentional)
 
 import os
 import sys
@@ -61,9 +70,15 @@ def _first_line_has_label(cue):
     return cue["lines"][0].strip().startswith("[")
 
 
-# ── named: label each speaker once per (single) scene ────────────────
-def test_named_suppresses_consecutive_same_speaker():
-    prev = _set_env(SPEAKER_LABEL_MODE="named", CUSTOM_MAX_CHARS=42, CUSTOM_MAX_LINES=2)
+# ── all repeat-suppressing modes are turn-based (parametrized) ───────
+# 'named', 'first_occurrence_per_scene', and 'every_change' resolve to the SAME
+# turn-based rule: label only on a speaker change from the previous dialogue cue.
+_TURN_BASED_MODES = ["named", "first_occurrence_per_scene", "every_change"]
+
+
+@pytest.mark.parametrize("mode", _TURN_BASED_MODES)
+def test_suppresses_consecutive_same_speaker(mode):
+    prev = _set_env(SPEAKER_LABEL_MODE=mode, CUSTOM_MAX_CHARS=42, CUSTOM_MAX_LINES=2)
     try:
         cues = [
             _cue(1, "SPEAKER B", _labeled("SPEAKER B", "For players and fans alike,")),
@@ -72,7 +87,7 @@ def test_named_suppresses_consecutive_same_speaker():
             _cue(4, "SPEAKER B", _labeled("SPEAKER B", "Inexplicably awry.")),
         ]
         out = suppress_repeat_speaker_labels(cues)
-        # First cue keeps the tag; the next three drop it.
+        # First cue of the run keeps the tag; the next three drop it.
         assert _first_line_has_label(out[0])
         assert not _first_line_has_label(out[1])
         assert not _first_line_has_label(out[2])
@@ -81,27 +96,11 @@ def test_named_suppresses_consecutive_same_speaker():
         _restore(prev)
 
 
-def test_named_relabels_on_speaker_change():
-    prev = _set_env(SPEAKER_LABEL_MODE="named", CUSTOM_MAX_CHARS=42, CUSTOM_MAX_LINES=2)
-    try:
-        cues = [
-            _cue(1, "A", _labeled("A", "Hi there.")),
-            _cue(2, "A", _labeled("A", "Still me.")),
-            _cue(3, "B", _labeled("B", "Now me.")),
-            _cue(4, "A", _labeled("A", "Back to me.")),  # per-scene: A already seen → stripped
-        ]
-        out = suppress_repeat_speaker_labels(cues)
-        assert _first_line_has_label(out[0])       # A first
-        assert not _first_line_has_label(out[1])   # A repeat
-        assert _first_line_has_label(out[2])       # B first
-        assert not _first_line_has_label(out[3])   # A already labeled this scene
-    finally:
-        _restore(prev)
-
-
-# ── every_change: label only on a change from the previous cue ───────
-def test_every_change_relabels_when_speaker_returns():
-    prev = _set_env(SPEAKER_LABEL_MODE="every_change", CUSTOM_MAX_CHARS=42, CUSTOM_MAX_LINES=2)
+@pytest.mark.parametrize("mode", _TURN_BASED_MODES)
+def test_relabels_when_original_speaker_returns(mode):
+    """The core behavior the user described: A…A…A…A → B → A must re-label the
+    returning A. Every repeat-suppressing mode does this (turn-based, universal)."""
+    prev = _set_env(SPEAKER_LABEL_MODE=mode, CUSTOM_MAX_CHARS=42, CUSTOM_MAX_LINES=2)
     try:
         cues = [
             _cue(1, "A", _labeled("A", "Hi there.")),
@@ -113,13 +112,13 @@ def test_every_change_relabels_when_speaker_returns():
         assert _first_line_has_label(out[0])       # A (first)
         assert not _first_line_has_label(out[1])   # A repeat → stripped
         assert _first_line_has_label(out[2])       # change to B → kept
-        assert _first_line_has_label(out[3])       # change back to A → kept
+        assert _first_line_has_label(out[3])       # A returns after B → re-labeled
     finally:
         _restore(prev)
 
 
-# ── scene boundaries re-assert labels ────────────────────────────────
-def test_named_relabels_after_scene_boundary():
+# ── scene boundaries re-assert labels (forward-looking hook) ─────────
+def test_relabels_after_scene_boundary():
     prev = _set_env(SPEAKER_LABEL_MODE="named", CUSTOM_MAX_CHARS=42, CUSTOM_MAX_LINES=2)
     try:
         cues = [
@@ -130,7 +129,7 @@ def test_named_relabels_after_scene_boundary():
         out = suppress_repeat_speaker_labels(cues, scene_boundary_idxs={2})
         assert _first_line_has_label(out[0])       # A first in scene 1
         assert not _first_line_has_label(out[1])   # A repeat in scene 1
-        assert _first_line_has_label(out[2])       # scene 2 → A re-labeled
+        assert _first_line_has_label(out[2])       # scene 2 boundary → A re-labeled
     finally:
         _restore(prev)
 
