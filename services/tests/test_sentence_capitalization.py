@@ -140,6 +140,30 @@ def test_speaker_label_preserved():
     assert cues[1]["lines"][0].startswith("- You've"), cues[1]["lines"]
 
 
+# ── Closed-class pronouns are never protected as proper nouns ────────────
+def test_common_pronoun_never_poisoned_by_stray_midcue_capital():
+    # A stray mid-cue capitalized "They" (after a quote-closed sentence the
+    # naive check can't see through) must NOT protect the pronoun globally —
+    # the continuation "They" in cue 2 must still be lowercased.
+    cues = [
+        _dialogue('He said "we win." They believed him.', 0, 3000),
+        _dialogue("and for one glorious season,", 3000, 5000),
+        _dialogue("They ruled the state.", 5000, 7000),
+    ]
+    apply_sentence_capitalization(cues)
+    assert _body(cues[2]).startswith("they"), _body(cues[2])
+
+
+# ── Quote-closed sentence end drives the continuation tracker ────────────
+def test_quote_closed_cue_starts_new_sentence():
+    cues = [
+        _dialogue('She shouted "we won the game."', 0, 2000),
+        _dialogue("nobody could believe it.", 2000, 4000),
+    ]
+    apply_sentence_capitalization(cues)
+    assert _body(cues[1]).startswith("Nobody"), _body(cues[1])
+
+
 # ── Conservative ambiguity — unknown capitalized word stays as-is ───────
 def test_ambiguous_name_left_capitalized():
     # "Kowalski" appears ONLY at the continuation start — no mid-cue capitalized
