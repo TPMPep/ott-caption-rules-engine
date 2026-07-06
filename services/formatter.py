@@ -703,13 +703,15 @@ def process_caption_job(
     # the Base44 ingester writes CaptionCue.original_verbatim_text + provenance
     # and the editor can show a "Condensed — verify" chip with one-click revert.
     # SOC 2 CC8.1 — words are never silently reworded; every change is attributed.
+    condensation_stats: Dict[str, Any] = {}
     try:
         from .condensation import condense_cues
         before_condense = len(cues)
-        cues = condense_cues(cues, heartbeat=heartbeat)
+        cues = condense_cues(cues, heartbeat=heartbeat, stats_out=condensation_stats)
         print(f"[FORMATTER] After condensation: {len(cues)} cues (was {before_condense})")
     except Exception as _e:
         print(f"[FORMATTER] condensation skipped (non-fatal): {_e}")
+        condensation_stats = {"error": str(_e)[:300]}
 
     # 8. Timecode offset (UPDATED)
     cues = _apply_timecode_offset(cues)
@@ -736,6 +738,24 @@ def process_caption_job(
     except Exception as _e:
         print(f"[FORMATTER] label-suppression skipped (non-fatal): {_e}")
 
+    # 10d. SENTENCE-BOUNDARY CAPITALIZATION — the DETERMINISTIC final authority.
+    # Runs LAST (after every stage that could have split, merged, condensed, or
+    # AI-polished a cue) so the delivered text always has correct sentence-
+    # boundary casing regardless of whether the optional editorial-AI ran:
+    #   • a cue that CONTINUES the prior sentence keeps its first word lowercase
+    #     (proper-noun-safe — never downcases "I", an acronym, or a proven
+    #     proper noun), and
+    #   • a cue that STARTS a new sentence capitalizes its first word.
+    # This closes the two shaping/transcript casing defects (mid-sentence "This
+    # place" left capitalized after a split; a new sentence "you've" left
+    # lowercase) deterministically, with NO AI dependency. Idempotent. SOC 2
+    # CC8.1 — reproducible casing an auditor can re-derive.
+    try:
+        from .capitalization import apply_sentence_capitalization
+        cues = apply_sentence_capitalization(cues)
+    except Exception as _e:
+        print(f"[FORMATTER] sentence-capitalization skipped (non-fatal): {_e}")
+
     # 11. QC
     qc = qc_report(cues_in_count, cues, protected_phrases)
     print(f"[FORMATTER] QC: {qc}")
@@ -745,18 +765,31 @@ def process_caption_job(
         output_formats = [_env_str("OUTPUT_FORMATS", "srt")]
     output_formats = [f.strip().lower() for f in ",".join(output_formats).split(",") if f.strip()]
 
+    # NOTE on meta: the Base44 ingesters (ccIngestReformatResult /
+    # ccIngestRailwayResult) read cue.meta.condensation to persist
+    # original_verbatim_text + condensation_applied provenance onto CaptionCue.
+    # We carry ONLY the condensation block (not full meta — word_timings would
+    # bloat the payload by megabytes on a feature). Dropping this was the bug
+    # that made condensed cues land with no audit trail. SOC 2 CC8.1.
+    def _result_cue(i: int, c: Dict[str, Any]) -> Dict[str, Any]:
+        out = {
+            "idx": i + 1,
+            "start_ms": c["start_ms"],
+            "end_ms": c["end_ms"],
+            "lines": c["lines"],
+            "type": c.get("type", "dialogue"),
+        }
+        cond = (c.get("meta") or {}).get("condensation")
+        if cond and cond.get("applied"):
+            out["meta"] = {"condensation": cond}
+        return out
+
     result: Dict[str, Any] = {
-        "cues": [
-            {
-                "idx": i + 1,
-                "start_ms": c["start_ms"],
-                "end_ms": c["end_ms"],
-                "lines": c["lines"],
-                "type": c.get("type", "dialogue"),
-            }
-            for i, c in enumerate(cues)
-        ],
+        "cues": [_result_cue(i, c) for i, c in enumerate(cues)],
         "qc": qc,
+        # Condensation verdict counts — persisted onto CCFormatRun.summary by
+        # the Base44 ingesters so the rewrite stage is never a black box.
+        "condensation_stats": condensation_stats or None,
     }
 
     if "srt" in output_formats:
@@ -953,8 +986,25 @@ def _build_dialogue_cues(
         # AND word-phrase splitting with a fixed-point loop. Keeping ONE owner for
         # label-aware splitting avoids two stages half-solving it and drifting.
         if g_len > budget:
-            _flush_pack()
-            g_start = group["start_ms"]
+            # SHORT-LEAD ABSORPTION (universal): a tiny same-speaker sentence
+            # sitting in the pack ("By who?") must ride INTO the split of the
+            # following over-budget sentence instead of being flushed as its
+            # own micro-cue with a micro window. The chunker then packs
+            # "By who? Gus from the body shop…" naturally, splitting at real
+            # clause/sentence boundaries. Latin only (CJK packs by glyph).
+            absorbed_start: Optional[int] = None
+            if (pack_words and not g_is_cjk and pack_speaker == g_speaker
+                    and len(" ".join(pack_words)) <= max_chars):
+                g_words = pack_words + g_words
+                absorbed_start = pack_start
+                pack_words = []
+                pack_start = None
+                pack_end = 0
+                pack_runs = []
+                pack_speaker = None
+            else:
+                _flush_pack()
+            g_start = absorbed_start if absorbed_start is not None else group["start_ms"]
             g_end = max(group["end_ms"], g_start + 1)
             span = g_end - g_start
 
@@ -1052,6 +1102,14 @@ def _split_sentence_into_cue_chunks(
     """
     budget = max_chars * max_lines
     _CLAUSE_END = (",", ";", ":", "—", "–")
+    _SENT_END = (".", "!", "?")
+    # MIN-CHUNK GUARD (2026-07-06, Pluto 0062 sliver defect): never back off to
+    # a boundary that strands a tiny head chunk. "No, I'm not gonna call…" must
+    # NOT become a 3-char "No," cue with a ~0.2s proportional window — the
+    # boundary after "No," is grammatically real but editorially unusable as a
+    # standalone caption. A back-off boundary is eligible only when the head it
+    # produces carries at least MIN_CHUNK_WORDS words.
+    MIN_CHUNK_WORDS = 3
 
     chunks: List[List[str]] = []
     cur: List[str] = []
@@ -1060,11 +1118,15 @@ def _split_sentence_into_cue_chunks(
         if len(test) <= budget or not cur:
             cur.append(w)
         else:
-            # Back off to the last clause boundary inside `cur` if one exists
-            # and it isn't the very first word.
+            # Back off to the last clause OR sentence boundary inside `cur`
+            # whose head chunk is at least MIN_CHUNK_WORDS words. Sentence
+            # enders are included so an absorbed short lead ("By who?") ends
+            # its chunk at the sentence break, never mid-phrase.
             split_at = None
             for i in range(len(cur) - 1, 0, -1):
-                if cur[i].rstrip().endswith(_CLAUSE_END):
+                tok = cur[i].rstrip()
+                if (tok.endswith(_CLAUSE_END) or tok.endswith(_SENT_END)) \
+                        and (i + 1) >= MIN_CHUNK_WORDS:
                     split_at = i + 1
                     break
             if split_at and split_at < len(cur):
