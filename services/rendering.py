@@ -471,10 +471,13 @@ def text_fits_delivered_as_speaker(
 # top via scene_boundary_idxs (already plumbed through) without changing this
 # default.
 #
-# Modes NOT suppressed: 'always' (tag every cue, by design), 'dash' / 'none' /
-# 'alpha' / 'generic' (dash has no bracket tag to strip; none emits nothing;
-# alpha/generic are placeholder-label modes that intentionally re-assert the
-# placeholder each cue). SOC 2 CC8.1 / FCC §79.1 — speaker identification appears
+# Modes NOT suppressed: 'always' (tag every cue, by design), 'dash' (no bracket
+# tag to strip) and 'none' (emits nothing). Placeholder modes ('alpha' /
+# 'generic') ARE turn-based suppressed: the professional convention is identical
+# whether the label is a real name or '[SPEAKER B:]' — identify the speaker once
+# per turn, omit until the speaker changes. Repeating a placeholder on every
+# consecutive same-speaker cue reads as noise and wastes line budget.
+# SOC 2 CC8.1 / FCC §79.1 — speaker identification appears
 # at every genuine speaker turn; the pass is a deterministic, reproducible
 # function of (cues, mode).
 #
@@ -489,7 +492,7 @@ def text_fits_delivered_as_speaker(
 # render time), not on how often the label appears. A scene-aware posture is a
 # future opt-in gated on real (visual) scene detection.
 _TURN_BASED_SUPPRESS_MODES = frozenset(
-    {"first_occurrence_per_scene", "named", "every_change"}
+    {"first_occurrence_per_scene", "named", "every_change", "alpha", "generic"}
 )
 
 # Match a leading bracket tag '[NAME:] ' or paren tag '(NAME): ' the renderer
@@ -530,7 +533,7 @@ def suppress_repeat_speaker_labels(
     modes ('named' / 'first_occurrence_per_scene' / 'every_change') use this one
     rule; they differ only in what the label SAYS, decided at render time.
 
-    No-op for every other mode ('always' / 'dash' / 'none' / 'alpha' / 'generic').
+    No-op for every other mode ('always' / 'dash' / 'none').
     Pure, deterministic, in-place-safe (returns the same list mutated).
 
     `scene_boundary_idxs` is a set of cue indices that START a new scene — a
