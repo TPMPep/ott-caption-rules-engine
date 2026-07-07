@@ -216,11 +216,16 @@ def _best_split_index(words: List[str]) -> int:
     best_i: Optional[int] = None
     best_dist = n + 1
     # A boundary AFTER word j means split index = j+1.
+    # MIN-SIDE GUARD (2026-07-07): a boundary that strands a side under 3 words
+    # ('By who?' | rest) is skipped — same rule as the shaping + chunker
+    # pickers, so no split path in the engine can mint a tiny fragment cue.
     for j in range(n - 1):
         w = words[j].rstrip()
         if w.endswith(_CLAUSE_END) or w.endswith(_SENTENCE_END):
             idx = j + 1
             if idx <= 0 or idx >= n:
+                continue
+            if min(idx, n - idx) < 3:
                 continue
             dist = abs(idx - mid)
             if dist < best_dist:
