@@ -261,11 +261,25 @@ def _pick_clause_boundary(words: List[str]) -> Optional[int]:
     clause path through the same word-class intelligence the word-fallback path
     uses, so a punctuated cue never strands 'of'/'the'/'and' on the tail cue.
     Returns a split index in 1..len-1, or None when no clean clause boundary
-    exists (caller falls back to the word-phrase splitter)."""
+    exists (caller falls back to the word-phrase splitter).
+
+    MIN-SIDE GUARD (2026-07-07, Pluto 0054/0058): this is the CPL SAFETY-NET
+    fallback picker (require_readable_windows=False), and it was the ONE
+    boundary picker without the tiny-side guard — so a forced split of
+    '[SPEAKER A:] Well, I could always…' chose the boundary after 'Well,' and
+    minted a 1-word, 0.2s, 100-CPS caption. A clause boundary that strands a
+    side under 3 words is editorially unusable as a standalone caption;
+    excluding it makes the caller fall through to the balanced word-phrase
+    boundary ('Well, I could always use email' | 'or instant messaging.'),
+    which reads professionally AND fits. Same guard, same threshold as
+    _pick_rebalanced_latin_boundary — ONE consistent rule everywhere."""
     bounds = _latin_phrase_boundaries(words)
     if not bounds:
         return None
-    clean = [b for b in bounds if _clause_boundary_ok(words, b)]
+    clean = [
+        b for b in bounds
+        if _clause_boundary_ok(words, b) and min(b, len(words) - b) >= 3
+    ]
     return _pick_balanced_boundary(clean, len(words))
 
 
