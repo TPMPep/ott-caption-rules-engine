@@ -122,6 +122,31 @@ def _max_lines() -> int:
 _CLAUSE_END = (",", ";", ":", "—", "–")
 _SENTENCE_END = (".", "!", "?")
 
+# UNIVERSAL LAW (mirrors shaping._split_breaks_paired_delimiter): a quoted /
+# parenthetical / bracketed span is never split so its opener and closer land
+# on different cues. The CPS split path is a separate splitter, so it needs the
+# same guard — otherwise a CPS-driven split re-introduces the orphaned quote the
+# shaping guard prevented. Deterministic, zero-cost, every timed-text form.
+_OPEN_TO_CLOSE_CPS = {"\u201c": "\u201d", "(": ")", "[": "]", "\u2018": "\u2019", "\u00ab": "\u00bb"}
+_CLOSE_TO_OPEN_CPS = {v: k for k, v in _OPEN_TO_CLOSE_CPS.items()}
+
+
+def _split_breaks_paired_delimiter(words: List[str], idx: int) -> bool:
+    if idx <= 0 or idx >= len(words):
+        return False
+    head = " ".join(words[:idx])
+    stack = []
+    dq_open = False
+    for ch in head:
+        if ch == '"':
+            dq_open = not dq_open
+        elif ch in _OPEN_TO_CLOSE_CPS:
+            stack.append(ch)
+        elif ch in _CLOSE_TO_OPEN_CPS:
+            if stack and stack[-1] == _CLOSE_TO_OPEN_CPS[ch]:
+                stack.pop()
+    return bool(stack) or dq_open
+
 
 def _visible_chars(cue: Dict[str, Any]) -> int:
     """Character count actually on screen, measured per the spec's
@@ -226,6 +251,9 @@ def _best_split_index(words: List[str]) -> int:
             if idx <= 0 or idx >= n:
                 continue
             if min(idx, n - idx) < 3:
+                continue
+            # UNIVERSAL: never split so an opening quote/bracket is orphaned.
+            if _split_breaks_paired_delimiter(words, idx):
                 continue
             dist = abs(idx - mid)
             if dist < best_dist:
