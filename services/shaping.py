@@ -202,6 +202,43 @@ def _word_timings(cue: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
+# ─── UNIVERSAL LAW: never orphan a paired delimiter across a split ────
+# A quotation, parenthetical, or bracketed span is ONE grammatical unit. A
+# split index that lands BETWEEN an opener and its matching closer would put
+# the open `"` on one cue and its close `"` on another — the orphaned-quote
+# defect the operator flagged ('My dad used to say, "If something's ugly,' with
+# no close on screen). This is true for EVERY timed-text form (SRT/CC/SDH), so
+# it lives here as a universal guard consulted by every boundary picker, not a
+# spec knob. Straight ASCII quote (") is ambiguous (open==close) so we track it
+# by parity; directional quotes and brackets are matched by pair.
+_OPEN_TO_CLOSE = {"\u201c": "\u201d", "(": ")", "[": "]", "\u2018": "\u2019", "\u00ab": "\u00bb"}
+_CLOSE_TO_OPEN = {v: k for k, v in _OPEN_TO_CLOSE.items()}
+
+
+def _split_breaks_paired_delimiter(words: List[str], idx: int) -> bool:
+    """True when splitting Latin `words` at word index `idx` (head=words[:idx],
+    tail=words[idx:]) would fall INSIDE an open paired delimiter — i.e. the head
+    leaves a delimiter open that only the tail closes. Universal grammatical-
+    integrity law: a quoted / parenthetical / bracketed span is never split so
+    that its opener and closer land on different cues. Deterministic, zero-cost."""
+    if idx <= 0 or idx >= len(words):
+        return False
+    head = " ".join(words[:idx])
+    # Balanced-pair scan over the HEAD only: any opener with no matching closer
+    # in the head means the closer is in the tail → the split orphans the pair.
+    stack = []
+    dq_open = False  # straight ASCII double-quote parity (open==close)
+    for ch in head:
+        if ch == '"':
+            dq_open = not dq_open
+        elif ch in _OPEN_TO_CLOSE:
+            stack.append(ch)
+        elif ch in _CLOSE_TO_OPEN:
+            if stack and stack[-1] == _CLOSE_TO_OPEN[ch]:
+                stack.pop()
+    return bool(stack) or dq_open
+
+
 # ─── Phrase boundary selection (script-aware, single decision point) ──
 def _latin_phrase_boundaries(words: List[str]) -> List[int]:
     """Word indices AFTER which a phrase boundary exists (clause/sentence
@@ -248,6 +285,9 @@ def _clause_boundary_ok(words: List[str], idx: int) -> bool:
     end on a bare function word; the remaining risk is purely the tail's leading
     word. Returns True when the split reads cleanly."""
     if idx <= 0 or idx >= len(words):
+        return False
+    # UNIVERSAL: never split so an opening quote/bracket is orphaned from its close.
+    if _split_breaks_paired_delimiter(words, idx):
         return False
     first_bare = _bare_word(words[idx])
     if first_bare in _LEADING_WORDS or first_bare in _DETERMINERS:
@@ -299,6 +339,10 @@ def _pick_word_phrase_boundary(words: List[str]) -> Optional[int]:
     mid = n / 2.0
     scored: List[tuple] = []
     for i in range(1, n):
+        # UNIVERSAL: skip any boundary that would orphan a paired delimiter
+        # (open quote/bracket on the head, its close on the tail).
+        if _split_breaks_paired_delimiter(words, i):
+            continue
         last_bare = _bare_word(words[i - 1])
         first_bare = _bare_word(words[i])
         score = 0.0
