@@ -437,7 +437,16 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
     max_lines = _max_lines()
     max_chars = _max_chars()
     max_dur = _env_int("CUSTOM_MAX_DISPLAY_MS", 7000)
-    max_gap = _env_int("CONDENSATION_MERGE_MAX_GAP_MS", 500)
+    # UNIVERSAL FRAGMENT-REJOIN GAP. This is the healing counterpart to the
+    # shaping split: when the shaper (or CPS split) breaks ONE utterance into
+    # sentence fragments, those fragments are CONTIGUOUS by construction, so the
+    # rejoin must be eligible across that split. The old 500ms ceiling was tuned
+    # for genuinely separate utterances and starved the rejoin (9 merges against
+    # 527 gated fragments on a feature). 1200ms covers a natural intra-sentence
+    # breath/pause between shaper-split halves while still refusing to fuse two
+    # distinct utterances (which are separated by the left cue ENDING a sentence
+    # — the _mc_ends_sentence gate below, not the gap, is the real firewall).
+    max_gap = _env_int("CONDENSATION_MERGE_MAX_GAP_MS", 1200)
 
     # Merge-pass wall-clock budget — previously UNBOUNDED: hundreds of
     # eligible pairs × up to 3 LLM attempts each could grind for many
@@ -617,12 +626,24 @@ def condense_cues(
     # it can't fix falls through to normal per-cue condensation.
     merged_pairs = 0
     if mode == "condense_to_cps":
-        cues, merged_pairs = _merge_condense_continuations(
-            cues, client if use_llm else None, model, system_prompt
-        )
-        if merged_pairs:
-            for i2, c2 in enumerate(cues):
-                c2["idx"] = i2 + 1
+        # UNIVERSAL FRAGMENT-REJOIN — iterate to a fixed point. A single left-to-
+        # right pass only rejoins the FIRST fragment pair of a sentence the
+        # shaper split into 3+ cues; the remaining fragments would still ship
+        # broken. Looping until no pair merges (bounded) lets a fully-shattered
+        # sentence rejoin completely and condense as ONE unit — the whole point
+        # of the healing law. Bounded at 4 passes: even a sentence split into 5
+        # fragments collapses in ≤4 rounds, and the merge budget inside the
+        # function is the real wall-clock guard.
+        for _rejoin_pass in range(4):
+            cues, pass_merged = _merge_condense_continuations(
+                cues, client if use_llm else None, model, system_prompt
+            )
+            merged_pairs += pass_merged
+            if pass_merged:
+                for i2, c2 in enumerate(cues):
+                    c2["idx"] = i2 + 1
+            else:
+                break
 
     # ── Sentence-fragment map (computed AFTER the merge pass) ─────────
     # A cue is a FRAGMENT when it does not end a sentence (left half of a
