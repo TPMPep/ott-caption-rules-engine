@@ -1082,6 +1082,81 @@ def _build_dialogue_cues(
     return cues
 
 
+# Phrase-boundary word classes — the SAME linguistic tables the line-breaker
+# and shaper use, so the CUE-level balanced split ranks boundaries identically
+# (break BEFORE a preposition/conjunction/article, never strand one at a chunk
+# end). Shared import keeps every split path in the engine consistent.
+try:
+    from .linebreak import _LEADING_WORDS as _BAL_LEADING, _DETERMINERS as _BAL_DET, _bare as _bal_bare
+except Exception:  # pragma: no cover
+    _BAL_LEADING = frozenset()
+    _BAL_DET = frozenset()
+
+    def _bal_bare(w):
+        return (w or "").strip(".,;:!?\"')]}").lower()
+
+_BAL_SENT_END = (".", "!", "?")
+_BAL_CLAUSE_END = (",", ";", ":", "—", "–")
+
+
+def _balanced_two_way_split(
+    words: List[str],
+    budget: int,
+) -> Optional[tuple]:
+    """Split `words` into TWO balanced, phrase-aware halves for the common
+    "sentence needs exactly two cues" case. Returns (left_words, right_words)
+    or None when no boundary gives two halves that EACH fit one cue's budget
+    (caller then falls through to the greedy multi-chunk splitter).
+
+    Scoring mirrors linebreak.choose_two_line_break at the CUE level:
+      + reward balance (small |len(left) - len(right)|)
+      + strong reward for breaking AFTER sentence punctuation, then clause punct
+      + reward the right half LEADING with a conjunction/preposition/article
+      - penalize a left half ENDING on a stranded function word
+    A ≥3-word tiny-side guard (same threshold as every other picker) keeps a
+    3-char fragment from becoming its own cue. Deterministic; ties → earlier
+    break. SOC 2 CC8.1."""
+    n = len(words)
+    if n < 4:
+        return None
+
+    def _llen(start: int, end: int) -> int:
+        if start >= end:
+            return 0
+        seg = words[start:end]
+        return sum(len(w) for w in seg) + (len(seg) - 1)
+
+    best_i: Optional[int] = None
+    best_score = float("-inf")
+    for i in range(1, n):
+        len1 = _llen(0, i)
+        len2 = _llen(i, n)
+        # Each half must fit a single cue (max_chars × max_lines).
+        if len1 > budget or len2 > budget:
+            continue
+        # Tiny-side guard — never strand a <3-word fragment as its own cue.
+        if min(i, n - i) < 3:
+            continue
+        last = words[i - 1]
+        first = words[i]
+        score = -abs(len1 - len2) * 1.0
+        if last.rstrip().endswith(_BAL_SENT_END):
+            score += 32.0
+        elif last.rstrip().endswith(_BAL_CLAUSE_END):
+            score += 28.0
+        if _bal_bare(first) in _BAL_LEADING or _bal_bare(first) in _BAL_DET:
+            score += 15.0
+        if _bal_bare(last) in _BAL_LEADING or _bal_bare(last) in _BAL_DET:
+            score -= 25.0
+        if score > best_score:
+            best_score = score
+            best_i = i
+
+    if best_i is None:
+        return None
+    return (words[:best_i], words[best_i:])
+
+
 def _split_sentence_into_cue_chunks(
     words: List[str],
     max_chars: int,
@@ -1110,6 +1185,27 @@ def _split_sentence_into_cue_chunks(
     # standalone caption. A back-off boundary is eligible only when the head it
     # produces carries at least MIN_CHUNK_WORDS words.
     MIN_CHUNK_WORDS = 3
+
+    # ── BALANCED TWO-WAY SPLIT (2026-07-10, PBS 0003 defect) ─────────────────
+    # When a sentence overflows ONE cue but fits in TWO (len ≤ 2×budget), a
+    # professional captioner BALANCES the two cues at the best phrase boundary
+    # — NOT greedy-fill cue 1 to the brim and dump the short remainder into cue
+    # 2. The old greedy loop turned
+    #   "Now, today's story is about a father who was obsessed with buying antiques."
+    # into a lopsided 58ch chunk + a 16ch "buying antiques." tail; the shaper
+    # then re-split the 58ch chunk, yielding a 3-way fragment mess with a
+    # 1-line, over-CPS "Now, today's story is" fail-cue. Balancing splits it into
+    # two clean ~37ch cues ("...about a father" | "who was obsessed with buying
+    # antiques.") — "buying antiques." rides with its phrase, exactly the
+    # expected professional output. This mirrors the balanced+clause-aware
+    # scoring the LINE breaker (linebreak.choose_two_line_break) already uses,
+    # applied one level up at the CUE boundary. Longer sentences (3+ cues) fall
+    # through to the greedy clause-backoff loop below unchanged. SOC 2 CC8.1 —
+    # deterministic function of phrase structure, identical every run.
+    if budget < len(" ".join(words)) <= 2 * budget and len(words) >= 4:
+        two = _balanced_two_way_split(words, budget)
+        if two is not None:
+            return [{"words": two[0]}, {"words": two[1]}]
 
     chunks: List[List[str]] = []
     cur: List[str] = []
