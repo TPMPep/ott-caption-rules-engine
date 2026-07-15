@@ -77,6 +77,23 @@ Pure functions only. No env writes.
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+# COLLISION-RESISTANT canonical hashing — SHA-256 over deterministic canonical
+# serialization, byte-identical to lib/cc-segmentation-audit.js canonicalSha256.
+# THE audit identity + idempotency hash for input_hash / candidate_set_hash /
+# output_hash / decision_key. FNV-1a (32-bit) is RETIRED for every audit hash —
+# its birthday-bound collision space is indefensible for a per-decision
+# idempotency key that gates whether a second ingestion duplicates a row.
+# SOC 2 CC7.2 / CC8.1.
+from .canonical_hash import canonical_sha256
+
+
+# Schema generation of the persisted CCSegmentationDecision record shape. Bumped
+# when the field set the engine emits (and the ingester persists) changes.
+DECISION_SCHEMA_VERSION = 1
+# Language-aware segmentation policy generation (CJK kinsoku / Latin clause
+# tables). Bumped only when those linguistic tables change.
+LANGUAGE_POLICY_VERSION = 1
+
 # ─── Versioning (Step 17) ────────────────────────────────────────────
 # Bump SEGMENTATION_POLICY_VERSION when the candidate-generation or scoring
 # LOGIC changes in a way that could alter selected boundaries. Bump
@@ -115,6 +132,18 @@ _SENTENCE_END = (".", "!", "?")
 _CLAUSE_END = (",", ";", ":", "—", "–")
 _OPEN_TO_CLOSE = {"\u201c": "\u201d", "(": ")", "[": "]", "\u2018": "\u2019", "\u00ab": "\u00bb"}
 _CLOSE_TO_OPEN = {v: k for k, v in _OPEN_TO_CLOSE.items()}
+
+# Discourse markers / coordinating conjunctions that grammatically bind to the
+# PRECEDING clause. A cue must never END on one (it dangles) and a tail cue that
+# BEGINS with one is a weak boundary — the marker belongs with the prior phrase.
+# Used by the editorial-quality scorer (Step 4/6), NOT as a hard veto, so a
+# boundary is only avoided when a better compliant candidate exists. These are a
+# superset of the leading-word table with the specific coordinators the reviewer
+# flagged ("so", "and", "but", …). Language: Latin/English slice (Step 11 seam).
+_DANGLING_TAIL_MARKERS = frozenset({
+    "so", "and", "but", "or", "nor", "for", "yet", "because", "since", "while",
+    "although", "though", "if", "when", "as", "that", "then", "well",
+})
 
 
 # ─── Spec knobs (identical names/defaults to shaping.py + cps.py) ─────
@@ -263,14 +292,19 @@ def _collect_windows(cues: List[Dict[str, Any]]) -> List[Tuple[int, int]]:
 
 
 def _window_word_stream(cues: List[Dict[str, Any]], start: int, end: int
-                        ) -> Tuple[List[str], List[Dict[str, Any]], int, int, bool]:
+                        ) -> Tuple[List[str], List[Dict[str, Any]], int, int, bool, List[bool]]:
     """Flatten a window into (words, per_word_timings, win_start_ms, win_end_ms,
-    have_timings). Word order is preserved exactly. Timings prefer the cue's real
-    meta.word_timings; a cue lacking them contributes interpolated placeholders so
-    the stream stays index-aligned to words (have_timings=False when ANY cue in
-    the window lacked real timings → interpolation-fallback provenance)."""
+    have_timings, measured_flags). Word order is preserved exactly. Timings prefer
+    the cue's real meta.word_timings; a cue lacking them contributes interpolated
+    placeholders so the stream stays index-aligned to words (have_timings=False
+    when ANY cue in the window lacked real timings → interpolation-fallback).
+    measured_flags is index-aligned to words: True where the token carried a REAL
+    provider word-timing, False where it was proportionally interpolated — this is
+    what lets the provenance be 'mixed' (some measured, some not) rather than
+    collapsing a partial window to a single verdict. SOC 2 CC8.1."""
     words: List[str] = []
     timings: List[Dict[str, Any]] = []
+    measured_flags: List[bool] = []
     have_all = True
     for k in range(start, end):
         cue = cues[k]
@@ -282,6 +316,7 @@ def _window_word_stream(cues: List[Dict[str, Any]], start: int, end: int
             for w, t in zip(cw, wt):
                 words.append(w)
                 timings.append({"start_ms": t["start_ms"], "end_ms": t["end_ms"]})
+                measured_flags.append(True)
         else:
             # Interpolate this cue's words proportionally over its window.
             have_all = False
@@ -294,9 +329,10 @@ def _window_word_stream(cues: List[Dict[str, Any]], start: int, end: int
                 e = c_start + span * cursor // total
                 words.append(w)
                 timings.append({"start_ms": int(s), "end_ms": int(max(e, s + 1))})
+                measured_flags.append(False)
     win_start = int(cues[start].get("start_ms", 0))
     win_end = int(cues[end - 1].get("end_ms", win_start + 1))
-    return words, timings, win_start, win_end, have_all
+    return words, timings, win_start, win_end, have_all, measured_flags
 
 
 # ─── Candidate = a proposed arrangement of the window's words into cues ─
@@ -390,29 +426,44 @@ def _candidate_cut_sets(words: List[str], orig_cut_indices: Tuple[int, ...]
 
 
 # ─── Hard vetoes (Step 4 / candidate scoring) ────────────────────────
+def _tokens_conserved(parts: List[Dict[str, Any]], orig_words: List[str]) -> bool:
+    """Token-IDENTITY conservation (Step 7) — stronger than a string-concat
+    check. Verifies that the flattened dialogue tokens of the candidate equal the
+    window's original tokens EXACTLY, position by position: same count, same
+    order, same surface form INCLUDING attached punctuation, with duplicates
+    preserved as duplicates (a positional zip, never a set/multiset compare that
+    could hide a dropped-then-duplicated word). Because word boundaries are only
+    ever split BETWEEN whitespace tokens — never inside a token, never across a
+    contraction — a token like "you're" or "today." moves as one atom and is
+    compared as one atom, so contractions and punctuation-attached tokens are
+    handled explicitly and can never be silently normalized away. Deterministic."""
+    got: List[str] = []
+    for p in parts:
+        got.extend((p["meta"]["dialogue_text"]).split())
+    if len(got) != len(orig_words):
+        return False
+    return all(a == b for a, b in zip(got, orig_words))
+
+
 def _veto(parts: List[Dict[str, Any]], orig_words: List[str]
           ) -> Optional[str]:
     """Return a veto reason code, or None when the candidate is compliant.
-    Vetoes run BEFORE scoring — a vetoed candidate is never selectable."""
+    Vetoes run BEFORE scoring — a vetoed candidate is never selectable.
+
+    NOTE (Step 5): the reading-rhythm TARGET is a PREFERENCE, not a compliance
+    law, so it is NOT a hard veto here. A cue longer than target×1.5 is penalized
+    in _score (so a balanced split beats a wall-of-text WHEN a compliant split
+    exists) but survives when it is the only valid arrangement (grammatically
+    indivisible sentence, protected boundary, or every split reads worse). The
+    ONLY duration vetoes are the spec's hard floor (min_display) and hard ceiling
+    (max_display)."""
     max_chars, max_lines = _max_chars(), _max_lines()
     min_display, max_display = _min_display_ms(), _max_display_ms()
     max_cps = _max_cps()
-    # RHYTHM CEILING (Step 6, editorial): a single cue running noticeably longer
-    # than the reading-rhythm target reads as a wall of text even when it's under
-    # the hard max_display and within CPS. Ceiling = target × 1.5 (same threshold
-    # shaping._needs_shaping uses to decide a cue is over-rhythm). A candidate
-    # containing an over-rhythm part is vetoed so a balanced split always beats
-    # the merged wall-of-text — UNLESS no split is possible, in which case every
-    # candidate vetoes here and the caller's chosen-is-None path lets the
-    # downstream rhythm/CPS stages handle it. Deterministic, spec-driven.
-    rhythm_ceiling = int(_target_duration_ms() * 1.5)
     if not parts:
         return "EMPTY_CANDIDATE"
-    # TEXT CONSERVATION — concatenated tokens must equal the original, in order.
-    got = []
-    for p in parts:
-        got.extend((p["meta"]["dialogue_text"]).split())
-    if got != orig_words:
+    # TEXT CONSERVATION (Step 7) — token-identity, not string concat.
+    if not _tokens_conserved(parts, orig_words):
         return "TEXT_CONSERVATION_FAILED"
     for p in parts:
         dur = p["end_ms"] - p["start_ms"]
@@ -420,8 +471,6 @@ def _veto(parts: List[Dict[str, Any]], orig_words: List[str]
             return "DURATION_BELOW_MIN"
         if dur > max_display:
             return "DURATION_ABOVE_MAX"
-        if dur > rhythm_ceiling:
-            return "OVER_RHYTHM_CEILING"
         if not _cue_fits_delivered(p, max_lines, max_chars):
             return "LINE_OR_CPL_FAIL"
         # CPS veto — a resegmentation that is STILL over budget is not a
@@ -443,27 +492,59 @@ def _score(parts: List[Dict[str, Any]], op: str, orig_part_count: int) -> float:
     max_cps = _max_cps()
     target_cps = _target_cps()
     target_dur = _target_duration_ms()
+    rhythm_ceiling = int(target_dur * 1.5)
     flash_ms = _micro_flash_ms()
     score = 0.0
 
-    cps_vals, durs = [], []
+    cps_vals, durs, char_lens = [], [], []
     for i, p in enumerate(parts):
         dur = p["end_ms"] - p["start_ms"]
         durs.append(dur)
         body = " ".join(p.get("lines", [])).strip() or p["meta"]["dialogue_text"]
+        char_lens.append(len(body))
         cps = len(body) / max(0.001, dur / 1000.0)
         cps_vals.append(cps)
         words = p["meta"]["dialogue_text"].split()
-        # Grammar boundary: reward a part that ENDS on sentence/clause punct
-        # (a natural break), except the final part which just ends the window.
+        # Grammar boundary quality of the CUT after this part (not the final one).
         if i < len(parts) - 1:
-            last = words[-1].rstrip()
-            if last.endswith(_SENTENCE_END):
-                score += 12.0
-            elif last.endswith(_CLAUSE_END):
-                score += 8.0
+            last_raw = words[-1].rstrip()
+            last_bare = _bare_word(last_raw)
+            nxt_words = parts[i + 1]["meta"]["dialogue_text"].split()
+            first_bare = _bare_word(nxt_words[0]) if nxt_words else ""
+            if last_raw.endswith(_SENTENCE_END):
+                score += 14.0                      # strongest: sentence end
+            elif last_raw.endswith(_CLAUSE_END):
+                score += 8.0                       # good: clause end
             else:
-                score -= 6.0  # mid-phrase boundary is worse
+                score -= 8.0                       # mid-phrase break is weak
+            # DANGLING-TAIL penalty (Step 4): this part ENDS on a coordinator /
+            # discourse marker ("so", "and", "but", "well", …). It dangles —
+            # the marker grammatically leads the NEXT clause, so ending here is
+            # linguistically weak even if it clears CPS. Heavily penalized so a
+            # boundary one word later (after the marker) is preferred WHEN it
+            # is also compliant.
+            if last_bare in _DANGLING_TAIL_MARKERS:
+                score -= 16.0
+            # WEAK-TAIL-LEAD penalty (Step 4): the NEXT part BEGINS with a
+            # coordinator/marker/determiner that belongs to the prior phrase.
+            # (Candidate generation already blocks leading determiners/function
+            # words; this catches the discourse-marker case they don't cover.)
+            if first_bare in _DANGLING_TAIL_MARKERS:
+                score -= 10.0
+        # Rhythm penalty (Step 5 — PREFERENCE, not veto): a part past the
+        # editorial rhythm ceiling reads as a wall of text. Penalized STEEPLY
+        # (a fixed "this should have been split" hit plus a per-second slope) so
+        # a compliant balanced split reliably beats it — but NOT rejected, so
+        # when no compliant split exists (grammatically indivisible sentence,
+        # protected boundary, every split worse) it remains the winning
+        # arrangement. The fixed component matters because a wall-of-text only
+        # marginally over the ceiling is still a wall of text; the slope makes
+        # ever-longer walls ever-worse. Calibrated against the executed corpus
+        # (test_reconsider_rhythm_veto): a ~4.6s single cue loses to a clean
+        # 2-cue split, while a 4.6s indivisible sentence with no compliant
+        # alternative still wins.
+        if dur > rhythm_ceiling:
+            score -= 15.0 + (dur - rhythm_ceiling) / 1000.0 * 6.0
         # Flash penalty (editorial, not just min_display).
         if dur < flash_ms:
             score -= 20.0
@@ -475,11 +556,20 @@ def _score(parts: List[Dict[str, Any]], op: str, orig_part_count: int) -> float:
     if cps_vals:
         score -= max(0.0, max(cps_vals) - target_cps) * 1.2
         if len(cps_vals) > 1:
-            spread = max(cps_vals) - min(cps_vals)
-            score -= spread * 0.4
+            score -= (max(cps_vals) - min(cps_vals)) * 0.4
     # Duration balance.
     if len(durs) > 1:
         score -= (max(durs) - min(durs)) / 1000.0 * 0.8
+    # CHARACTER-LOAD IMBALANCE penalty (Step 4): a very short first cue followed
+    # by a dense second cue ("You get on well" | 12-word wall) reads badly even
+    # when both clear CPS. Penalize the reading-load ratio between the lightest
+    # and heaviest part — the higher the ratio, the more lopsided. Applied to
+    # multi-part candidates only; scaled so a ~2× imbalance is a mild nudge and a
+    # ~4×+ imbalance is decisive against an otherwise-tied balanced alternative.
+    if len(char_lens) > 1:
+        lo = max(1, min(char_lens))
+        hi = max(char_lens)
+        score -= (hi / lo - 1.0) * 5.0
     # Fragmentation penalty — more parts = more fragmentation; slight bias to
     # the fewest cues that solve the problem (2 beats 3 on ties).
     score -= (len(parts) - 1) * 2.0
@@ -497,6 +587,150 @@ def _summarize_candidate(op: str, cuts, parts, veto_reason) -> Dict[str, Any]:
         "vetoed": veto_reason is not None,
         "veto_reason": veto_reason,
     }
+
+
+def _timing_provenance(op: str, parts: List[Dict[str, Any]],
+                       timings: List[Dict[str, Any]], words: List[str],
+                       cuts: Tuple[int, ...], have_timings: bool
+                       ) -> Tuple[str, Dict[str, int]]:
+    """Compute the PRECISE timing provenance of a selected arrangement, per the
+    timing-provenance-precision contract. Distinguishes:
+      • 'inherited'    — no_change reproduced the incoming boundaries unchanged.
+      • 'measured'     — EVERY internal cut boundary landed on a real provider
+                          word-timing (all boundary words had measured timings).
+      • 'interpolated' — NO boundary word had a measured timing (the whole window
+                          fell back to proportional interpolation).
+      • 'mixed'        — SOME boundaries are measured and SOME interpolated. A
+                          partial-timing window is NEVER labeled simply
+                          'interpolated' when any boundary is real.
+    Returns (provenance, detail_counts). detail_counts is bounded (four ints),
+    never the raw timing arrays. `_measured_flags` (index-aligned to `words`,
+    True where a token carried a real measured timing) is read from module state
+    set by the window builder. SOC 2 CC8.1."""
+    n_cuts = len(cuts)
+    detail = {
+        "measured_boundary_count": 0,
+        "interpolated_boundary_count": 0,
+        "extended_boundary_count": 0,
+        "total_boundary_count": n_cuts,
+    }
+    if op == "no_change":
+        # no_change reproduces the incoming cue boundaries verbatim — inherited.
+        return "inherited", detail
+    if n_cuts == 0:
+        # merge_all: one cue spanning the window; its edges are the window edges
+        # (inherited from the incoming window bounds), no internal boundary.
+        return "inherited", detail
+    measured = 0
+    interpolated = 0
+    flags = _MEASURED_FLAGS
+    for cut in cuts:
+        # The boundary word is words[cut] (start of the next part). It is
+        # 'measured' when that token carried a real provider timing.
+        if 0 <= cut < len(flags) and flags[cut]:
+            measured += 1
+        else:
+            interpolated += 1
+    detail["measured_boundary_count"] = measured
+    detail["interpolated_boundary_count"] = interpolated
+    if measured and interpolated:
+        return "mixed", detail
+    if measured and not interpolated:
+        return "measured", detail
+    return "interpolated", detail
+
+
+def _reason_codes(op: str, scored: List[Tuple], chosen: Tuple,
+                  no_change_over_cps: bool) -> List[str]:
+    """Bounded, machine-readable reason codes for WHY the selected candidate won.
+    Reproducible from the pinned policy — never free text. Mirrors the
+    deterministic selection sort key (highest score → fewest parts → earliest
+    cuts → no_change)."""
+    codes: List[str] = []
+    if len(scored) == 1:
+        codes.append("only_compliant")
+    else:
+        codes.append("highest_score")
+        top = scored[0][0]
+        ties = [s for s in scored if abs(s[0] - top) < 1e-9]
+        if len(ties) > 1:
+            codes.append("tie_fewest_parts")
+            codes.append("tie_earliest_cuts")
+    if op == "no_change":
+        codes.append("stability_preferred")
+    elif op == "merge_all":
+        codes.append("merged_reads_best")
+    else:
+        codes.append("resegmented_for_rhythm")
+    return codes
+
+
+def _rejected_reason_categories(summaries: List[Dict[str, Any]]) -> List[str]:
+    """DEDUPLICATED list of veto CATEGORIES that eliminated non-selected
+    candidates. Categories only — never per-candidate detail (that stays in the
+    engine run log). Bounded by the finite veto-code vocabulary."""
+    cats = []
+    for s in summaries:
+        r = s.get("veto_reason")
+        if r and r not in cats:
+            cats.append(r)
+    return cats
+
+
+def _decision_hashes(words: List[str], orig_boundaries: List[int],
+                     candidates: List[Tuple[str, Tuple[int, ...]]],
+                     parts: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+    """(input_hash, candidate_set_hash, output_hash) — the reproducibility +
+    idempotency anchors, all COLLISION-RESISTANT SHA-256 over canonical payloads
+    (byte-identical to cc-segmentation-audit.js). input = ordered source token
+    surfaces + incoming boundaries; candidate_set = the deterministic candidate
+    cut-sets generated; output = result cue text + boundaries. Every payload is
+    a plain dict/list of deterministic values — no timestamps, no transient
+    fields — so identical logical input hashes identically across Python + JS."""
+    input_hash = canonical_sha256({
+        "kind": "seg_input",
+        "words": list(words),
+        "boundaries": list(orig_boundaries),
+    })
+    candidate_set_hash = canonical_sha256({
+        "kind": "seg_candidates",
+        "candidates": [[op, list(cuts)] for op, cuts in candidates],
+    })
+    output_hash = canonical_sha256({
+        "kind": "seg_output",
+        "parts": [[int(p["start_ms"]), int(p["end_ms"]), p["meta"]["dialogue_text"]] for p in parts],
+    })
+    return input_hash, candidate_set_hash, output_hash
+
+
+def _decision_key(format_run_id: str, transformation_sequence: int,
+                  input_hash: str, candidate_set_hash: str, op: str,
+                  cuts: Tuple[int, ...]) -> str:
+    """DETERMINISTIC idempotency key for one decision within its run. SHA-256
+    over (run id, window position, engine/policy versions, input_hash,
+    candidate_set_hash, selected op+cuts). Repeated ingestion of the SAME engine
+    result upserts on this key instead of creating a duplicate row — the
+    exactly-once persistence guarantee under the poller's at-least-once delivery.
+    No timestamps → the same result always yields the same key. SOC 2 CC7.2."""
+    return canonical_sha256({
+        "kind": "seg_decision_key",
+        "format_run_id": str(format_run_id or ""),
+        "transformation_sequence": int(transformation_sequence),
+        "optimizer_version": OPTIMIZER_VERSION,
+        "segmentation_policy_version": SEGMENTATION_POLICY_VERSION,
+        "input_hash": input_hash,
+        "candidate_set_hash": candidate_set_hash,
+        "operation": op,
+        "selected_cuts": list(cuts),
+    })
+
+
+# Module-level index-aligned measured-timing flags for the window currently being
+# processed. Set by optimize_cue_sequence right after _window_word_stream so
+# _timing_provenance can tell a measured boundary from an interpolated one at the
+# exact cut index. Reset per window. Not thread-shared (the engine processes one
+# job per worker thread, one window at a time within it).
+_MEASURED_FLAGS: List[bool] = []
 
 
 # ─── Public entry ────────────────────────────────────────────────────
@@ -518,6 +752,12 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     windows = _collect_windows(cues)
     out: List[Dict[str, Any]] = []
     cursor = 0
+    # Zero-based window index within this run's segmentation pass — the
+    # transformation_sequence recorded on every decision so an auditor can replay
+    # decisions in engine order and page deterministically. Incremented ONLY for
+    # material dialogue windows the optimizer actually evaluated (not the
+    # non-dialogue gaps emitted verbatim between them).
+    transformation_sequence = 0
     for (start, end) in windows:
         # Emit any non-dialogue cues sitting before this window verbatim.
         while cursor < start:
@@ -526,7 +766,9 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         window_cues = cues[start:end]
         speaker = _primary_speaker(window_cues[0])
-        words, timings, win_start, win_end, have_timings = _window_word_stream(cues, start, end)
+        words, timings, win_start, win_end, have_timings, measured_flags = _window_word_stream(cues, start, end)
+        global _MEASURED_FLAGS
+        _MEASURED_FLAGS = measured_flags
         orig_text = " ".join(words)
         orig_boundaries = [int(c.get("start_ms", 0)) for c in window_cues]
         # Original cut indices = cumulative word counts at each internal cue
@@ -611,26 +853,72 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         timing_source = "word_timings" if have_timings else "interpolated"
         seg_quality = "optimized" if op != "no_change" else "compliant"
 
+        # Precise timing provenance (measured/interpolated/mixed/inherited) +
+        # bounded boundary counts — replaces the coarse timing_source verdict.
+        timing_provenance, timing_detail = _timing_provenance(
+            op, parts, timings, words, cuts, have_timings)
+        selected_reason_codes = _reason_codes(op, scored, chosen, no_change_over_cps)
+        rejected_categories = _rejected_reason_categories(summaries)
+        review_required = (op == "no_change" and no_change_over_cps and not non_destructive_fix_exists)
+        review_reason_codes = (["cps_over_max_no_resegmentation"] if review_required else [])
+        input_hash, candidate_set_hash, output_hash = _decision_hashes(
+            words, orig_boundaries, candidates, parts)
+        # Stable selected-candidate id — the serialized winning cut-set (bounded
+        # string, NOT the candidate's text).
+        selected_candidate_id = ("no_change" if op == "no_change"
+                                 else f"{op}:{','.join(str(c) for c in cuts)}")
+        # Engine-side decision_key WITHOUT the run id (the engine does not know
+        # the Base44 CCFormatRun.id). The ingester recomputes the FINAL key
+        # binding the run id via the same canonical contract; this
+        # `decision_key_unbound` lets a reader verify the ingester's binding.
+        # transformation_sequence is the deterministic window index.
+        this_seq = transformation_sequence
+        transformation_sequence += 1
+        decision_key_unbound = _decision_key(
+            "", this_seq, input_hash, candidate_set_hash, op, cuts)
+
         prov = {
             "optimizer_version": OPTIMIZER_VERSION,
             "policy_version": SEGMENTATION_POLICY_VERSION,
+            "segmentation_policy_version": SEGMENTATION_POLICY_VERSION,
+            "language_policy_version": LANGUAGE_POLICY_VERSION,
+            "decision_schema_version": DECISION_SCHEMA_VERSION,
+            "transformation_sequence": this_seq,
+            "decision_key_unbound": decision_key_unbound,
             "source_cue_ids": [c.get("idx") for c in window_cues],
             "source_cue_count": len(window_cues),
+            "result_cue_count": len(parts),
             "original_window_text": orig_text[:2000],
             "original_boundaries_ms": orig_boundaries,
             "speaker": speaker,
             "operation": op,
             "candidates_considered": len(summaries),
+            "candidate_count": len(candidates),
             "candidate_summaries": summaries[:40],  # bounded audit
             "selected_cuts": list(cuts),
+            "selected_candidate_id": selected_candidate_id,
+            "selected_reason_codes": selected_reason_codes,
+            "rejected_reason_categories": rejected_categories,
             "moved_word_count": moved_words,
             "timing_change": op != "no_change",
             "timing_source": timing_source,
-            "text_conservation": "passed",  # a vetoed candidate never reaches here
+            "timing_provenance": timing_provenance,
+            "timing_provenance_detail": timing_detail,
+            # Token-identity conservation (Step 7). A candidate that failed the
+            # positional token compare was vetoed (TEXT_CONSERVATION_FAILED) and
+            # can never reach here, so a selected candidate is provably conserved.
+            "text_conservation": "token_identity_passed",
+            "text_conservation_status": "token_identity_passed",
+            "token_conservation_method": "positional_surface_compare",
             "condensation_evaluated": True,
             "condensation_allowed": condensation_allowed,
             "condensation_reason": condensation_reason,
             "segmentation_quality": seg_quality,
+            "review_required": review_required,
+            "review_reason_codes": review_reason_codes,
+            "input_hash": input_hash,
+            "candidate_set_hash": candidate_set_hash,
+            "output_hash": output_hash,
         }
 
         for pi, p in enumerate(parts):
