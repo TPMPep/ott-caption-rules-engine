@@ -681,6 +681,26 @@ def process_caption_job(
     except Exception as _e:
         print(f"[FORMATTER] caption shaping skipped (non-fatal): {_e}")
 
+    # 5c. CROSS-CUE SEQUENCE OPTIMIZER (canonical Timed-Text Editorial
+    # Segmentation stage). Runs AFTER shaping (word timings intact) and BEFORE
+    # editorial-AI / readability+CPS / condensation. This is the ONLY stage that
+    # evaluates a contiguous same-speaker cue WINDOW as a whole and is allowed to
+    # REPLACE the local boundaries — generating candidate 2-/3-cue
+    # resegmentations from the original word-timed stream, vetoing the
+    # non-compliant, scoring the rest, and stamping the redistribution-before-
+    # condensation gate + full provenance on every emitted cue. It fixes the
+    # flash-fragment and removed-phrase failure classes through general rules,
+    # not per-example branches. Disabled per run via SEQ_OPTIMIZER_ENABLED=0.
+    # SOC 2 CC8.1 — deterministic, attributable, reproducible.
+    try:
+        from .sequence_optimizer import optimize_cue_sequence
+        before_opt = len(cues)
+        cues = optimize_cue_sequence(cues)
+        print(f"[FORMATTER] After sequence optimizer: {len(cues)} cues "
+              f"(was {before_opt})")
+    except Exception as _e:
+        print(f"[FORMATTER] sequence optimizer skipped (non-fatal): {_e}")
+
     # 6. Editorial AI — pass the heartbeat through so each cue's OpenAI
     # call can pulse the job's updated_at timestamp. Closes the "engine
     # looks hung from outside even though it's still working" perception
@@ -781,7 +801,28 @@ def process_caption_job(
         }
         cond = (c.get("meta") or {}).get("condensation")
         if cond and cond.get("applied"):
-            out["meta"] = {"condensation": cond}
+            out.setdefault("meta", {})["condensation"] = cond
+        # Sequence-optimizer provenance — the bounded, meaningful audit summary
+        # the application contract exposes (Step 13). We carry ONLY the summary
+        # fields (not the full candidate_summaries debug payload — that stays in
+        # the engine log to keep the result payload small on a feature). The
+        # Base44 ingester persists these onto CaptionCue for the editor's
+        # "compliant / optimized / condensed / review-required" distinction.
+        so = (c.get("meta") or {}).get("seq_opt")
+        if so:
+            out.setdefault("meta", {})["seq_opt"] = {
+                "optimizer_version": so.get("optimizer_version"),
+                "policy_version": so.get("policy_version"),
+                "operation": so.get("operation"),
+                "segmentation_quality": so.get("segmentation_quality"),
+                "moved_word_count": so.get("moved_word_count", 0),
+                "timing_source": so.get("timing_source"),
+                "condensation_evaluated": so.get("condensation_evaluated", False),
+                "condensation_allowed": so.get("condensation_allowed", False),
+                "condensation_reason": so.get("condensation_reason"),
+                "candidates_considered": so.get("candidates_considered"),
+                "source_cue_count": so.get("source_cue_count"),
+            }
         return out
 
     result: Dict[str, Any] = {
