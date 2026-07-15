@@ -76,6 +76,17 @@ except Exception:
     _merge_cue_meta = None
     _cue_fits_delivered = None
 
+# REDISTRIBUTION-BEFORE-CONDENSATION guard (Step 5 / precedence). The sequence
+# optimizer stamps every cue with meta.seq_opt.condensation_allowed. This helper
+# returns True when a words-changing condensation is FORBIDDEN because the
+# optimizer found a compliant non-destructive arrangement. A cue the optimizer
+# never touched (no seq_opt) is handled the legacy way (returns False → permit).
+try:
+    from .sequence_optimizer import condensation_is_blocked as _condensation_is_blocked
+except Exception:  # pragma: no cover
+    def _condensation_is_blocked(cue):
+        return False
+
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
 def _env_int(name: str, default: int) -> int:
@@ -479,6 +490,11 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
                  or _cue_cps(nxt, _cue_dialogue_text(nxt)) > max_cps)
             and int(nxt.get("start_ms", 0)) - int(cue.get("end_ms", 0)) <= max_gap
             and int(nxt.get("end_ms", 0)) - int(cue.get("start_ms", 0)) <= max_dur
+            # REDISTRIBUTION-BEFORE-CONDENSATION: skip the destructive merge-
+            # reword when the optimizer already found a compliant non-destructive
+            # arrangement for either cue in the pair. SOC 2 CC8.1.
+            and not _condensation_is_blocked(cue)
+            and not _condensation_is_blocked(nxt)
         )
         if not eligible:
             out.append(cue)
@@ -710,6 +726,17 @@ def condense_cues(
         # audit row can answer "why wasn't this over-CPS cue condensed?".
         if use_llm and fragment_flags[idx] and still_over:
             stats["fragment_gated"] += 1
+        # REDISTRIBUTION-BEFORE-CONDENSATION (Step 5): if the sequence optimizer
+        # recorded that a compliant non-destructive resegmentation existed for
+        # this cue, the LLM reword is FORBIDDEN — the words must be preserved and
+        # the honest QC flag ships instead of a paraphrase. Deterministic
+        # disfluency removal above is still allowed (it removes only fillers, not
+        # meaning). SOC 2 CC8.1 — a words-deleting reword is provably a last resort.
+        if use_llm and still_over and _condensation_is_blocked(cue):
+            stats["fragment_gated"] += 1  # counted as gated (redistribution won)
+            plans[idx] = {"verbatim": verbatim, "working": working,
+                          "applied_kind": applied_kind, "llm_target": None}
+            continue
         # LLM only for COMPLETE sentences (never reword a fragment in isolation).
         if use_llm and not fragment_flags[idx] and still_over:
             target_chars = max(1, total_budget - label_overhead)
