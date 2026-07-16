@@ -1,0 +1,198 @@
+{
+  "_comment": "FROZEN shared parity fixtures for Segmentation QC. Consumed by BOTH src/lib/__tests__/cc-segmentation-qc.test.js (JS reference) AND src/cc-rules-engine/tests/test_segmentation_qc_parity.py (Python canonical). For each fixture, both engines must produce a matching NORMALIZED public contract: sorted technical_violations, the set of {issue_code, severity, remediation_attempted (sorted), remediation_result} per issue, review_required, export_blocked, and segmentation_qc_policy_version. Internal debug fields (evidence blobs, metrics, hashes) are NOT compared — only the normalized contract. NEVER renumber issue codes. Timings chosen so remediation feasibility is deterministic across both engines.",
+  "policy_version": 1,
+  "policy_invariants": {
+    "_comment": "POLICY-VERSION-1 invariants asserted by BOTH suites (test_segmentation_qc_parity.py + cc-segmentation-qc.test.js). These are VERSIONED, not permanent semantic guarantees — a future QC_POLICY_VERSION may relax them, at which point the fixture's policy_version bumps and the assertions are updated.",
+    "review_required_count_equals_unresolved_count": true,
+    "note": "Under v1 a cue is review-required IFF it carries an unresolved hard defect, so the run rollup's segmentation_qc_review_required_count == segmentation_qc_unresolved_count. Both fields are persisted separately on CCFormatRun so this equality can diverge in a later policy with no schema migration."
+  },
+  "rules": {
+    "line_rules": { "max_chars_per_line": 32, "max_lines_per_caption": 2, "min_gap_between_captions_ms": 80 },
+    "reading_speed_rules": { "max_cps": 17, "cps_measurement": "characters" },
+    "protected_phrases": ["andy cohen", "watch what happens live"]
+  },
+  "fixtures": [
+    {
+      "name": "speaker_label_caused_cps_failure_unresolvable",
+      "note": "Label tips cue over CPS; next cue is immediate so timing extension cannot help. Hard, unresolved.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 1400, "text": "[JOHN:] twenty character line", "speaker_label": "JOHN", "speaker_id": "s1" },
+        { "id": "c2", "start_ms": 1500, "end_ms": 3000, "text": "next cue.", "speaker_label": "MARY", "speaker_id": "s2" }
+      ],
+      "expect": {
+        "technical_violations": ["max_cps"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "SPEAKER_LABEL_CAUSED_CPS_FAILURE", "severity": "fail", "remediation_attempted": ["line_reflow", "timing_extension"], "remediation_result": "unresolved" }
+        ]
+      }
+    },
+    {
+      "name": "speaker_label_caused_cps_failure_resolvable_by_extension",
+      "note": "Same over-CPS label cue but with a large idle gap before the next cue → timing extension resolves it.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 1400, "text": "[JOHN:] twenty character line", "speaker_label": "JOHN", "speaker_id": "s1" },
+        { "id": "c2", "start_ms": 9000, "end_ms": 10000, "text": "next cue.", "speaker_label": "MARY", "speaker_id": "s2" }
+      ],
+      "expect": {
+        "technical_violations": ["max_cps"],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "SPEAKER_LABEL_CAUSED_CPS_FAILURE", "severity": "fail", "remediation_attempted": ["line_reflow", "timing_extension"], "remediation_result": "resolved" }
+        ]
+      }
+    },
+    {
+      "name": "speaker_label_caused_cpl_failure_resolvable_by_reflow",
+      "note": "Single-line label cue over CPL but with plenty of duration; a 2-line reflow fits both lines → resolved.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 6000, "text": "[MARY:] this line is just over the limit", "speaker_label": "MARY", "speaker_id": "s2" }
+      ],
+      "expect": {
+        "technical_violations": ["max_chars_per_line"],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "SPEAKER_LABEL_CAUSED_CPL_FAILURE", "severity": "fail", "remediation_attempted": ["line_reflow", "shorter_label"], "remediation_result": "resolved" }
+        ]
+      }
+    },
+    {
+      "name": "protected_phrase_preserved_no_issue",
+      "note": "Phrase-safe layout used; phrase intact on one line. No protected-phrase issue at all.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "I had dinner with Andy Cohen\nat the restaurant." }
+      ],
+      "expect": {
+        "technical_violations": [],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": []
+      }
+    },
+    {
+      "name": "protected_phrase_geometry_conflict",
+      "note": "Phrase split across the line break AND no phrase-safe layout fits max_cpl → geometry conflict, unresolved.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "Tonight on Watch What\nHappens Live we discuss it" }
+      ],
+      "expect": {
+        "technical_violations": ["protected_phrase"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "PROTECTED_PHRASE_GEOMETRY_CONFLICT", "severity": "fail", "remediation_attempted": ["phrase_safe_reflow"], "remediation_result": "unresolved" }
+        ]
+      }
+    },
+    {
+      "name": "protected_phrase_split_avoidable_resolved",
+      "note": "Phrase split across line break BUT a phrase-safe layout fits → avoidable split, reflow resolves it.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "I met Andy\nCohen at the bar." }
+      ],
+      "expect": {
+        "technical_violations": ["protected_phrase"],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "PROTECTED_PHRASE_SPLIT", "severity": "fail", "remediation_attempted": ["phrase_safe_reflow"], "remediation_result": "resolved" }
+        ]
+      }
+    },
+    {
+      "name": "flash_cue_resolvable",
+      "note": "Sub-400ms cue with idle room to extend past the flash floor → resolved.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 250, "text": "Hey!", "speaker_id": "s1" },
+        { "id": "c2", "start_ms": 5000, "end_ms": 6000, "text": "Later on.", "speaker_id": "s1" }
+      ],
+      "expect": {
+        "technical_violations": ["min_caption_duration_ms"],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "resolved" }
+        ]
+      }
+    },
+    {
+      "name": "flash_cue_unresolvable",
+      "note": "Sub-400ms cue with an immediate next cue → no room to extend, unresolved.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 250, "text": "Hey!", "speaker_id": "s1" },
+        { "id": "c2", "start_ms": 300, "end_ms": 1500, "text": "Right now.", "speaker_id": "s1" }
+      ],
+      "expect": {
+        "technical_violations": ["min_caption_duration_ms"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "unresolved" }
+        ]
+      }
+    },
+    {
+      "name": "micro_cue_soft",
+      "note": "Between flash floor and micro floor → soft MICRO_CUE, non-blocking.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 800, "text": "A short line here.", "speaker_id": "s1" }
+      ],
+      "expect": {
+        "technical_violations": [],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "MICRO_CUE", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" }
+        ]
+      }
+    },
+    {
+      "name": "avoidable_fragment_soft",
+      "note": "Two-word incomplete fragment → soft AVOIDABLE_FRAGMENT, non-blocking. Long duration so no micro/flash overlap.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 3000, "text": "And I", "speaker_id": "s1" }
+      ],
+      "expect": {
+        "technical_violations": [],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "AVOIDABLE_FRAGMENT", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" }
+        ]
+      }
+    },
+    {
+      "name": "reading_speed_imbalance_soft",
+      "note": "Adjacent same-speaker cues with a >2.2x CPS ratio → soft READING_SPEED_IMBALANCE.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "Short.", "speaker_id": "s1" },
+        { "id": "c2", "start_ms": 4100, "end_ms": 5100, "text": "This one is packed with far more reading.", "speaker_id": "s1" }
+      ],
+      "expect": {
+        "technical_violations": [],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "OVERLOADED_UNDERFILLED_ADJACENCY", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" },
+          { "issue_code": "READING_SPEED_IMBALANCE", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" }
+        ]
+      }
+    },
+    {
+      "name": "clean_no_issues",
+      "note": "A perfectly compliant cue → empty contract.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 3000, "text": "A clean readable line.", "speaker_id": "s1" }
+      ],
+      "expect": {
+        "technical_violations": [],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": []
+      }
+    }
+  ]
+}
