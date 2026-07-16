@@ -776,6 +776,44 @@ def process_caption_job(
     except Exception as _e:
         print(f"[FORMATTER] sentence-capitalization skipped (non-fatal): {_e}")
 
+    # 10e. SEGMENTATION QC — the canonical (production-authority) deterministic
+    # inspection + bounded remediation stage. Runs AFTER every deterministic
+    # transform that could change delivered text or timing (shaping → sequence
+    # optimizer → readability + CPS remediation → condensation → timecode/italics/
+    # alignment → label suppression → sentence capitalization) so it measures the
+    # cue exactly as the viewer sees it, and BEFORE general QC (step 11) + export
+    # serialization (step 12). It keeps TECHNICAL COMPLIANCE separate from WORKFLOW
+    # DISPOSITION: technical_violations always lists the raw failing rules; an
+    # unresolved hard defect additionally sets review_required + export_blocked.
+    # Its per-cue summaries + run rollup are carried on result.segmentation_qc for
+    # the Base44 ingester to persist verbatim — the ingester NEVER recomputes QC.
+    # SOC 2 CC7.4 (bounded, attributable auto-correction) / CC8.1.
+    seg_qc: Dict[str, Any] = {}
+    try:
+        from .segmentation_qc import run_segmentation_qc
+        seg_qc = run_segmentation_qc(cues, {
+            "line_rules": {
+                "max_chars_per_line": max_chars,
+                "max_lines_per_caption": max_lines,
+                "min_gap_between_captions_ms": _merge_gap_ms(),
+            },
+            "reading_speed_rules": {
+                "max_cps": _max_cps(),
+                "cps_measurement": _env_str("CPS_MEASUREMENT", "characters") or "characters",
+            },
+            "protected_phrases": protected_phrases,
+        })
+        print(f"[FORMATTER] Segmentation QC: completeness="
+              f"{seg_qc.get('rollup', {}).get('segmentation_qc_completeness')} "
+              f"review_required={seg_qc.get('review_required')} "
+              f"export_blocked={seg_qc.get('export_blocked')}")
+    except Exception as _e:
+        # NEVER crash a job on the QC stage. Record an honest 'unavailable'
+        # verdict so the Base44 ingester marks the audit not-applicable (not
+        # failed) rather than silently shipping without a QC record.
+        print(f"[FORMATTER] segmentation QC skipped (non-fatal): {_e}")
+        seg_qc = {"error": str(_e)[:300], "segmentation_qc_policy_version": None}
+
     # 11. QC
     qc = qc_report(cues_in_count, cues, protected_phrases)
     print(f"[FORMATTER] QC: {qc}")
@@ -808,26 +846,70 @@ def process_caption_job(
         # the engine log to keep the result payload small on a feature). The
         # Base44 ingester persists these onto CaptionCue for the editor's
         # "compliant / optimized / condensed / review-required" distinction.
+        # BOUNDED external seq_opt payload — the fields the Base44 ingester
+        # persists onto CaptionCue (cue-level summary) and CCSegmentationDecision
+        # (run-level audit). Deliberately EXCLUDES the heavy debug detail
+        # (candidate_summaries, original_window_text, word_timings, raw candidate
+        # text) — those stay in the engine's Railway run log, referenced by
+        # candidate_set_hash. Every field here is a version, count, enum,
+        # bounded reason-code list, or hash — never an unbounded array. SOC 2 CC8.1.
         so = (c.get("meta") or {}).get("seq_opt")
         if so:
             out.setdefault("meta", {})["seq_opt"] = {
+                # identity / version
                 "optimizer_version": so.get("optimizer_version"),
                 "policy_version": so.get("policy_version"),
+                "segmentation_policy_version": so.get("segmentation_policy_version", so.get("policy_version")),
+                "language_policy_version": so.get("language_policy_version"),
+                "decision_schema_version": so.get("decision_schema_version"),
+                # ancestry (bounded)
+                "source_cue_ids": (so.get("source_cue_ids") or [])[:40],
+                "source_cue_count": so.get("source_cue_count"),
+                "result_cue_count": so.get("result_cue_count"),
+                "part_index": so.get("part_index"),
+                "part_total": so.get("part_total"),
+                # decision
                 "operation": so.get("operation"),
                 "segmentation_quality": so.get("segmentation_quality"),
+                "selected_candidate_id": so.get("selected_candidate_id"),
+                "candidate_count": so.get("candidate_count", so.get("candidates_considered")),
+                "candidates_considered": so.get("candidates_considered"),
+                "selected_reason_codes": (so.get("selected_reason_codes") or [])[:12],
+                "rejected_reason_categories": (so.get("rejected_reason_categories") or [])[:12],
                 "moved_word_count": so.get("moved_word_count", 0),
+                # conservation + timing
+                "text_conservation_status": so.get("text_conservation_status", so.get("text_conservation")),
+                "token_conservation_method": so.get("token_conservation_method"),
                 "timing_source": so.get("timing_source"),
+                "timing_provenance": so.get("timing_provenance"),
+                "timing_provenance_detail": so.get("timing_provenance_detail"),
+                # condensation gate
                 "condensation_evaluated": so.get("condensation_evaluated", False),
                 "condensation_allowed": so.get("condensation_allowed", False),
                 "condensation_reason": so.get("condensation_reason"),
-                "candidates_considered": so.get("candidates_considered"),
-                "source_cue_count": so.get("source_cue_count"),
+                # review
+                "review_required": so.get("review_required", False),
+                "review_reason_codes": (so.get("review_reason_codes") or [])[:8],
+                # audit hashes
+                "input_hash": so.get("input_hash"),
+                "candidate_set_hash": so.get("candidate_set_hash"),
+                "output_hash": so.get("output_hash"),
+                # bounded diagnostic aid (speaker + original boundaries, capped)
+                "speaker": so.get("speaker"),
+                "original_boundaries_ms": (so.get("original_boundaries_ms") or [])[:10],
             }
         return out
 
     result: Dict[str, Any] = {
         "cues": [_result_cue(i, c) for i, c in enumerate(cues)],
         "qc": qc,
+        # Canonical Segmentation QC contract — the production-authority verdict.
+        # The Base44 ingester (ccIngestReformatResult) VALIDATES + persists this
+        # verbatim (cue-level summaries + run-level rollup) and NEVER recomputes
+        # QC itself. Carries technical_violations, segmentation_qc_issues[],
+        # review_required, export_blocked, segmentation_qc_policy_version,
+        # cue_summaries[], rollup{}. SOC 2 CC8.1.
+        "segmentation_qc": seg_qc or None,
         # Condensation verdict counts — persisted onto CCFormatRun.summary by
         # the Base44 ingesters so the rewrite stage is never a black box.
         "condensation_stats": condensation_stats or None,
