@@ -837,6 +837,17 @@ def process_caption_job(
             "lines": c["lines"],
             "type": c.get("type", "dialogue"),
         }
+        # ── STRUCTURED SPEAKER ATTRIBUTION (from source token data, NOT from
+        # parsing rendered "[SPEAKER X:]" text). Emitted from the cue's
+        # meta.runs (per-speaker word offsets carried since packing). A single-
+        # speaker cue emits a scalar speaker_label; a legitimate multi-speaker
+        # cue (dash grouping) emits bounded speaker_segments — one entry per run
+        # with the speaker + that segment's text span — so the ingester can
+        # persist each line's true speaker without ever assigning the whole cue
+        # to one speaker. review_required rides through so an unknown-speaker cue
+        # is flagged, never silently defaulted. SOC 2 CC8.1 / FCC §79.1.
+        speaker_fields = _structured_speaker_fields(c)
+        out.update(speaker_fields)
         cond = (c.get("meta") or {}).get("condensation")
         if cond and cond.get("applied"):
             out.setdefault("meta", {})["condensation"] = cond
@@ -1071,26 +1082,51 @@ def _build_dialogue_cues(
     pack_end: int = 0
     pack_runs: List[Dict[str, Any]] = []
     pack_speaker: Optional[str] = None
+    # Whether the current pack is an unknown-speaker (review-required) run — it
+    # must never absorb, or be absorbed by, a known-speaker group.
+    pack_review_required: bool = False
+    # Whether the current pack OPENED at a hard inter-utterance pause boundary.
+    # Stamped onto the finalized cue's meta so the sequence optimizer's window
+    # collector treats it as an immutable wall (no window may span it).
+    pack_pause_boundary: bool = False
 
     budget = max_chars * max_lines
 
     def _flush_pack() -> None:
         nonlocal pack_words, pack_start, pack_end, pack_runs, pack_speaker
+        nonlocal pack_review_required, pack_pause_boundary
         if pack_words:
-            cues.append(_finalize_dialogue_cue(
+            cue = _finalize_dialogue_cue(
                 pack_words, pack_start, pack_end, pack_runs, max_lines, max_chars,
                 word_timings=_word_timings_in_window(tokens, pack_start, pack_end),
-            ))
+                review_required=pack_review_required,
+            )
+            if pack_pause_boundary:
+                cue["meta"]["pause_boundary_before"] = True
+            cues.append(cue)
         pack_words = []
         pack_start = None
         pack_end = 0
         pack_runs = []
         pack_speaker = None
+        pack_review_required = False
+        pack_pause_boundary = False
 
     for group in sentence_groups:
         g_words = group["words"]
         g_text = " ".join(g_words)
-        g_speaker = (group.get("speaker_runs") or [{}])[0].get("speaker")
+        # EXPLICIT speaker ownership — read the group's OWN speaker, never a
+        # neighbour's. segmentation now guarantees a non-empty group always
+        # carries exactly one materialized speaker_run, so g_speaker is reliable
+        # (it was the None-from-empty-runs value here that drove the historical
+        # cross-speaker fusion). g_review_required marks an unknown-speaker group
+        # that must NEVER be merged into an adjacent known-speaker cue.
+        g_speaker = group.get("speaker", (group.get("speaker_runs") or [{}])[0].get("speaker"))
+        g_speaker_known = bool(group.get("speaker_known", g_speaker is not None))
+        g_review_required = bool(group.get("review_required", not g_speaker_known))
+        # IMMUTABLE PAUSE BOUNDARY — the group opens after a ≥pause_boundary_ms
+        # silence between distinct source utterances. A cue may never span it.
+        g_hard_boundary_before = bool(group.get("hard_boundary_before", False))
         g_is_cjk = _is_cjk(g_text)
 
         # The on-screen budget. For CJK the budget is measured in CHARACTERS
@@ -1115,8 +1151,13 @@ def _build_dialogue_cues(
             # own micro-cue with a micro window. The chunker then packs
             # "By who? Gus from the body shop…" naturally, splitting at real
             # clause/sentence boundaries. Latin only (CJK packs by glyph).
+            # Short-lead absorption is FORBIDDEN across a hard pause boundary,
+            # into/out of an unknown-speaker group, or across a speaker change —
+            # the same immutable invariants the main packing branch enforces.
             absorbed_start: Optional[int] = None
             if (pack_words and not g_is_cjk and pack_speaker == g_speaker
+                    and g_speaker_known and pack_speaker is not None
+                    and not g_hard_boundary_before
                     and len(" ".join(pack_words)) <= max_chars):
                 g_words = pack_words + g_words
                 absorbed_start = pack_start
@@ -1177,9 +1218,13 @@ def _build_dialogue_cues(
         # single-speaker cue is the guaranteed unit; intentional two-speaker
         # dash captions are produced afterwards by group_two_speaker_cues in
         # readability.py, which works ONLY on clean single-speaker cues.
-        speaker_changed = (
-            pack_words
-            and g_speaker != pack_speaker
+        # A speaker change is ANY difference in known speaker OR a
+        # known↔unknown transition. Because segmentation now guarantees explicit
+        # per-group ownership, this compares real values, not a None-from-empty-
+        # runs artifact. An unknown-speaker group (g_review_required) also always
+        # flushes so it can never be absorbed into a known-speaker cue.
+        speaker_changed = bool(pack_words) and (
+            g_speaker != pack_speaker or g_review_required or pack_review_required
         )
         # CJK packs by joining with no space (no inter-word spaces in Japanese);
         # Latin joins by space. Length is measured the same way the budget is.
@@ -1190,14 +1235,26 @@ def _build_dialogue_cues(
             candidate = (" ".join(pack_words + g_words)).strip() if pack_words else g_text
             would_overflow = len(candidate) > budget
 
-        if (speaker_changed or would_overflow) and pack_words:
+        # IMMUTABLE PAUSE BOUNDARY — a group opened by a ≥pause_boundary_ms
+        # inter-utterance silence ALWAYS forces a flush, so a cue can never span
+        # the pause (the "Cookie?" fix). Evaluated before the overflow/speaker
+        # tests so it can never be bypassed.
+        if (g_hard_boundary_before or speaker_changed or would_overflow) and pack_words:
             _flush_pack()
 
         if pack_start is None:
             pack_start = group["start_ms"]
-        if pack_speaker is None:
+        # Pack ownership is materialized from the FIRST group in the pack and is
+        # fixed for its lifetime (a change flushes above). pack_review_required
+        # rides with it so a downstream reader can flag the cue for review;
+        # pack_pause_boundary records that this pack opened at a hard pause so
+        # the optimizer treats the cue's leading edge as an immutable wall.
+        if not pack_words:
             pack_speaker = g_speaker
-            pack_runs.append({"speaker": g_speaker, "word_start": 0})
+            pack_review_required = g_review_required
+            pack_pause_boundary = g_hard_boundary_before
+            pack_runs.append({"speaker": g_speaker if g_speaker_known else None,
+                              "word_start": 0})
         pack_words.extend(g_words)
         pack_end = group["end_ms"]
 
@@ -1432,6 +1489,7 @@ def _finalize_dialogue_cue(
     max_lines: int,
     max_chars: int,
     word_timings: Optional[List[Dict[str, Any]]] = None,
+    review_required: bool = False,
 ) -> Dict[str, Any]:
     """Wrap words into lines respecting max_chars and max_lines, then apply
     the deterministic speaker-render baseline (dash / off-camera labels).
@@ -1468,5 +1526,11 @@ def _finalize_dialogue_cue(
             # universal shaping stage prefers these for frame-faithful splits;
             # empty list → shaper interpolates. SOC 2 CC8.1 — timing provenance.
             "word_timings": word_timings or [],
+            # SPEAKER-OWNERSHIP REVIEW FLAG — True when this cue's source group
+            # had no known speaker. Carried so the optimizer/readability never
+            # merge it into a known-speaker cue and the ingester can mark it
+            # review-required. SOC 2 CC8.1 — an unknown speaker is never silently
+            # defaulted to a neighbour.
+            "review_required": bool(review_required),
         },
     }
