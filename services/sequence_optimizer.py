@@ -265,11 +265,30 @@ def _split_breaks_paired_delimiter(words: List[str], idx: int) -> bool:
 
 
 # ─── Window = a maximal run of adjacent SAME-SPEAKER dialogue cues ───
+def _opens_immutable_wall(cue: Dict[str, Any]) -> bool:
+    """True when this cue opens a hard source-utterance pause / authored wall,
+    OR is an unknown-speaker (review-required) cue. A window may NOT extend
+    across such a cue — it is the leading edge of a new, un-spannable segment.
+    Reads the same bounded meta the shared boundary primitive reads. The optimizer
+    keeps its own tiny reader (rather than importing boundaries.is_immutable_
+    boundary) because windowing is a per-cue "does a wall START here?" question,
+    not a pairwise merge question. SOC 2 CC8.1."""
+    meta = cue.get("meta") or {}
+    return bool(meta.get("pause_boundary_before")
+                or meta.get("hard_boundary_before")
+                or meta.get("review_required"))
+
+
 def _collect_windows(cues: List[Dict[str, Any]]) -> List[Tuple[int, int]]:
     """Return [start, end) index ranges of maximal same-speaker dialogue runs.
     A window is the optimizer's evaluation unit. Windows never cross a speaker
     change or a non-dialogue (sound/music) cue — those are protected boundaries
-    (Step 4 hard veto: never move a word across a speaker boundary)."""
+    (Step 4 hard veto: never move a word across a speaker boundary). A window
+    ALSO never spans a cue that OPENS an immutable wall (hard source-utterance
+    pause, authored boundary, or unknown-speaker review cue): such a cue starts
+    its OWN window, so the optimizer can never redistribute a word across the
+    'Cookie?' pause or absorb an unknown-speaker cue into a known-speaker window.
+    SOC 2 CC8.1 / FCC §79.1."""
     windows: List[Tuple[int, int]] = []
     i = 0
     n = len(cues)
@@ -280,7 +299,11 @@ def _collect_windows(cues: List[Dict[str, Any]]) -> List[Tuple[int, int]]:
             continue
         spk = _primary_speaker(cue)
         j = i + 1
-        while j < n and cues[j].get("type") == "dialogue" and _primary_speaker(cues[j]) == spk:
+        while (j < n and cues[j].get("type") == "dialogue"
+               and _primary_speaker(cues[j]) == spk
+               # STOP the window at any cue that opens an immutable wall — it is
+               # the first cue of a new, un-spannable segment.
+               and not _opens_immutable_wall(cues[j])):
             j += 1
         # Only windows of ≥2 cues are candidates for resegmentation; a single
         # standalone cue has no neighbour to redistribute with (the shaper
@@ -725,6 +748,47 @@ def _decision_key(format_run_id: str, transformation_sequence: int,
     })
 
 
+def _passthrough_identity(transformation_sequence: int, words: List[str],
+                          orig_boundaries: List[int], window_cues: List[Dict[str, Any]],
+                          candidates: Optional[List[Tuple[str, Tuple[int, ...]]]] = None
+                          ) -> Dict[str, Any]:
+    """Build a UNIQUE per-window decision identity for a passthrough window (CJK-
+    deferred or no-compliant-candidate). This is the decision-linkage-integrity
+    primitive: each passthrough window gets its own transformation_sequence +
+    decision_key_unbound + hashes derived from ITS OWN words/boundaries, so the
+    ingester groups it as its OWN CCSegmentationDecision and it can never share an
+    id with an unrelated passthrough window. input_hash pins the window's source
+    tokens; candidate_set_hash is over whatever candidates were generated (empty
+    for a CJK defer); output_hash mirrors the input (no rearrangement occurred).
+    SOC 2 CC8.1 / CC7.2 — reproducible + idempotent per window."""
+    cand = candidates if candidates is not None else []
+    input_hash = canonical_sha256({
+        "kind": "seg_input", "words": list(words), "boundaries": list(orig_boundaries),
+    })
+    candidate_set_hash = canonical_sha256({
+        "kind": "seg_candidates", "candidates": [[op, list(cuts)] for op, cuts in cand],
+    })
+    # A passthrough performs no rearrangement, so the output IS the input window.
+    output_hash = canonical_sha256({
+        "kind": "seg_output",
+        "parts": [[int(c.get("start_ms", 0)), int(c.get("end_ms", 0)),
+                   (c.get("meta") or {}).get("dialogue_text")
+                   or " ".join(c.get("lines", []))] for c in window_cues],
+    })
+    decision_key_unbound = _decision_key(
+        "", transformation_sequence, input_hash, candidate_set_hash, "passthrough", ())
+    return {
+        "transformation_sequence": transformation_sequence,
+        "decision_key_unbound": decision_key_unbound,
+        "input_hash": input_hash,
+        "candidate_set_hash": candidate_set_hash,
+        "output_hash": output_hash,
+        "source_cue_ids": [c.get("idx") for c in window_cues],
+        "source_cue_count": len(window_cues),
+        "result_cue_count": len(window_cues),
+    }
+
+
 # Module-level index-aligned measured-timing flags for the window currently being
 # processed. Set by optimize_cue_sequence right after _window_word_stream so
 # _timing_provenance can tell a measured boundary from an interpolated one at the
@@ -783,10 +847,19 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         orig_cuts_t = tuple(orig_cuts)
 
         # CJK windows: skip (the shaper's char-splitter owns that path). Stamp a
-        # reason so the audit shows the optimizer saw it and deferred.
+        # reason so the audit shows the optimizer saw it and deferred. EACH such
+        # window gets its OWN decision identity (its own transformation_sequence
+        # + decision_key_unbound derived from its own window) so unrelated
+        # deferred windows never collapse to one shared decision id.
         if _is_cjk(orig_text):
+            this_seq = transformation_sequence
+            transformation_sequence += 1
+            identity = _passthrough_identity(
+                this_seq, words, orig_boundaries, window_cues)
             for c in window_cues:
-                _stamp_passthrough(c, "cjk_window_deferred", have_timings)
+                _stamp_passthrough(c, "cjk_window_deferred", have_timings,
+                                   speaker=speaker, orig_boundaries=orig_boundaries,
+                                   identity=identity)
                 out.append(c)
             cursor = end
             continue
@@ -826,13 +899,20 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         if chosen is None:
             # Nothing compliant at all (rare) — leave originals, allow condensation
-            # to try (it's the honest last resort), reason recorded.
+            # to try (it's the honest last resort), reason recorded. This window
+            # gets its OWN decision identity so it never shares an id with any
+            # other passthrough window (decision-linkage integrity).
+            this_seq = transformation_sequence
+            transformation_sequence += 1
+            identity = _passthrough_identity(
+                this_seq, words, orig_boundaries, window_cues, candidates=candidates)
             for c in window_cues:
                 _stamp_passthrough(c, "no_compliant_candidate", have_timings,
                                    condensation_allowed=True,
                                    condensation_reason="no_compliant_resegmentation",
                                    summaries=summaries, orig_text=orig_text,
-                                   orig_boundaries=orig_boundaries, speaker=speaker)
+                                   orig_boundaries=orig_boundaries, speaker=speaker,
+                                   identity=identity)
                 out.append(c)
             cursor = end
             continue
@@ -959,13 +1039,29 @@ def _count_moved_words(orig_cues: List[Dict[str, Any]], new_parts: List[Dict[str
 
 def _stamp_passthrough(cue, reason, have_timings, condensation_allowed=False,
                        condensation_reason="not_evaluated", summaries=None,
-                       orig_text=None, orig_boundaries=None, speaker=None):
+                       orig_text=None, orig_boundaries=None, speaker=None,
+                       identity=None):
     """Stamp a minimal seq_opt provenance block on a cue the optimizer left
-    unchanged, so EVERY dialogue cue carries an audit trail (no silent gaps)."""
+    unchanged, so EVERY dialogue cue carries an audit trail (no silent gaps).
+
+    DECISION-LINKAGE FIX (2026-07-17): every passthrough WINDOW must carry its
+    OWN unique decision identity (transformation_sequence + decision_key_unbound
+    + the three hashes) via `identity`. Previously passthrough cues carried NO
+    decision_key_unbound and NO transformation_sequence, so the ingester's
+    grouping fallback (`seq:{transformation_sequence}` = `seq:None` for all of
+    them) collapsed EVERY unrelated passthrough cue into ONE shared
+    CCSegmentationDecision id. With a per-window identity each passthrough links
+    only to the cue(s) and source window it actually evaluated. SOC 2 CC8.1.
+    `identity` = {transformation_sequence, decision_key_unbound, input_hash,
+    candidate_set_hash, output_hash, source_cue_ids, source_cue_count,
+    result_cue_count}."""
     meta = cue.get("meta") or {}
-    meta["seq_opt"] = {
+    block = {
         "optimizer_version": OPTIMIZER_VERSION,
         "policy_version": SEGMENTATION_POLICY_VERSION,
+        "segmentation_policy_version": SEGMENTATION_POLICY_VERSION,
+        "language_policy_version": LANGUAGE_POLICY_VERSION,
+        "decision_schema_version": DECISION_SCHEMA_VERSION,
         "operation": "no_change",
         "passthrough_reason": reason,
         "timing_source": "word_timings" if have_timings else "interpolated",
@@ -974,15 +1070,20 @@ def _stamp_passthrough(cue, reason, have_timings, condensation_allowed=False,
         "condensation_reason": condensation_reason,
         "segmentation_quality": "passthrough",
     }
+    if identity is not None:
+        # Per-window decision identity — the linkage-integrity fix. Each
+        # passthrough window gets its own key so decisions never collide.
+        block.update(identity)
     if summaries is not None:
-        meta["seq_opt"]["candidate_summaries"] = summaries[:40]
-        meta["seq_opt"]["candidates_considered"] = len(summaries)
+        block["candidate_summaries"] = summaries[:40]
+        block["candidates_considered"] = len(summaries)
     if orig_text is not None:
-        meta["seq_opt"]["original_window_text"] = orig_text[:2000]
+        block["original_window_text"] = orig_text[:2000]
     if orig_boundaries is not None:
-        meta["seq_opt"]["original_boundaries_ms"] = orig_boundaries
+        block["original_boundaries_ms"] = orig_boundaries
     if speaker is not None:
-        meta["seq_opt"]["speaker"] = speaker
+        block["speaker"] = speaker
+    meta["seq_opt"] = block
     cue["meta"] = meta
 
 
