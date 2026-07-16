@@ -3,7 +3,7 @@ Sentence segmentation — the professional-grade linguistic core of cue building
 
 WHY THIS EXISTS
 ───────────────
-A broadcast caption engine (Iyuno / Pixelogic / Zoo / Deluxe grade) segments
+A broadcast caption engine (Deluxe grade) segments
 spoken text into captions on TRUE SENTENCE boundaries first, then fits whole
 sentences to the spec's line/CPS budget — splitting WITHIN a sentence only at
 clause boundaries, and NEVER orphaning a trailing word onto its own flashing
