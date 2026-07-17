@@ -143,6 +143,8 @@ def propagate_boundary_to_children(parent: Dict[str, Any],
     review = bool(pmeta.get("review_required"))
     pause_first = bool(pmeta.get("pause_boundary_before"))
     hard_first = bool(pmeta.get("hard_boundary_before"))
+    # Bounded pause provenance rides with the opening pause wall — first child only.
+    pause_prov = pmeta.get("pause_provenance")
     for i, child in enumerate(children):
         cmeta = child.setdefault("meta", {})
         # Speaker-integrity review flag rides with every child (all children are
@@ -155,8 +157,11 @@ def propagate_boundary_to_children(parent: Dict[str, Any],
                 cmeta["pause_boundary_before"] = True
             if hard_first:
                 cmeta["hard_boundary_before"] = True
+            if pause_prov is not None:
+                cmeta["pause_provenance"] = pause_prov
         else:
             # A mid-sentence split child must NOT claim the parent's opening wall.
             cmeta.pop("pause_boundary_before", None)
             cmeta.pop("hard_boundary_before", None)
+            cmeta.pop("pause_provenance", None)
     return children
