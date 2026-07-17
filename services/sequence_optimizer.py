@@ -1001,9 +1001,20 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "output_hash": output_hash,
         }
 
+        # The window opened at the first window-cue's boundary. If that cue
+        # carried bounded pause provenance (item-4), it belongs to the FIRST
+        # emitted part only — the resegmentation introduced no new source pause
+        # between parts. Carry it forward so the final cue retains the provenance.
+        first_cue_meta = window_cues[0].get("meta") or {}
+        window_pause_prov = first_cue_meta.get("pause_provenance")
+        window_pause_flag = bool(first_cue_meta.get("pause_boundary_before"))
         for pi, p in enumerate(parts):
             meta = p.get("meta") or {}
             meta["seq_opt"] = dict(prov) | {"part_index": pi, "part_total": len(parts)}
+            if pi == 0 and window_pause_prov is not None:
+                meta["pause_provenance"] = window_pause_prov
+                if window_pause_flag:
+                    meta["pause_boundary_before"] = True
             p["meta"] = meta
             out.append(p)
         cursor = end
