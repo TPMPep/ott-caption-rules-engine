@@ -15,7 +15,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from services.formatter import _split_sentence_into_cue_chunks  # noqa: E402
-from services.shaping import _pick_rebalanced_latin_boundary, _split_cue_once  # noqa: E402
+from services.shaping import (  # noqa: E402
+    _pick_rebalanced_latin_boundary,
+    _pick_clause_boundary,
+    _split_cue_once,
+)
+from services.cps import _best_split_index  # noqa: E402
 from services.condensation import remove_disfluencies  # noqa: E402
 
 
@@ -98,6 +103,45 @@ def test_forced_cpl_split_never_mints_zero_duration_child():
             assert dur >= 900, f"child cue too short: {dur}ms"
     finally:
         _restore_env(old)
+
+
+# ─── 3b. CPL safety-net fallback picker (Pluto 0054/0058) ────────────
+def test_clause_boundary_picker_never_strands_tiny_side():
+    # 'Well, I could always use email or instant messaging.' — the ONLY clause
+    # boundary is after 'Well,' (1-word side). The safety-net picker must
+    # reject it (returns None → caller uses the word-phrase fallback).
+    words = "Well, I could always use email or instant messaging.".split()
+    assert _pick_clause_boundary(words) is None
+
+    # 'By who? Gus from…' — only boundary is after 'who?' (2-word side).
+    words = ("By who? Gus from the body shop or that drug salesman "
+             "who gave you all the Prozac pens?").split()
+    assert _pick_clause_boundary(words) is None
+
+    # A genuinely balanced clause boundary is still chosen.
+    #
+    # NOTE (fixture corrected 2026-07-15): the prior fixture's only comma was
+    # followed by "and" ("...this morning, and then..."). The clause picker
+    # DELIBERATELY rejects a boundary whose tail LEADS with a coordinating
+    # conjunction (the orphaned-function-word guard the first two assertions in
+    # this very test validate) — so it correctly returned None, contradicting
+    # the assertion. That was a self-contradictory fixture, not a rule defect.
+    # This input's comma is followed by "then" (a genuine content lead), giving a
+    # clean, balanced clause boundary the picker SHOULD accept — proving the
+    # positive path without contradicting the orphan guard.
+    words = ("I finished all my homework early, then I went outside "
+             "to play in the yard.").split()
+    idx = _pick_clause_boundary(words)
+    assert idx is not None and min(idx, len(words) - idx) >= 3
+    # The chosen boundary is the real clause comma (after "early,"), and its
+    # tail does NOT lead with a stranded function word.
+    assert words[idx - 1].endswith(","), f"did not break at the clause comma: idx={idx}"
+
+
+def test_cps_split_index_never_strands_tiny_side():
+    words = "Well, I could always use email or instant messaging.".split()
+    idx = _best_split_index(words)
+    assert min(idx, len(words) - idx) >= 3
 
 
 # ─── 4. Condensation retention guard (deterministic layer) ───────────
