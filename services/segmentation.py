@@ -291,6 +291,11 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
     cur_speaker_known: bool = False
     cur_utterance_id: Optional[Any] = None
     cur_hard_boundary: bool = False
+    # Bounded pause-provenance for a group opened at a hard pause: the measured
+    # gap (ms) and the prior utterance id. None on a group that did not open at
+    # a hard pause. Materialized on the first token of a hard-boundary group.
+    cur_gap_before_ms: Optional[int] = None
+    cur_prev_utterance_id: Optional[Any] = None
     # Timing + speaker of the LAST appended token — the reference for the next
     # token's pause-boundary + speaker-change decisions. Kept explicitly (not
     # re-derived from cur_words) so a flush never loses the reference frame.
@@ -312,6 +317,7 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
         # NEXT group's boundary math.
         nonlocal cur_words, cur_start, cur_end, cur_speaker, cur_speaker_known
         nonlocal cur_utterance_id, cur_hard_boundary
+        nonlocal cur_gap_before_ms, cur_prev_utterance_id
         if cur_words:
             speaker_known = cur_speaker_known and cur_speaker is not None
             groups.append({
@@ -323,6 +329,12 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
                 "review_required": not speaker_known,
                 "source_utterance_id": cur_utterance_id,
                 "hard_boundary_before": cur_hard_boundary,
+                # BOUNDED PAUSE PROVENANCE (item-4 contract). Only meaningful on a
+                # group that opened at a hard pause: the measured inter-utterance
+                # gap (ms) and the PRIOR utterance id, so a downstream reader can
+                # prove the boundary reason from bounded scalars — never raw words.
+                "gap_before_ms": cur_gap_before_ms,
+                "prev_utterance_id": cur_prev_utterance_id,
                 # EXPLICIT ownership — always exactly one run, materialized from
                 # the group's own speaker. Never empty on a non-empty group.
                 "speaker_runs": [{"speaker": cur_speaker if speaker_known else None,
@@ -335,6 +347,8 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
         cur_speaker_known = False
         cur_utterance_id = None
         cur_hard_boundary = False
+        cur_gap_before_ms = None
+        cur_prev_utterance_id = None
 
     for token in tokens:
         text = (token.get("text") or "").strip()
@@ -374,11 +388,19 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
         gap_ms = (start_ms - prev_end_ms) if (cur_words and prev_end_ms is not None) else 0
         hard_pause = different_utterance and gap_ms >= threshold
 
+        # Capture the measured gap + prior utterance id BEFORE the flush resets
+        # the reference frame — so a hard-pause group can carry bounded pause
+        # provenance (item-4 contract). Read only when the pause actually fires.
+        pause_gap_ms = gap_ms if hard_pause else None
+        pause_prev_utt = prev_utterance_id if hard_pause else None
         if (speaker_changed or prev_sentence_ended or hard_pause) and cur_words:
             _flush()
-            # A group opened by a hard pause carries the immutable-boundary flag.
+            # A group opened by a hard pause carries the immutable-boundary flag
+            # plus its bounded provenance (measured gap + prior utterance id).
             if hard_pause:
                 cur_hard_boundary = True
+                cur_gap_before_ms = int(pause_gap_ms) if pause_gap_ms is not None else None
+                cur_prev_utterance_id = pause_prev_utt
 
         if cur_start is None:
             cur_start = start_ms
