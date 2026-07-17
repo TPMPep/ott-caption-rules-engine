@@ -281,9 +281,11 @@ def _build_tokens_from_words(
     utterances: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     # Pre-build utterance time-windows once so per-word reconciliation is O(1)
-    # amortised — never re-scans utterances per word.
+    # amortised — never re-scans utterances per word. Each window carries its
+    # utterance INDEX so a reconciled word can also recover its source-utterance
+    # identity (the pause-boundary invariant's anchor on the flat-words path).
     utterance_windows: List[Dict[str, Any]] = []
-    for u in (utterances or []):
+    for u_index, u in enumerate(utterances or []):
         sp = u.get("speaker")
         if sp is None:
             continue
@@ -292,7 +294,20 @@ def _build_tokens_from_words(
             ue = int(u.get("end", us))
         except (TypeError, ValueError):
             continue
-        utterance_windows.append({"speaker": sp, "start": us, "end": ue})
+        utterance_windows.append({"speaker": sp, "start": us, "end": ue, "index": u_index})
+
+    def _reconcile_word_utterance_id(s_ms: int, e_ms: int):
+        """Source-utterance index whose time window contains this word's midpoint
+        (flat-words path). None when no window matches. Mirrors
+        _reconcile_word_speaker so speaker + utterance id come from the same
+        window — keeping the pause boundary and speaker ownership consistent."""
+        if not utterance_windows:
+            return None
+        mid = (s_ms + e_ms) // 2 if e_ms >= s_ms else s_ms
+        for win in utterance_windows:
+            if win["start"] <= mid <= win["end"]:
+                return win["index"]
+        return None
 
     tokens: List[Dict[str, Any]] = []
     for word in words:
@@ -307,14 +322,24 @@ def _build_tokens_from_words(
         # stored baseline left per-word speaker null.
         if speaker is None and utterance_windows:
             speaker = _reconcile_word_speaker(start_ms, end_ms, utterance_windows)
-        tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms, "speaker": speaker})
+        tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms,
+                       "speaker": speaker,
+                       "source_utterance_id": _reconcile_word_utterance_id(start_ms, end_ms)})
     return tokens
 
 
 def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tokens: List[Dict[str, Any]] = []
-    for utterance in utterances:
+    for utt_index, utterance in enumerate(utterances):
         utt_speaker = utterance.get("speaker")
+        # SOURCE-UTTERANCE IDENTITY (the pause-boundary invariant's anchor).
+        # Every word carries the index of the provider utterance it came from so
+        # segmentation can enforce the hard inter-utterance pause boundary
+        # (segmentation.segment_into_sentence_groups): a cue may never span a
+        # ≥pause_boundary_ms silence BETWEEN two distinct source utterances. A
+        # long hesitation WITHIN one utterance shares one id, so it never
+        # over-fragments dramatic speech. SOC 2 CC8.1 — the boundary is provably
+        # a function of source-utterance identity, not a blind gap heuristic.
         for word in (utterance.get("words") or []):
             text = (word.get("text") or "").strip()
             if not text:
@@ -330,7 +355,8 @@ def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict
             speaker = word.get("speaker")
             if speaker is None:
                 speaker = utt_speaker
-            tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms, "speaker": speaker})
+            tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms,
+                           "speaker": speaker, "source_utterance_id": utt_index})
     return tokens
 
 
