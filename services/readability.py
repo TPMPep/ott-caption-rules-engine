@@ -20,6 +20,12 @@ import os
 # speakers on one line). This is what fixes the "A+B fused into one flat line"
 # defect — the merge passes no longer do naive string concatenation.
 try:
+    from .boundaries import is_immutable_boundary as _is_immutable_boundary
+except Exception:  # pragma: no cover
+    def _is_immutable_boundary(prev_cue, next_cue):
+        return False
+
+try:
     from .rendering import render_lines, merge_cue_meta, cue_speakers, cue_fits_delivered
 except Exception:
     _HAVE_RENDERING = False
@@ -47,17 +53,43 @@ MICRO_WORD_LIMIT = 2
 MICRO_DURATION_MS = 1000
 
 
+try:
+    from .boundaries import opens_hard_boundary as _opens_hard_boundary, is_review_required as _is_review_required
+except Exception:  # pragma: no cover
+    def _opens_hard_boundary(cue):
+        meta = cue.get("meta") or {}
+        return bool(meta.get("pause_boundary_before") or meta.get("hard_boundary_before"))
+
+    def _is_review_required(cue):
+        return bool((cue.get("meta") or {}).get("review_required"))
+
+
+def _hard_wall_between(a, b):
+    """Immutable wall that NO merge (even the intentional two-speaker dash
+    grouping) may cross: `b` opens a hard source pause / authored wall, OR
+    either cue is an unknown-speaker (review-required) cue. Distinct from
+    _speakers_compatible, which governs whether the SAME speaker continues.
+    A dash grouping legitimately joins two DIFFERENT speakers, but never across
+    one of these walls. SOC 2 CC8.1 / FCC §79.1."""
+    return _opens_hard_boundary(b) or _is_review_required(a) or _is_review_required(b)
+
+
 def _speakers_compatible(a, b):
-    """Two cues may be merged only when they don't introduce a NEW speaker
-    boundary that the renderer would have to split anyway. Compatible when:
-      • either cue has no known speaker (unknown — safe to join), OR
-      • they share the exact same single speaker.
-    Cues belonging to genuinely DIFFERENT speakers are never glued together —
-    that's what preserves the dash/label and stops A+B fusing into one line."""
+    """Two cues may be merged AS ONE SPEAKER only when the boundary between them
+    is not immutable AND they share the exact same single known speaker.
+
+    HARDENED (2026-07-17): the historical "either side unknown → safe to join"
+    leniency is REMOVED — it was the root of the cross-speaker contamination
+    (Speaker A's fragment fusing into Speaker G's cue when a speaker tag was
+    dropped). Same-speaker continuation now REQUIRES both sides prove the same
+    single speaker, and never crosses a pause/authored/unknown-speaker wall.
+    Delegates to the shared immutable-boundary primitive so every stage agrees."""
+    if _is_immutable_boundary(a, b):
+        return False
     sa = cue_speakers(a)
     sb = cue_speakers(b)
     if not sa or not sb:
-        return True
+        return False
     return sa == sb and len(sa) == 1
 
 
@@ -261,7 +293,10 @@ def merge_micro_cues(cues):
             # Different-speaker merge is only allowed when the spec gives us a
             # second line to put the second speaker on (one-speaker-per-line is
             # non-negotiable). Dash mode is handled by group_two_speaker_cues.
-            allow_cross = (not same_speaker) and max_lines >= 2 and label_mode != "dash"
+            # NEVER across a pause/authored/unknown-speaker wall, even for a
+            # legitimate two-line two-speaker caption. SOC 2 CC8.1.
+            allow_cross = ((not same_speaker) and max_lines >= 2
+                           and label_mode != "dash" and not _hard_wall_between(cue, nxt))
             if same_speaker or allow_cross:
                 candidate = _rerender_merged(cue, nxt)
                 if _merge_improves(cue, nxt, candidate):
@@ -391,6 +426,9 @@ def group_two_speaker_cues(cues):
                 and cue.get("type") == "dialogue"
                 and nxt.get("type") == "dialogue"
                 and not _speakers_compatible(cue, nxt)  # genuinely DIFFERENT speakers
+                # Never group across a hard pause / authored wall / unknown-
+                # speaker cue, even though the two speakers genuinely differ.
+                and not _hard_wall_between(cue, nxt)
                 and (nxt["start_ms"] - cue["end_ms"]) <= group_gap):
             combined = _rerender_merged(cue, nxt)
             # Only accept the grouping if it still fits the on-screen budget
