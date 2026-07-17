@@ -69,6 +69,15 @@ except Exception:  # pragma: no cover
     def _cue_fits_delivered(cue, max_lines=None, max_chars=None):
         return True
 
+# Immutable-boundary primitive — the split must carry the parent's opening
+# pause/authored wall onto the FIRST child only, and the review-required
+# speaker-integrity flag onto EVERY child, so a boundary survives shaping.
+try:
+    from .boundaries import propagate_boundary_to_children as _propagate_boundary
+except Exception:  # pragma: no cover
+    def _propagate_boundary(parent, children):
+        return children
+
 try:
     from .cjk import (
         is_cjk_text as _is_cjk,
@@ -332,13 +341,31 @@ def _pick_word_phrase_boundary(words: List[str]) -> Optional[int]:
     start) and the first half does NOT end on a stranded function word. Same
     word-class intelligence the line-breaker uses, applied to CUE splitting so a
     punctuation-free line still divides at a real phrase point, never a blind
-    midpoint. Returns a split index in 1..len-1, or None if too short (≤1 word)."""
+    midpoint. Returns a split index in 1..len-1, or None if too short (≤1 word).
+
+    MIN-SIDE GUARD (2026-07-10, PBS 0003 "Now, today's story is" defect): mirror
+    the ≥3-word tiny-side guard the two clause pickers already enforce. Without
+    it, a fast-speech word-phrase split could strand a 4-word fragment
+    ("Now, today's story is") as its own flashing sub-min-duration fail-cue.
+    Excluding boundaries whose smaller side is under 3 words makes the picker
+    prefer the BALANCED phrase cut ("...about a father" | "who was obsessed...")
+    that reads professionally AND fits — ONE consistent tiny-side rule across
+    every boundary picker in the engine. For a cue so short that no boundary
+    clears the guard, the guard is relaxed to len-1 (any split) so an over-CPL
+    line can still break — the guard tightens rhythm, it never blocks a forced
+    CPL break."""
     n = len(words)
     if n < 2:
         return None
     mid = n / 2.0
+    # Tiny-side floor: prefer a break whose smaller half is ≥3 words. Relax to 1
+    # for very short cues (≤5 words) so a genuinely-must-split short line is
+    # never left un-breakable — CPL fit outranks the rhythm-balance preference.
+    min_side = 3 if n > 5 else 1
     scored: List[tuple] = []
     for i in range(1, n):
+        if min(i, n - i) < min_side:
+            continue
         # UNIVERSAL: skip any boundary that would orphan a paired delimiter
         # (open quote/bracket on the head, its close on the tail).
         if _split_breaks_paired_delimiter(words, i):
@@ -475,7 +502,8 @@ def _pick_rebalanced_latin_boundary(
     if clause:
         return clause[0]
 
-    # Word-phrase fallback — ONLY for punctuation-free cues, window-checked.
+    # Word-phrase fallback — for cues with no clean clause boundary. Prefer a
+    # split that ALSO gives both children a readable window (rhythm-ideal).
     widx = _pick_word_phrase_boundary(words)
     if widx is not None and _child_windows_readable(
         cue, " ".join(words[:widx]), " ".join(words[widx:]),
@@ -611,7 +639,12 @@ def _split_cue_once(
             },
         }
 
-    return [_mk(left_text, start, left_end), _mk(right_text, right_start, end)]
+    children = [_mk(left_text, start, left_end), _mk(right_text, right_start, end)]
+    # Preserve the parent's opening pause/authored wall on the FIRST child only,
+    # and its speaker-integrity review flag on both children. A split introduces
+    # NO new source-utterance pause between the halves, so only child[0] may
+    # claim the parent's opening boundary. SOC 2 CC8.1 / FCC §79.1.
+    return _propagate_boundary(cue, children)
 
 
 def _wrap_overflows_cpl(cue: Dict[str, Any]) -> bool:
