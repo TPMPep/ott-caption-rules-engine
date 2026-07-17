@@ -87,6 +87,14 @@ except Exception:  # pragma: no cover
     def _condensation_is_blocked(cue):
         return False
 
+# Immutable-boundary primitive — the continuation-merge must never fuse across a
+# pause/authored/unknown-speaker wall, even for same-speaker fragments.
+try:
+    from .boundaries import is_immutable_boundary as _is_immutable_boundary
+except Exception:  # pragma: no cover
+    def _is_immutable_boundary(prev_cue, next_cue):
+        return False
+
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
 def _env_int(name: str, default: int) -> int:
@@ -495,6 +503,10 @@ def _merge_condense_continuations(cues, client, model, system_prompt):
             # arrangement for either cue in the pair. SOC 2 CC8.1.
             and not _condensation_is_blocked(cue)
             and not _condensation_is_blocked(nxt)
+            # IMMUTABLE BOUNDARY: never fuse across a hard source-utterance pause,
+            # an authored wall, or an unknown-speaker cue — even two same-speaker
+            # fragments. SOC 2 CC8.1 / FCC §79.1.
+            and not _is_immutable_boundary(cue, nxt)
         )
         if not eligible:
             out.append(cue)
