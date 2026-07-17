@@ -47,7 +47,7 @@ Provider selection (auditor-grade default):
   on every POST.
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, Dict, Any, List
@@ -72,7 +72,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.31.0-immutable-boundaries-structured-speaker"
+VERSION = "5.32.0-diagnostics-fixture-route-pause-provenance"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -670,3 +670,76 @@ def get_job(job_id: str, x_engine_secret: Optional[str] = Header(default=None)):
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
+
+
+# ─── Bounded diagnostic route (deployed-engine verification) ─────────
+# LOCKED DOWN by design (see services/diagnostics.py):
+#   • 404 unless ENABLE_ENGINE_DIAGNOSTICS=true — disabling needs NO code deploy,
+#     just flip the env var; the route vanishes on next boot.
+#   • requires X-Engine-Secret (same as /v1/jobs).
+#   • body accepts ONLY { "fixture_id": <allowlisted string> } — ANY extra key
+#     (tokens, transcript, env, captionOptions, path, ...) is rejected 400.
+#   • strict request-size limit; no provider calls, no S3, no network, no DB,
+#     no persistence, no fixture-transcript logging.
+#   • runs the REAL process_caption_job over committed fixtures + returns a
+#     bounded diagnostic result and a FIXED build manifest (SHA-256 of the ten
+#     known runtime files — never a caller-supplied path).
+#   • zero effect on /v1/jobs.
+# The Pydantic model with model_config forbidding extras enforces the
+# "reject arbitrary token/transcript inputs" requirement declaratively.
+
+# Max diagnostic request body — a fixture request is a few dozen bytes. 4KB is a
+# generous ceiling that still rejects any attempt to smuggle a payload.
+_DIAG_MAX_BODY_BYTES = 4096
+
+
+def _diagnostics_enabled() -> bool:
+    return (os.getenv("ENABLE_ENGINE_DIAGNOSTICS", "") or "").strip().lower() in ("1", "true", "yes")
+
+
+class DiagnosticFixtureRequest(BaseModel):
+    # forbid ANY key other than fixture_id — this is the "reject arbitrary
+    # token/transcript inputs" guarantee, enforced by Pydantic, not by hand.
+    model_config = {"extra": "forbid"}
+    fixture_id: str
+
+
+@app.post("/v1/diagnostics/caption-fixture")
+async def diagnostics_caption_fixture(
+    request: Request,
+    x_engine_secret: Optional[str] = Header(default=None),
+):
+    # (1) Availability gate — 404 when diagnostics are disabled (indistinguishable
+    # from a nonexistent route; leaks nothing about the engine).
+    if not _diagnostics_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+    # (2) Secret — same posture as the production routes.
+    _check_secret(x_engine_secret)
+    # (3) Strict request-size limit BEFORE parsing.
+    raw = await request.body()
+    if len(raw) > _DIAG_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="diagnostic request too large")
+    # (4) Parse + validate with extra=forbid (rejects any token/transcript input).
+    try:
+        parsed = json.loads(raw.decode("utf-8")) if raw else {}
+        req_model = DiagnosticFixtureRequest(**parsed)
+    except Exception:
+        # SAFE message only — no paths, no internals, no stack trace.
+        raise HTTPException(status_code=400, detail="invalid diagnostic request")
+    # (5) Allowlist check + run the real pipeline over the committed fixture.
+    from services.diagnostics import run_fixture, DiagnosticsError, ALLOWED_FIXTURE_IDS
+    if req_model.fixture_id not in ALLOWED_FIXTURE_IDS:
+        raise HTTPException(status_code=400, detail="unknown fixture_id")
+    try:
+        result = run_fixture(req_model.fixture_id, VERSION)
+    except DiagnosticsError:
+        raise HTTPException(status_code=400, detail="unknown fixture_id")
+    except Exception:
+        # Never leak a stack trace / path from a diagnostic run.
+        raise HTTPException(status_code=500, detail="diagnostic run failed")
+    return {
+        "ok": True,
+        "engine_version": VERSION,
+        "allowed_fixture_ids": list(ALLOWED_FIXTURE_IDS),
+        **result,
+    }
