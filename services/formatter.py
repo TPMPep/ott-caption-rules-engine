@@ -21,12 +21,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Project imports with local fallbacks
 try:
-    from .rendering import render_lines as _render_lines
+    from .rendering import render_lines as _render_lines, segments_from_runs as _segments_from_runs
 except Exception:
     # Defensive: must never crash a job. Falls back to a plain join. This
     # path should never fire in production (rendering.py ships with the engine).
     def _render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text=None):
         return [dialogue_text if dialogue_text is not None else " ".join(words)]
+
+    def _segments_from_runs(words, speaker_runs):
+        if not speaker_runs:
+            return [{"speaker": None, "text": " ".join(words)}]
+        out = []
+        for i, run in enumerate(speaker_runs):
+            start = run.get("word_start", 0)
+            end = (speaker_runs[i + 1].get("word_start", len(words))
+                   if i + 1 < len(speaker_runs) else len(words))
+            seg_words = words[start:end]
+            if seg_words:
+                out.append({"speaker": run.get("speaker"), "text": " ".join(seg_words)})
+        return out
 
 # CJK awareness — single source of truth for no-space-script handling.
 try:
@@ -57,12 +70,22 @@ except Exception:
             source = timestamps
         out = []
         for item in source:
-            out.append({
+            token = {
                 "text": item.get("text", ""),
                 "start_ms": int(item.get("start_ms", item.get("start", 0) or 0)),
                 "end_ms": int(item.get("end_ms", item.get("end", 0) or 0)),
                 "speaker": item.get("speaker") or "A",
-            })
+            }
+            # PRESERVE the source-utterance identity — the immutable pause-boundary
+            # invariant (segmentation._token_utterance_id) reads this to detect a
+            # distinct-utterance hard pause. Dropping it here silently disabled the
+            # invariant on the fallback normalization path (assembly.normalize_tokens
+            # keeps it verbatim; this fallback must match). SOC 2 CC8.1 / FCC §79.1.
+            utt = item.get("source_utterance_id",
+                           item.get("utterance_index", item.get("aai_utterance_index")))
+            if utt is not None:
+                token["source_utterance_id"] = utt
+            out.append(token)
         return out
 
     def _is_sound_token(text: str) -> bool:
@@ -573,6 +596,71 @@ def _apply_alignment(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     cue["lines"][0] = "{\\+" + align_tag + "}" + first_line
 
     return cues
+
+
+# ─── Structured speaker attribution ─────────────────────────────────
+
+def _structured_speaker_fields(c: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive STRUCTURED speaker fields for a result cue FROM SOURCE TOKEN
+    STRUCTURE (the cue's meta.runs word-offset runs) — NEVER by parsing the
+    rendered "[SPEAKER X:]" caption text. Returns a dict merged into the result
+    cue by _result_cue. Contract:
+
+      • Non-dialogue cue (music / sound_effect / …) → {} (no speaker fields).
+      • Unknown-speaker cue (meta.review_required, or no known speaker in runs)
+        → {"speaker_review_required": True}. NO speaker_label is emitted — the
+        speaker was never silently defaulted to a neighbour.
+      • Exactly ONE distinct known speaker → {"speaker_label": <speaker>}.
+      • ≥2 distinct known speakers (a legitimate dash-grouped multi-speaker cue)
+        → {"speaker_label": <first speaker, stable scalar primary>,
+           "speaker_segments": [{speaker, text}, …]} — one bounded entry per
+        source run (capped at 8), each carrying that run's own text span, so the
+        ingester persists each line's TRUE speaker without ever labeling the
+        whole cue as one speaker.
+
+    SOC 2 CC8.1 / FCC 47 CFR §79.1 — every line's speaker is provable from source
+    structure, and the cross-speaker-fusion defect class is answerable from data.
+    """
+    if c.get("type", "dialogue") != "dialogue":
+        return {}
+
+    meta = c.get("meta") or {}
+    runs = meta.get("runs") or []
+    review_required = bool(meta.get("review_required"))
+
+    # Reconstruct the cue's word list from the source dialogue text (never from
+    # rendered lines, which may carry speaker labels / dashes).
+    dialogue_text = meta.get("dialogue_text")
+    if dialogue_text is None:
+        dialogue_text = " ".join(c.get("lines") or [])
+    words = dialogue_text.split() if dialogue_text else []
+
+    known_speakers = [r.get("speaker") for r in runs if r.get("speaker") is not None]
+    distinct_known = []
+    for s in known_speakers:
+        if s not in distinct_known:
+            distinct_known.append(s)
+
+    # Unknown speaker: flagged for review, never given a label.
+    if review_required or not distinct_known:
+        out: Dict[str, Any] = {}
+        if review_required or not known_speakers:
+            out["speaker_review_required"] = True
+        return out
+
+    if len(distinct_known) == 1:
+        return {"speaker_label": distinct_known[0]}
+
+    # Legitimate multi-speaker cue — bounded per-run attribution + scalar primary.
+    segments = _segments_from_runs(words, runs)
+    speaker_segments = [
+        {"speaker": str(s.get("speaker")), "text": str(s.get("text", ""))}
+        for s in segments if s.get("speaker") is not None
+    ][:8]
+    return {
+        "speaker_label": distinct_known[0],
+        "speaker_segments": speaker_segments,
+    }
 
 
 # ─── Main Pipeline ──────────────────────────────────────────────────
