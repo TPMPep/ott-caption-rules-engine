@@ -36,6 +36,8 @@ identical (words, runs, spec) always renders identical lines, on every stage.
 import os
 from typing import Any, Dict, List, Optional
 
+from .rules import get_rule as _rule_get
+
 try:
     from services.linebreak import choose_two_line_break
 except ImportError:  # pragma: no cover — defensive for alternate import roots
@@ -59,7 +61,7 @@ except ImportError:  # pragma: no cover
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -77,11 +79,11 @@ def _max_chars() -> int:
 
 
 def _speaker_label_mode() -> str:
-    return (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
+    return (_rule_get("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
 
 
 def _label_case() -> str:
-    return (os.getenv("SPEAKER_LABEL_CASE", "uppercase") or "uppercase").strip().lower()
+    return (_rule_get("SPEAKER_LABEL_CASE", "uppercase") or "uppercase").strip().lower()
 
 
 def _format_speaker_name(raw: Optional[str], mode: str) -> str:
@@ -125,10 +127,10 @@ def _label_format(off_camera: bool = False) -> str:
     """Tag template from the spec. {name} is substituted. Off-camera speakers
     may use a distinct template (Pluto: '({name}):')."""
     if off_camera:
-        oc = (os.getenv("OFF_CAMERA_LABEL_FORMAT", "") or "").strip()
+        oc = (_rule_get("OFF_CAMERA_LABEL_FORMAT", "") or "").strip()
         if oc:
             return oc
-    return (os.getenv("SPEAKER_LABEL_FORMAT", "[{name}:]") or "[{name}:]").strip()
+    return (_rule_get("SPEAKER_LABEL_FORMAT", "[{name}:]") or "[{name}:]").strip()
 
 
 def _render_speaker_tag(raw_speaker: Optional[str], mode: str) -> str:
@@ -162,25 +164,51 @@ def segments_from_runs(words: List[str], speaker_runs: List[Dict[str, Any]]) -> 
 def _greedy_wrap(words: List[str], max_chars: int, max_lines: int) -> List[str]:
     """Greedy left-to-right fill. The deterministic fallback used for the
     1-line case, the 3+-line case, and whenever the syntax-aware 2-line breaker
-    finds no feasible balanced split. Word-faithful (enumerate-based slice)."""
+    finds no feasible balanced split.
+
+    WORD-FIDELITY INVARIANT (hard, universal): every spoken word in `words` is
+    present in the returned lines, in order, exactly once. Wrapping may exceed
+    max_chars on a line ONLY when a single line cannot physically hold the words
+    (e.g. max_lines=1 with text longer than max_chars, or a word longer than
+    max_chars) — it must NEVER drop a word to satisfy the geometry. Content
+    fidelity outranks line geometry: an over-wide line is a QC-flaggable layout
+    issue; a dropped spoken word is silent data loss (FCC §79.1 completeness /
+    SOC 2 CC8.1). The prior implementation truncated to `lines[:max_lines]` after
+    dumping the current index, which on max_lines=1 discarded every word after
+    the first overflow — the exact fidelity defect this guard closes.
+
+    When the natural fill would need MORE than max_lines lines, the overflow
+    words are appended to the LAST allowed line (that line goes over-wide) rather
+    than dropped, so the deliverable still contains all words and QC surfaces the
+    over-length line honestly."""
+    if not words:
+        return [""]
+
     lines: List[str] = []
     current_line = ""
     for idx, word in enumerate(words):
         test = (current_line + " " + word).strip() if current_line else word
         if len(test) <= max_chars:
             current_line = test
-        else:
-            if current_line:
-                lines.append(current_line)
-            current_line = word
-            if len(lines) >= max_lines - 1:
-                # Last allowed line — dump remaining words from the CURRENT
-                # index (never words.index(word), which finds the first match).
-                lines.append(" ".join(words[idx:]))
-                return lines[:max_lines]
+            continue
+        # `word` doesn't fit on the current line.
+        if len(lines) >= max_lines - 1:
+            # We're already on the LAST allowed line. Dropping the remainder
+            # would lose spoken words — instead keep every remaining word on
+            # this final line (it may exceed max_chars; that's a layout issue,
+            # never data loss). Slice from the CURRENT index so repeated words
+            # are faithful (never words.index(word), which finds the first).
+            tail = " ".join(words[idx:])
+            current_line = (current_line + " " + tail).strip() if current_line else tail
+            lines.append(current_line)
+            return lines
+        # Otherwise start a fresh line with this word.
+        if current_line:
+            lines.append(current_line)
+        current_line = word
     if current_line:
         lines.append(current_line)
-    return lines[:max_lines]
+    return lines
 
 
 def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
@@ -222,6 +250,36 @@ def wrap_text(text: str, max_chars: int, max_lines: int) -> List[str]:
             return two
 
     return _greedy_wrap(words, max_chars, max_lines)
+
+
+def _wrap_with_atomic_label(tag: str, dialogue_text: str, max_chars: int, max_lines: int) -> List[str]:
+    """Wrap a single-speaker cue while treating its rendered identifier as one
+    indivisible presentation token. The label may never be broken internally.
+    """
+    body_words = (dialogue_text or "").split()
+    if not tag:
+        return wrap_text(dialogue_text, max_chars, max_lines)
+    if len(tag) > max_chars:
+        # Keep the identifier intact and let delivered-geometry QC block it.
+        return [tag] + (wrap_text(dialogue_text, max_chars, max(1, max_lines - 1)) if body_words else [])
+    lines: List[str] = []
+    first = tag
+    consumed = 0
+    for i, word in enumerate(body_words):
+        trial = f"{first} {word}".strip()
+        if len(trial) > max_chars:
+            break
+        first = trial
+        consumed = i + 1
+    lines.append(first)
+    remaining = " ".join(body_words[consumed:])
+    if remaining:
+        room = max_lines - 1
+        if room <= 0:
+            lines[0] = f"{lines[0]} {remaining}".strip()
+        else:
+            lines.extend(wrap_text(remaining, max_chars, room))
+    return lines
 
 
 def render_lines(
@@ -286,14 +344,10 @@ def render_lines(
             # Dash mode does NOT prefix a single-speaker cue (the dash only
             # disambiguates a multi-speaker exchange). Plain wrap.
             return wrap_text(dialogue_text, max_chars, max_lines)
-        # Bracket-style modes (alpha / generic / named / first_occurrence /
-        # every_change / always): prepend the tag to the wrapped text so the
-        # label rides on the first line. The tag counts toward the char budget
-        # of line 1 — wrap the tagged text as a whole so QC stays honest.
+        # Bracket-style modes: the tag counts toward final geometry, but is an
+        # ATOMIC presentation token and may never split internally.
         tag = _render_speaker_tag(primary_speaker, mode)
-        if not tag:
-            return wrap_text(dialogue_text, max_chars, max_lines)
-        return wrap_text(f"{tag} {dialogue_text}".strip(), max_chars, max_lines)
+        return _wrap_with_atomic_label(tag, dialogue_text, max_chars, max_lines)
 
     # ── Multi-speaker cue — one speaker per line + per-speaker label ──────
     lines: List[str] = []
