@@ -8,6 +8,8 @@ graded this cue?" from the result alone.
 """
 
 import os
+
+from .rules import get_rule as _rule_get
 import re
 from typing import Dict, List
 
@@ -30,7 +32,7 @@ FUNCTION_WORDS = {
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -40,7 +42,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _caption_profile() -> str:
-    return (os.getenv("CAPTION_PROFILE", "") or "").strip().lower()
+    return (_rule_get("CAPTION_PROFILE", "") or "").strip().lower()
 
 
 def _max_lines() -> int:
@@ -72,7 +74,7 @@ def _min_cps() -> int:
 
 
 def _measurement() -> str:
-    return (os.getenv("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
+    return (_rule_get("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
 
 
 def _visible_chars(cue: Dict) -> int:
@@ -329,6 +331,6 @@ def qc_report(cues_in: int, cues_out: List[Dict], protected_phrases: List[str]) 
             # Confirms whether the Base44 producer's project posture ('alpha')
             # reached the engine, or whether it fell to the 'dash' default
             # (which would explain dash-path grouping running unexpectedly).
-            "speaker_label_mode": (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower(),
+            "speaker_label_mode": (_rule_get("SPEAKER_LABEL_MODE", "") or "dash").strip().lower(),
         },
     }
