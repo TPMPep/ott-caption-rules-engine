@@ -680,6 +680,18 @@ def _structured_speaker_fields(c: Dict[str, Any]) -> Dict[str, Any]:
 
 # ─── Main Pipeline ──────────────────────────────────────────────────
 
+# FORMATTER PIPELINE VERSION — the deterministic-formatter generation. Bumped
+# when any DETERMINISTIC stage (segmentation → shaping → optimizer → readability
+# → condensation → timecode/italics/alignment → label suppression → sentence
+# capitalization → frame-grid → segmentation QC → export) changes in a way that
+# could alter delivered bytes. Pinned into every run's deterministic input tuple
+# (main.deterministic_inputs) so an auditor can prove which formatter produced a
+# delivery. Independent of the engine VERSION string (which also moves for
+# non-formatter changes) and of SEGMENTATION_POLICY_VERSION (the optimizer's
+# scoring policy). SOC 2 CC8.1.
+FORMATTER_VERSION = 1
+
+
 def process_caption_job(
     backbone_srt_text: str,
     timestamps: Any,
@@ -687,9 +699,25 @@ def process_caption_job(
     output_formats: Optional[List[str]] = None,
     heartbeat: Optional[Any] = None,
     audio_events: Optional[List[Dict[str, Any]]] = None,
+    allow_editorial_ai: bool = False,
 ) -> Dict[str, Any]:
     """
     Main caption processing pipeline.
+
+    DETERMINISM CONTRACT (Design A, Phase 1)
+    ────────────────────────────────────────
+    `allow_editorial_ai` gates the ONE non-deterministic stage (the OpenAI
+    editorial polish, step 6). It defaults to FALSE so the pipeline is
+    byte-deterministic by default: identical (backbone, timestamps, env,
+    formatter/policy versions) → identical output on every run, across service
+    restarts and repeated job dispatch, with NO OpenAI call.
+
+    The caller sets allow_editorial_ai=True ONLY for the explicit
+    overlay-authoring / initial-transcription path — NEVER for
+    reformat_from_baseline (Apply Spec). This is the executable guarantee that
+    Apply Spec can never generate or mutate an editorial decision; it may only
+    consume a previously-frozen overlay (Phase 2), applied deterministically.
+    SOC 2 CC8.1 — the reformat critical path has no LLM on it, provably.
 
     Steps:
     1. Parse backbone SRT
@@ -697,7 +725,7 @@ def process_caption_job(
     3. Separate spoken vs sound tokens
     4. Filter sound cues by density (UPDATED)
     5. Build cue list with proper line breaks
-    6. Run editorial AI refinement
+    6. Run editorial AI refinement — ONLY when allow_editorial_ai=True
     7. Apply readability rules
     8. Apply timecode offset (UPDATED)
     9. Apply italics (UPDATED)
@@ -809,12 +837,21 @@ def process_caption_job(
     except Exception as _e:
         print(f"[FORMATTER] sequence optimizer skipped (non-fatal): {_e}")
 
-    # 6. Editorial AI — pass the heartbeat through so each cue's OpenAI
-    # call can pulse the job's updated_at timestamp. Closes the "engine
-    # looks hung from outside even though it's still working" perception
-    # gap that produced the Pluto-Test 16-min auto-fail.
-    cues = editorial_refine_cues(cues, protected_phrases, heartbeat=heartbeat)
-    print(f"[FORMATTER] After editorial AI: {len(cues)} cues")
+    # 6. Editorial AI — DETERMINISM-GATED (Design A, Phase 1). The OpenAI polish
+    # is the ONLY non-deterministic stage in the pipeline (temperature=0 is NOT
+    # reproducible, and its parallel run-budget/bailout ships a timing-dependent
+    # subset of cues polished-vs-raw each run). It runs ONLY when the caller
+    # explicitly permits AI (overlay-authoring / initial transcription) — NEVER
+    # on reformat_from_baseline (Apply Spec). When gated off, the deterministic
+    # renderer (linebreak.py / rendering.py) — already every AI-rejected cue's
+    # fallback — is the sole authority, so Apply Spec is byte-identical every run
+    # with no OpenAI call. SOC 2 CC8.1 — the reformat critical path has no LLM.
+    if allow_editorial_ai:
+        cues = editorial_refine_cues(cues, protected_phrases, heartbeat=heartbeat)
+        print(f"[FORMATTER] After editorial AI: {len(cues)} cues")
+    else:
+        print("[FORMATTER] Editorial AI SKIPPED (deterministic mode — "
+              "no OpenAI on this path)")
 
     # 7. Readability
     cues = apply_readability_rules(cues)
