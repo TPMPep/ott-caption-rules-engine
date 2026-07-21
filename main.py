@@ -65,14 +65,20 @@ from services.assembly import (
     extract_audio_events_from_assembly_result,
 )
 from services.scribe import transcribe as scribe_transcribe
-from services.formatter import process_caption_job, apply_env_overrides, restore_env_overrides
+from services.formatter import (
+    process_caption_job, apply_env_overrides, restore_env_overrides,
+    FORMATTER_VERSION,
+)
+from services.sequence_optimizer import SEGMENTATION_POLICY_VERSION, OPTIMIZER_VERSION
+from services.canonical_hash import canonical_sha256
 
 import json
+import hashlib
 import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.35.0-paired-span-reconsideration"
+VERSION = "5.36.0-deterministic-reformat-no-editorial-ai"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -241,9 +247,11 @@ BASELINE_FETCH_TIMEOUT_SECONDS = int(
 )
 
 
-def fetch_baseline_json(baseline_url: str) -> Dict[str, Any]:
+def fetch_baseline_json(baseline_url: str):
     """
     Fetch + parse the immutable baseline JSON from a signed S3 GET URL.
+    Returns (data, raw_bytes) — the parsed dict and the exact fetched bytes
+    (the raw bytes let the caller pin the baseline artifact hash).
 
     The baseline is the {utterances, words, audio_events, ...} object Base44
     persisted at transcription time. This is the EXACT shape the formatter's
@@ -266,7 +274,11 @@ def fetch_baseline_json(baseline_url: str) -> Dict[str, Any]:
     utterances = data.get("utterances")
     if not isinstance(utterances, list) or len(utterances) == 0:
         raise ValueError("Baseline JSON has no utterances — cannot reformat")
-    return data
+    # Return the parsed dict AND the exact fetched bytes so the caller can pin
+    # the baseline artifact hash (SHA-256 of the immutable bytes) into the run's
+    # deterministic input tuple. SOC 2 CC8.1 — the reformat provably operated on
+    # a specific baseline artifact.
+    return data, raw
 
 
 def baseline_to_assembly_result(baseline: Dict[str, Any]) -> Dict[str, Any]:
@@ -287,6 +299,73 @@ def baseline_to_assembly_result(baseline: Dict[str, Any]) -> Dict[str, Any]:
         # Mark provenance so build_caption_inputs never cross-calls a provider
         # for the backbone SRT (it builds locally from utterances).
         "_provider": baseline.get("transcription_provider") or "",
+    }
+
+
+def _sha256_hex_bytes(raw: bytes) -> str:
+    """Raw SHA-256 hex of arbitrary bytes — used for the baseline artifact hash
+    (the exact bytes the engine fetched from S3). Distinct from canonical_sha256
+    (which hashes a canonical JSON structure); here we want the byte-identity of
+    the fetched artifact itself."""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def build_deterministic_inputs(
+    *,
+    baseline_hash: Optional[str],
+    overlay_hash: Optional[str],
+    spec_version: Any,
+    spec_slug: Optional[str],
+    overrides_source: Dict[str, Any],
+    editorial_mode: str,
+) -> Dict[str, Any]:
+    """Assemble the COMPLETE deterministic input tuple pinned on every run
+    (Design A). This is the reproducibility contract: two runs with an identical
+    tuple MUST produce byte-identical output. The ingester persists it on
+    CCFormatRun so an auditor can prove — from the row alone — exactly which
+    inputs produced a delivery, and re-derive it.
+
+    Fields (per the Design A spec):
+      • baseline_hash              — SHA-256 of the immutable transcription
+                                     baseline artifact bytes the engine fetched.
+      • overlay_hash               — SHA-256 of the frozen editorial overlay
+                                     artifact, or the literal 'NONE' when no
+                                     overlay was applied (deterministic-formatter-
+                                     only path). Never null → 'NONE' is an
+                                     explicit, auditable state.
+      • spec_slug / spec_version   — the pinned (slug, version) rule set.
+      • overrides_hash             — canonical hash of the per-run operator
+                                     overrides (the captionOptions env bundle),
+                                     so an override change is provably a different
+                                     input tuple.
+      • formatter_version          — the deterministic formatter generation.
+      • segmentation_policy_version— the optimizer's scoring/veto policy gen.
+      • optimizer_version          — the optimizer code generation.
+      • engine_version             — the full engine build string.
+      • editorial_mode             — 'deterministic' | 'ai_assist'. Records
+                                     whether the non-deterministic LLM stage was
+                                     permitted on THIS run (always 'deterministic'
+                                     for reformat_from_baseline).
+    SOC 2 CC8.1 — every run is reproducible from this tuple.
+    """
+    overrides_hash = canonical_sha256({
+        "kind": "cc_run_overrides",
+        # captionOptions is a flat string→string bundle; hash it canonically so
+        # key order can never change the hash. This is the exact env the engine
+        # applied, so it captures every spec-derived + operator-override knob.
+        "overrides": {str(k): str(v) for k, v in (overrides_source or {}).items()},
+    })
+    return {
+        "baseline_hash": baseline_hash,
+        "overlay_hash": overlay_hash if overlay_hash else "NONE",
+        "spec_slug": spec_slug,
+        "spec_version": spec_version,
+        "overrides_hash": overrides_hash,
+        "formatter_version": FORMATTER_VERSION,
+        "segmentation_policy_version": SEGMENTATION_POLICY_VERSION,
+        "optimizer_version": OPTIMIZER_VERSION,
+        "engine_version": VERSION,
+        "editorial_mode": editorial_mode,
     }
 
 
@@ -377,25 +456,39 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         # downstream Base44 ingester both consume this shape. Scribe v2 is
         # normalized by services.scribe.normalize_scribe_result to match.
         assembly_result: Dict[str, Any]
+        # ── DESIGN A DETERMINISM CONTRACT ────────────────────────────────
+        # allow_editorial_ai is the ONE switch that permits the non-deterministic
+        # OpenAI polish. It is TRUE only for transcription paths (initial author-
+        # ing) and FALSE for reformat_from_baseline (Apply Spec), so Apply Spec is
+        # byte-deterministic and never calls OpenAI. baseline_hash pins the exact
+        # immutable baseline artifact the reformat operated on. SOC 2 CC8.1.
+        allow_editorial_ai = not payload.get("reformat_from_baseline")
+        baseline_hash: Optional[str] = None
         if payload.get("reformat_from_baseline"):
-            # ── Reformat-from-baseline (engine 5.0.0) ────────────────────
+            # ── Reformat-from-baseline (Design A: DETERMINISTIC) ─────────
             # Skip transcription entirely. Fetch the immutable baseline JSON
-            # from the signed S3 URL and run the FULL formatting pipeline
-            # (formatter → editorial-AI → readability → QC) against it. The
-            # new spec geometry arrived via captionOptions/env (already
-            # applied above), so the editorial-AI rebalances line breaks for
-            # the new width — the orphan-line fix on a spec swap.
+            # from the signed S3 URL and run the DETERMINISTIC formatting
+            # pipeline (formatter → shaping → optimizer → readability → QC)
+            # against it — NO editorial-AI (allow_editorial_ai=False). The new
+            # spec geometry arrived via captionOptions/env (already applied
+            # above); deterministic line-breaking (linebreak.py) rebalances for
+            # the new width. Same baseline + same spec version → byte-identical
+            # output every run, with no OpenAI call. A frozen editorial overlay
+            # (Phase 2) is consumed here when present; when absent (the Phase 1
+            # universal case) the deterministic formatter is the sole authority.
             baseline_url = payload.get("baselineUrl")
             if not baseline_url:
                 raise ValueError("baselineUrl is required when reformat_from_baseline=true")
             update_job(job_id, status="processing", stage="fetching_transcript",
                        transcription_provider=provider,
                        transcription_model=model_id)
-            print(f"[{job_id}] Reformat-from-baseline: fetching baseline JSON")
-            baseline = fetch_baseline_json(str(baseline_url))
+            print(f"[{job_id}] Reformat-from-baseline (deterministic, no editorial-AI): fetching baseline JSON")
+            baseline, baseline_raw = fetch_baseline_json(str(baseline_url))
+            baseline_hash = _sha256_hex_bytes(baseline_raw)
             assembly_result = baseline_to_assembly_result(baseline)
             print(f"[{job_id}] Baseline loaded: {len(assembly_result.get('utterances') or [])} utterances, "
-                  f"{len(assembly_result.get('audio_events') or [])} audio events")
+                  f"{len(assembly_result.get('audio_events') or [])} audio events, "
+                  f"baseline_hash={baseline_hash[:12]}…")
         elif payload.get("reformat_only"):
             if not transcript_id:
                 raise ValueError("transcript_id is required when reformat_only=true")
@@ -466,6 +559,10 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
             output_formats=output_formats,
             heartbeat=_formatter_heartbeat,
             audio_events=audio_events,
+            # DESIGN A: AI polish permitted ONLY on the transcription/authoring
+            # path, NEVER on reformat_from_baseline. This is the executable
+            # guarantee that Apply Spec is deterministic + calls no OpenAI.
+            allow_editorial_ai=allow_editorial_ai,
         )
 
         # Attach diarization + audio events so Base44 can derive CCSpeaker
@@ -515,6 +612,23 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         # Auditor fingerprint — pinned per-run, not derived.
         caption_result["transcription_provider"] = provider
         caption_result["transcription_model"] = model_id
+        # ── DESIGN A: COMPLETE DETERMINISTIC INPUT TUPLE ──────────────────
+        # Pinned on EVERY run so the Base44 ingester can persist it on
+        # CCFormatRun and an auditor can prove reproducibility from the row.
+        # baseline_hash is set on the reformat path (the artifact the engine
+        # fetched); on the transcription path there is no pre-existing baseline
+        # artifact (the run CREATES it), so baseline_hash is None there.
+        # overlay_hash is 'NONE' in Phase 1 (no overlay is ever applied yet);
+        # Phase 2 sets it to the frozen overlay artifact hash when one is
+        # consumed. editorial_mode records whether the LLM stage was permitted.
+        caption_result["deterministic_inputs"] = build_deterministic_inputs(
+            baseline_hash=baseline_hash,
+            overlay_hash=None,  # Phase 1: no overlay is ever applied → 'NONE'
+            spec_version=env_overrides.get("SPEC_VERSION"),
+            spec_slug=env_overrides.get("SPEC_SLUG"),
+            overrides_source=env_overrides,
+            editorial_mode=("ai_assist" if allow_editorial_ai else "deterministic"),
+        )
 
         update_job(job_id, status="completed", stage="completed",
                    result=caption_result, error=None,
