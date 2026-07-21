@@ -19,6 +19,8 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .rules import activate_rule_context, reset_rule_context, get_rule as _rule_get
+
 # Project imports with local fallbacks
 try:
     from .rendering import render_lines as _render_lines, segments_from_runs as _segments_from_runs
@@ -54,6 +56,19 @@ except Exception:  # pragma: no cover — defensive for alternate import roots
     def _wrap_cjk(text, max_chars, max_lines):
         return [text]
 
+# GENERAL TIMING-DOMAIN PREDICATE — the formatter is TIMING-AWARE, never
+# QUARANTINE-aware. Every timestamp-based decision consumes only has_timing()
+# tokens; the formatter never asks WHY a token is untimed (that reason is an audit
+# fact owned by the repair layer). Keeps the formatter reusable for any future
+# provider / normalization / timing policy. SOC 2 CC8.1.
+try:
+    from .timing_repair import has_timing as _has_timing
+except Exception:  # pragma: no cover — defensive for alternate import roots
+    def _has_timing(token):
+        s = token.get("start_ms", token.get("start"))
+        e = token.get("end_ms", token.get("end"))
+        return s is not None and e is not None and e >= s
+
 try:
     from .assembly import normalize_tokens as _normalize_tokens, is_sound_token as _is_sound_token
 except Exception:
@@ -70,12 +85,22 @@ except Exception:
             source = timestamps
         out = []
         for item in source:
+            # AUDIT: preserve UNTIMED tokens as untimed — never coerce a missing/
+            # None timestamp to 0 (that would fabricate a real 0ms event). A token
+            # with either endpoint absent keeps start_ms/end_ms=None so the general
+            # has_timing() predicate excludes it from every timing calculation.
+            _s = item.get("start_ms", item.get("start"))
+            _e = item.get("end_ms", item.get("end"))
             token = {
                 "text": item.get("text", ""),
-                "start_ms": int(item.get("start_ms", item.get("start", 0) or 0)),
-                "end_ms": int(item.get("end_ms", item.get("end", 0) or 0)),
+                "start_ms": int(_s) if _s is not None else None,
+                "end_ms": int(_e) if _e is not None else None,
                 "speaker": item.get("speaker") or "A",
             }
+            # Carry the audit marker through the fallback path too (timing gating
+            # is via has_timing(), but keep the disposition flag for auditors).
+            if item.get("timing_quarantined"):
+                token["timing_quarantined"] = True
             # PRESERVE the source-utterance identity — the immutable pause-boundary
             # invariant (segmentation._token_utterance_id) reads this to detect a
             # distinct-utterance hard pause. Dropping it here silently disabled the
@@ -85,6 +110,16 @@ except Exception:
                            item.get("utterance_index", item.get("aai_utterance_index")))
             if utt is not None:
                 token["source_utterance_id"] = utt
+            # PRESERVE the immutable transcription-provenance object verbatim —
+            # the real assembly.normalize_tokens returns tokens untouched (it
+            # never strips keys), so this fallback MUST do the same or an
+            # all-untimed group loses its provider/model/job-id in the
+            # UNRESOLVED_UNTIMED_CONTENT evidence. Carrying it here keeps the
+            # fallback at parity with the production normalizer. SOC 2 CC8.1 /
+            # FCC §79.1 — provenance is never dropped by the fallback path.
+            prov = item.get("transcription_provenance")
+            if prov is not None:
+                token["transcription_provenance"] = prov
             out.append(token)
         return out
 
@@ -158,7 +193,7 @@ BRACKET_TAG_RE = re.compile(r"\[[^\]]+\]")
 # ─── Env Helpers (UPDATED: always read env vars) ────────────────────
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -168,7 +203,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_str(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or default).strip()
+    return (_rule_get(name, default) or default).strip()
 
 
 def _caption_profile() -> str:
@@ -423,44 +458,24 @@ def _export_ttml(cues: List[Dict[str, Any]], frame_rate: str, frame_rate_multipl
 
 # ─── Env Override Management ────────────────────────────────────────
 
-def apply_env_overrides(env_dict: Dict[str, Any]) -> Dict[str, Optional[str]]:
+def apply_env_overrides(env_dict: Dict[str, Any]):
+    """Activate one immutable job-scoped rule context.
+
+    The legacy name is retained for the main runner contract, but this function
+    no longer mutates process-wide environment variables.
     """
-    Set env vars from the captionOptions dict.
-    Returns a snapshot of previous values for restoration.
-
-    UPDATED: Also handles the new captionOptions mapping from the frontend.
-    The frontend sends keys like CAPTION_PROFILE, CUSTOM_MAX_LINES, etc.
-    """
-    snapshot: Dict[str, Optional[str]] = {}
-    if not env_dict or not isinstance(env_dict, dict):
-        return snapshot
-
-    for key, value in env_dict.items():
-        key = str(key).strip()
-        if not key:
-            continue
-        snapshot[key] = os.environ.get(key)
-        os.environ[key] = str(value)
-
-    # Log what was set
-    profile = os.getenv("CAPTION_PROFILE", "")
-    print(f"[ENV] Profile: {profile}")
-    print(f"[ENV] Max lines: {os.getenv('CUSTOM_MAX_LINES', 'default')}")
-    print(f"[ENV] Max chars: {os.getenv('CUSTOM_MAX_CHARS', 'default')}")
-    print(f"[ENV] Sound density: {os.getenv('SOUND_DENSITY', 'default')}")
-    print(f"[ENV] Speaker mode: {os.getenv('SPEAKER_LABEL_MODE', 'default')}")
-    print(f"[ENV] Timecode offset: {os.getenv('TIMECODE_OFFSET_MS', '0')}")
-
-    return snapshot
+    token = activate_rule_context(env_dict if isinstance(env_dict, dict) else {})
+    print(f"[RULES] Profile: {_rule_get('CAPTION_PROFILE', '')}")
+    print(f"[RULES] Max lines: {_rule_get('CUSTOM_MAX_LINES', 'default')}")
+    print(f"[RULES] Max chars: {_rule_get('CUSTOM_MAX_CHARS', 'default')}")
+    print(f"[RULES] Frame rate: {_rule_get('CUSTOM_FRAME_RATE', 'default')}")
+    print(f"[RULES] Gap frames: {_rule_get('CUSTOM_MIN_GAP_FRAMES', 'default')}")
+    return token
 
 
-def restore_env_overrides(snapshot: Dict[str, Optional[str]]) -> None:
-    """Restore env vars to their previous state."""
-    for key, value in snapshot.items():
-        if value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = value
+def restore_env_overrides(token) -> None:
+    """Reset the current job's rule context."""
+    reset_rule_context(token)
 
 
 # ─── Sound Density Filtering (UPDATED) ──────────────────────────────
@@ -735,7 +750,10 @@ def process_caption_job(
     print(f"[FORMATTER] Spoken: {len(spoken_tokens)}, Sound: {len(sound_tokens)}")
 
     # 4. Filter sound cues by density (UPDATED)
-    total_duration_ms = max(t.get("end_ms", 0) for t in tokens) if tokens else 0
+    # AUDIT: only TIMED tokens contribute to total_duration_ms — an untimed
+    # token's end_ms is None and must never be coerced to 0 (nor crash max()).
+    _timed_ends = [int(t["end_ms"]) for t in tokens if _has_timing(t)]
+    total_duration_ms = max(_timed_ends) if _timed_ends else 0
     sound_tokens = _filter_sound_cues_by_density(sound_tokens, total_duration_ms)
     print(f"[FORMATTER] Sound after density filter: {len(sound_tokens)}")
 
@@ -744,13 +762,14 @@ def process_caption_job(
     # MUSIC_CUE_FORMAT / SOUND_EFFECT_FORMAT. Without this they were silently
     # dropped — the "no sound cues" regression. SOC 2 / FCC §79.1 non-dialogue
     # coverage is now reproduced from the baseline on every reformat.
-    cues = _build_cues_from_tokens(
+    cues, unresolved_groups = _build_cues_from_tokens(
         spoken_tokens, sound_tokens, max_lines, max_chars,
         audio_events=audio_events or [],
     )
     cues_in_count = len(cues)
     print(f"[FORMATTER] Initial cues built: {cues_in_count} "
-          f"(native audio_events in: {len(audio_events or [])})")
+          f"(native audio_events in: {len(audio_events or [])}, "
+          f"unresolved groups: {len(unresolved_groups)})")
 
     # 5b. CAPTION SHAPING (universal, spec-driven "caption rhythm" stage).
     # Splits over-rhythm dialogue cues toward the spec's TARGET duration at
@@ -773,8 +792,9 @@ def process_caption_job(
     # Segmentation stage). Runs AFTER shaping (word timings intact) and BEFORE
     # editorial-AI / readability+CPS / condensation. This is the ONLY stage that
     # evaluates a contiguous same-speaker cue WINDOW as a whole and is allowed to
-    # REPLACE the local boundaries — generating candidate 2-/3-cue
-    # resegmentations from the original word-timed stream, vetoing the
+    # REPLACE the local boundaries — finding a bounded complete segmentation
+    # path with no result-count ceiling from the original word-timed stream,
+    # vetoing the
     # non-compliant, scoring the rest, and stamping the redistribution-before-
     # condensation gate + full provenance on every emitted cue. It fixes the
     # flash-fragment and removed-phrase failure classes through general rules,
@@ -799,6 +819,16 @@ def process_caption_job(
     # 7. Readability
     cues = apply_readability_rules(cues)
     print(f"[FORMATTER] After readability: {len(cues)} cues")
+
+    # 7a. FINAL LOCAL RECOMPOSITION — readability may have merged, extended, or
+    # split cues. Re-run the bounded optimizer on the resulting local groups so
+    # no illegal child created downstream is accepted without reconsideration.
+    try:
+        from .sequence_optimizer import optimize_cue_sequence
+        cues = optimize_cue_sequence(cues)
+        print(f"[FORMATTER] After final local recomposition: {len(cues)} cues")
+    except Exception as _e:
+        print(f"[FORMATTER] final local recomposition skipped (non-fatal): {_e}")
 
     # 7b. CONDENSATION — the "captions aren't transcripts" editorial stage.
     # Runs AFTER the deterministic CPS extend/split (applied inside readability)
@@ -864,6 +894,34 @@ def process_caption_job(
     except Exception as _e:
         print(f"[FORMATTER] sentence-capitalization skipped (non-fatal): {_e}")
 
+    # 10d.1 FINAL LOCAL RECONSIDERATION — condensation and repeat-label
+    # suppression run after the earlier optimizer pass and can change delivered
+    # geometry. Reconsider complete local windows once more before the final CPL
+    # fit so quote/phrase spans are rebalanced as a sequence, not split in
+    # isolation. Deterministic and idempotent.
+    try:
+        from .sequence_optimizer import optimize_cue_sequence
+        cues = optimize_cue_sequence(
+            cues, defer_timing_constraints=True, repair_hard_geometry_only=True)
+    except Exception as _e:
+        print(f"[FORMATTER] final local reconsideration skipped (non-fatal): {_e}")
+
+    # 10d.2 FINAL DELIVERED-FIT REFLOW — run the same deterministic shaper on
+    # the actual delivered text before timing projection.
+    try:
+        from .shaping import enforce_cpl_fit
+        cues = enforce_cpl_fit(cues)
+    except Exception as _e:
+        print(f"[FORMATTER] final delivered-fit reflow skipped (non-fatal): {_e}")
+
+    # 10d.3 FRAME-GRID NORMALIZATION — final generated boundaries are resolved
+    # against the immutable per-job frame policy before delivery validation.
+    try:
+        from .timing_grid import normalize_cue_timing
+        cues = normalize_cue_timing(cues)
+    except Exception as _e:
+        print(f"[FORMATTER] frame-grid normalization skipped (non-fatal): {_e}")
+
     # 10e. SEGMENTATION QC — the canonical (production-authority) deterministic
     # inspection + bounded remediation stage. Runs AFTER every deterministic
     # transform that could change delivered text or timing (shaping → sequence
@@ -884,12 +942,19 @@ def process_caption_job(
                 "max_chars_per_line": max_chars,
                 "max_lines_per_caption": max_lines,
                 "min_gap_between_captions_ms": _merge_gap_ms(),
+                "min_caption_duration_ms": _min_display_ms(),
             },
             "reading_speed_rules": {
                 "max_cps": _max_cps(),
                 "cps_measurement": _env_str("CPS_MEASUREMENT", "characters") or "characters",
             },
             "protected_phrases": protected_phrases,
+            # TRANSIENT INPUT — the all-untimed linguistic groups detected in
+            # segmentation. Segmentation QC adjudicates each into ONE canonical
+            # UNRESOLVED_UNTIMED_CONTENT fail issue. This is the ONLY place the
+            # unresolved groups are consumed; they are NOT exposed on the result.
+            # Detection (segmentation) → adjudication (QC) → one canonical issue.
+            "unresolved_groups": unresolved_groups,
         })
         print(f"[FORMATTER] Segmentation QC: completeness="
               f"{seg_qc.get('rollup', {}).get('segmentation_qc_completeness')} "
@@ -939,6 +1004,24 @@ def process_caption_job(
         cond = (c.get("meta") or {}).get("condensation")
         if cond and cond.get("applied"):
             out.setdefault("meta", {})["condensation"] = cond
+        # ── BOUNDED PAUSE PROVENANCE (item-4 audit contract) ──────────────────
+        # A cue that opened at a hard inter-utterance pause carries bounded
+        # provenance: the source + prior utterance ids, the MEASURED gap (ms),
+        # the EFFECTIVE pause_boundary_ms threshold, the boundary reason, and the
+        # immutable-boundary status. Emitted on result.meta.pause_provenance so
+        # the final engine cue (and the Base44 ingester) retain the provenance
+        # that was previously null. NEVER raw word arrays — bounded scalars only.
+        # SOC 2 CC8.1 / FCC 47 CFR §79.1 — the boundary is provable from the row.
+        pause_prov = (c.get("meta") or {}).get("pause_provenance")
+        if pause_prov:
+            out.setdefault("meta", {})["pause_provenance"] = {
+                "source_utterance_id": pause_prov.get("source_utterance_id"),
+                "prev_utterance_id": pause_prov.get("prev_utterance_id"),
+                "measured_gap_ms": pause_prov.get("measured_gap_ms"),
+                "effective_pause_boundary_ms": pause_prov.get("effective_pause_boundary_ms"),
+                "boundary_reason": pause_prov.get("boundary_reason") or "source_utterance_pause",
+                "immutable_boundary": bool(pause_prov.get("immutable_boundary", True)),
+            }
         # Sequence-optimizer provenance — the bounded, meaningful audit summary
         # the application contract exposes (Step 13). We carry ONLY the summary
         # fields (not the full candidate_summaries debug payload — that stays in
@@ -1012,6 +1095,12 @@ def process_caption_job(
         # Condensation verdict counts — persisted onto CCFormatRun.summary by
         # the Base44 ingesters so the rewrite stage is never a black box.
         "condensation_stats": condensation_stats or None,
+        # NOTE: there is deliberately NO top-level unresolved_content /
+        # unresolved_content_count / publishable / review_required field. An
+        # all-untimed group is adjudicated into a canonical UNRESOLVED_UNTIMED_
+        # CONTENT issue inside result.segmentation_qc — the SINGLE publication
+        # authority. Segmentation QC is the one source of truth; the transient
+        # unresolved groups never leave the formatter. SOC 2 CC8.1.
     }
 
     if "srt" in output_formats:
@@ -1040,10 +1129,13 @@ def _build_cues_from_tokens(
     max_lines: int,
     max_chars: int,
     audio_events: Optional[List[Dict[str, Any]]] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Build caption cues from spoken tokens, in-text sound tokens, AND the
     provider's native audio_events[] array.
+
+    Returns (timed_cues, unresolved_groups) — the transient unresolved groups
+    are consumed by Segmentation QC only, never merged into the cue list.
 
     Two non-dialogue sources, both rendered through the per-spec renderer:
       1. sound_tokens — bracketed tags found inside utterance text ([MUSIC]).
@@ -1058,8 +1150,12 @@ def _build_cues_from_tokens(
     """
     audio_events = audio_events or []
 
-    # Build dialogue cues from spoken tokens
-    dialogue_cues = _build_dialogue_cues(spoken_tokens, max_lines, max_chars)
+    # Build dialogue cues from spoken tokens. Returns (timed_cues,
+    # unresolved_groups) — the transient unresolved channel carries all-untimed
+    # groups that must never become timed cues. Threaded to process_caption_job
+    # ONLY to feed Segmentation QC (the single publication authority); never
+    # exposed on the external result.
+    dialogue_cues, unresolved_groups = _build_dialogue_cues(spoken_tokens, max_lines, max_chars)
 
     sound_cues: List[Dict[str, Any]] = []
 
@@ -1115,16 +1211,22 @@ def _build_cues_from_tokens(
     for i, cue in enumerate(all_cues):
         cue["idx"] = i + 1
 
-    return all_cues
+    # Return the merged TIMED cue list AND the transient unresolved-group
+    # collection. Unresolved groups are NEVER placed into all_cues — the
+    # exporters serialize all_cues directly, so keeping them out is what
+    # guarantees no invalid (untimed) cue can ever reach SRT/VTT/SCC/TTML.
+    return all_cues, unresolved_groups
 
 
 def _build_dialogue_cues(
     tokens: List[Dict[str, Any]],
     max_lines: int,
     max_chars: int,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Build dialogue cues from spoken tokens — PROFESSIONAL-GRADE pipeline.
+    Returns (timed_cues, unresolved_groups). The unresolved groups are the
+    transient all-untimed groups fed to Segmentation QC (single authority).
 
     Order (the industry-correct ordering — Iyuno / Pixelogic / Zoo / Deluxe):
       1. SEGMENT the word stream into true SENTENCE GROUPS first
@@ -1144,14 +1246,21 @@ def _build_dialogue_cues(
     the orphaned fragment the naive per-word splitter produced.
     """
     if not tokens:
-        return []
+        return [], []
 
     try:
-        from .segmentation import segment_into_sentence_groups
+        from .segmentation import (
+            segment_into_sentence_groups,
+            build_unresolved_group as _build_unresolved_group,
+        )
     except Exception:
         # Defensive: if the segmentation module can't import, fall back to a
         # single-group-per-speaker grouping so we never crash a job. This
-        # path should never fire in production.
+        # path should never fire in production. The fallback also provides a
+        # minimal unresolved-group factory so the router contract still holds.
+        def _build_unresolved_group(**kwargs):
+            return dict(kwargs)
+
         def segment_into_sentence_groups(toks):
             return [{
                 "words": [t.get("text", "") for t in toks],
@@ -1177,12 +1286,35 @@ def _build_dialogue_cues(
     # Stamped onto the finalized cue's meta so the sequence optimizer's window
     # collector treats it as an immutable wall (no window may span it).
     pack_pause_boundary: bool = False
+    # Bounded pause provenance for a pack that opened at a hard pause: the
+    # group's source utterance id, prior utterance id, and measured gap (ms).
+    # None on a pack that did not open at a hard pause. Item-4 audit contract.
+    pack_pause_prov: Optional[Dict[str, Any]] = None
 
     budget = max_chars * max_lines
 
+    # ── UNRESOLVED (ALL-UNTIMED) GROUP CHANNEL — pure routing, zero mutation ─
+    # A group with timing_unresolved=True (segmentation could resolve NO window
+    # because EVERY token in it was untimed) has NO trustworthy timing. We do NOT
+    # invent one: no 0ms, no start==end, no anchor to the previous/next cue, no
+    # evidence-free interpolation. The group NEVER enters the timed-cue path, so it
+    # can never be serialized into SRT/VTT/SCC/TTML.
+    #
+    # OWNERSHIP (the monotonic provenance chain): SEGMENTATION owns the immutable
+    # unresolved-group SCHEMA (segmentation.build_unresolved_group) — it stamps the
+    # absolute source_word_start/end, carries the normalizer's transcription
+    # provenance, and assigns the intrinsic segmentation_group_index. The FORMATTER
+    # is a PURE ROUTER: it forwards each segmentation-emitted group VERBATIM into
+    # Segmentation QC. It adds no field, removes no field, reinterprets no field —
+    # and no longer tracks any word cursor (segmentation owns the offsets).
+    # Segmentation QC adjudicates each group into ONE canonical
+    # UNRESOLVED_UNTIMED_CONTENT fail issue (the single publication authority) and
+    # assigns its own ug#N routing ordinal independently. SOC 2 CC8.1 / FCC §79.1.
+    unresolved_groups: List[Dict[str, Any]] = []
+
     def _flush_pack() -> None:
         nonlocal pack_words, pack_start, pack_end, pack_runs, pack_speaker
-        nonlocal pack_review_required, pack_pause_boundary
+        nonlocal pack_review_required, pack_pause_boundary, pack_pause_prov
         if pack_words:
             cue = _finalize_dialogue_cue(
                 pack_words, pack_start, pack_end, pack_runs, max_lines, max_chars,
@@ -1191,6 +1323,8 @@ def _build_dialogue_cues(
             )
             if pack_pause_boundary:
                 cue["meta"]["pause_boundary_before"] = True
+                if pack_pause_prov is not None:
+                    cue["meta"]["pause_provenance"] = pack_pause_prov
             cues.append(cue)
         pack_words = []
         pack_start = None
@@ -1199,8 +1333,40 @@ def _build_dialogue_cues(
         pack_speaker = None
         pack_review_required = False
         pack_pause_boundary = False
+        pack_pause_prov = None
 
-    for group in sentence_groups:
+    for _group_index, group in enumerate(sentence_groups):
+        # ── DIVERT AN UNRESOLVED (ALL-UNTIMED) GROUP — before ANY timing math ─
+        # A group whose every token was untimed carries timing_unresolved=True and
+        # start_ms=None. It has NO trustworthy window, so it must never reach cue
+        # arithmetic (which would coerce None → 0) and must never become a timed
+        # cue. We flush any pending pack first (so reading order is preserved:
+        # unresolved content is recorded at its true position in the stream), then
+        # record the group's text + provenance in the unresolved channel and skip
+        # it. No fabricated timestamp is ever produced — not 0,0, not start==end,
+        # not a neighbour anchor, not evidence-free interpolation. The text is
+        # NEVER lost; it is surfaced separately and gates publication. This is the
+        # untimed-token contract carried up to the group level. SOC 2 CC8.1 / FCC §79.1.
+        if group.get("timing_unresolved") or group.get("start_ms") is None:
+            _flush_pack()
+            # PURE ROUTING: build the canonical immutable unresolved-group object
+            # using SEGMENTATION's owned schema factory, populated ENTIRELY from
+            # segmentation-provided fields (absolute word offsets, provenance,
+            # speaker, utterance id). The formatter computes nothing here — it does
+            # not track a word cursor, does not enrich provenance, does not
+            # reinterpret any field. The segmentation_group_index is the group's
+            # absolute index within segmentation's output (enumerate index below).
+            unresolved_groups.append(_build_unresolved_group(
+                words=list(group.get("words") or []),
+                source_word_start=group.get("source_word_start", 0),
+                source_word_end=group.get("source_word_end", 0),
+                speaker=group.get("speaker"),
+                source_utterance_id=group.get("source_utterance_id"),
+                provenance=group.get("transcription_provenance"),
+                segmentation_group_index=_group_index,
+                reason="all_tokens_untimed",
+            ))
+            continue
         g_words = group["words"]
         g_text = " ".join(g_words)
         # EXPLICIT speaker ownership — read the group's OWN speaker, never a
@@ -1341,13 +1507,37 @@ def _build_dialogue_cues(
             pack_speaker = g_speaker
             pack_review_required = g_review_required
             pack_pause_boundary = g_hard_boundary_before
+            # Carry the group's bounded pause provenance onto the pack when it
+            # opened at a hard pause. Effective threshold is the resolved spec
+            # value (segmentation.pause_boundary_ms). Item-4 audit contract —
+            # bounded scalars only, never raw words. SOC 2 CC8.1 / FCC §79.1.
+            if g_hard_boundary_before:
+                try:
+                    from .segmentation import pause_boundary_ms as _pbm
+                    _threshold = _pbm()
+                except Exception:
+                    _threshold = 1200
+                _gap = group.get("gap_before_ms")
+                pack_pause_prov = {
+                    "source_utterance_id": group.get("source_utterance_id"),
+                    "prev_utterance_id": group.get("prev_utterance_id"),
+                    "measured_gap_ms": int(_gap) if _gap is not None else None,
+                    "effective_pause_boundary_ms": int(_threshold),
+                    "boundary_reason": "source_utterance_pause",
+                    "immutable_boundary": True,
+                }
             pack_runs.append({"speaker": g_speaker if g_speaker_known else None,
                               "word_start": 0})
         pack_words.extend(g_words)
         pack_end = group["end_ms"]
 
     _flush_pack()
-    return cues
+    # Return the timed cues AND the transient unresolved-group collection. The
+    # caller (_build_cues_from_tokens → process_caption_job) feeds the groups into
+    # Segmentation QC (the single publication authority); it NEVER merges them
+    # into the timed cue list and NEVER exposes them on the external result.
+    # SOC 2 CC8.1.
+    return cues, unresolved_groups
 
 
 # Phrase-boundary word classes — the SAME linguistic tables the line-breaker
@@ -1557,11 +1747,22 @@ def _word_timings_in_window(
     meta so the universal shaping stage can split at FRAME-FAITHFUL boundaries
     (the enterprise-correct answer) instead of interpolating. Positional +
     time-window match — no dependency on segmentation carrying timings through.
-    Returns [] when no tokens match (shaper then interpolates)."""
+    Returns [] when no tokens match (shaper then interpolates).
+
+    GENERAL TIMING CONTRACT: an UNTIMED token (has_timing() False — its timing was
+    withheld upstream, e.g. a quarantined repair disposition, but the formatter
+    neither knows nor cares WHY) is EXCLUDED from the word-timing slice — it has no
+    trustworthy timing, so it must never anchor a shaper split boundary. Its TEXT
+    still reaches the cue via the sentence group (segmentation keeps the word in
+    order); only its (absent) timing is withheld. The has_timing() guard runs
+    BEFORE any int() read, so a None timestamp is never coerced to 0. SOC 2 CC8.1 /
+    FCC §79.1."""
     out = []
     for t in tokens:
-        ts = int(t.get("start_ms", 0) or 0)
-        te = int(t.get("end_ms", ts) or ts)
+        if not _has_timing(t):
+            continue  # untimed — never a split anchor, never coerced to 0
+        ts = int(t.get("start_ms", t.get("start")) or 0)
+        te = int(t.get("end_ms", t.get("end")) or ts)
         # A token belongs to this cue when its midpoint sits in the window.
         mid = (ts + te) // 2
         if start_ms <= mid <= end_ms:
