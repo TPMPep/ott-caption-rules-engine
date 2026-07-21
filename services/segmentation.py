@@ -59,6 +59,9 @@ SOC 2 CC8.1 — identical input always yields identical sentence boundaries.
 """
 
 import os
+
+from .rules import get_rule as _rule_get
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 # CJK awareness — the single source of truth for no-space-script handling.
@@ -67,11 +70,40 @@ try:
 except Exception:  # pragma: no cover — defensive for alternate import roots
     from cjk import is_cjk_text, CJK_SENTENCE_ENDERS
 
+# GENERAL TIMING-DOMAIN PREDICATE — the single source of truth for "does this
+# token have usable timing?". Segmentation is TIMING-AWARE, never QUARANTINE-aware:
+# it excludes UNTIMED tokens from every timestamp-based calculation and never asks
+# WHY a token is untimed (quarantine is only one possible reason; the reason lives
+# in the repair layer's audit metadata). SOC 2 CC8.1.
+try:
+    from .timing_repair import has_timing
+except Exception:  # pragma: no cover — defensive for alternate import roots
+    def has_timing(token: Dict[str, Any]) -> bool:
+        s = token.get("start_ms", token.get("start"))
+        e = token.get("end_ms", token.get("end"))
+        return s is not None and e is not None and e >= s
+
+# Immutability primitive — freezes the unresolved-group object so downstream
+# consumers physically cannot mutate it. See services.immutable.
+try:
+    from .immutable import freeze
+except Exception:  # pragma: no cover — defensive for alternate import roots
+    def freeze(v):
+        return v
+
 # ─── Segmentation policy version ─────────────────────────────────────
 # Bumped when the grouping LOGIC changes in a way that could alter group
 # boundaries or speaker ownership. Independent of the sequence-optimizer policy
 # version — this is the SENTENCE-GROUPING generation. SOC 2 CC8.1.
 SEGMENTATION_GROUPING_VERSION = 2
+
+# ─── Immutable unresolved-group schema version ───────────────────────
+# Segmentation OWNS the unresolved-group schema. This version travels ON the
+# emitted object so downstream consumers (formatter routes it; Segmentation QC
+# builds evidence from it) can distinguish schema generations DETERMINISTICALLY
+# rather than sniffing optional fields. Bump ONLY when the unresolved-group
+# object's SHAPE changes. SOC 2 CC8.1.
+SEGMENTATION_UNRESOLVED_GROUP_VERSION = 1
 
 # Default hard pause boundary (ms). A gap of AT LEAST this long BETWEEN two
 # distinct source utterances is an immutable cue boundary. 1200ms is the
@@ -87,7 +119,7 @@ def pause_boundary_ms() -> int:
     non-positive / unparseable value falls back to the default so the invariant
     can never be silently disabled by a malformed spec value. SOC 2 CC8.1 — the
     boundary a run used is the pinned spec value, reproducible from the row."""
-    raw = os.getenv("CUSTOM_PAUSE_BOUNDARY_MS")
+    raw = _rule_get("CUSTOM_PAUSE_BOUNDARY_MS")
     if raw is None or raw == "":
         return DEFAULT_PAUSE_BOUNDARY_MS
     try:
@@ -197,6 +229,72 @@ def _token_utterance_id(token: Dict[str, Any]) -> Optional[Any]:
     return None
 
 
+def _token_provenance(token: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the immutable transcription-provenance object the normalizer
+    stamped onto this token (assembly.build_transcription_provenance), or None on
+    a legacy/fallback token that never carried one. Segmentation NEVER inspects
+    the object's fields — it only carries it forward. SOC 2 CC8.1.
+
+    FROZEN-CONTRACT NOTE: assembly.build_transcription_provenance() stamps the
+    provenance onto every token as a genuinely read-only FrozenDict (a
+    collections.abc.Mapping, NOT a `dict`). A `dict`-only guard would silently
+    return None the instant the immutable contract is in force — dropping the
+    entire provenance chain from every unresolved-group's evidence (provider /
+    model / job-id → None). We therefore accept any Mapping. SOC 2 CC8.1 /
+    FCC §79.1 — provenance is preserved, never discarded by an over-narrow type
+    check (the exact FrozenDict/Mapping regression class the Phase 5 audit hunts)."""
+    prov = token.get("transcription_provenance")
+    return prov if isinstance(prov, Mapping) else None
+
+
+def build_unresolved_group(
+    *,
+    words: List[str],
+    source_word_start: int,
+    source_word_end: int,
+    speaker: Optional[str],
+    source_utterance_id: Optional[Any],
+    provenance: Optional[Dict[str, Any]],
+    segmentation_group_index: int,
+    reason: str = "all_tokens_untimed",
+) -> Dict[str, Any]:
+    """Build ONE immutable unresolved-group object — the CANONICAL schema
+    segmentation owns. Every downstream consumer receives exactly this object,
+    UNCHANGED. Carries its own schema version so future extensions are
+    deterministically distinguishable.
+
+    Provenance ownership (the monotonic chain):
+      • provider/model/etc. → the immutable transcription_provenance object the
+        NORMALIZER produced (assembly.build_transcription_provenance). Segmentation
+        carries it forward without inspecting it.
+      • source_word_start/end → ABSOLUTE word offsets segmentation stamps as it
+        walks the flattened token stream (formatter no longer tracks a cursor).
+      • segmentation_group_index → the group's ABSOLUTE index in segmentation's
+        output. This is intrinsic segmentation data. The unresolved-ordinal
+        (ug#N) is a QC ROUTING artifact assigned independently by Segmentation QC.
+      • speaker / source_utterance_id → the group's own linguistic identity.
+
+    ENFORCED IMMUTABLE CONTRACT: the returned object is a genuinely read-only
+    FrozenDict (via `freeze`) — the formatter forwards it verbatim and any
+    downstream attempt to add, remove, or reinterpret a field raises TypeError,
+    so the contract is enforced in code rather than relying on documentation.
+    `words` is frozen to a tuple; the already-frozen provenance object passes
+    through unchanged (freeze is idempotent). SOC 2 CC8.1 / FCC §79.1.
+    """
+    return freeze({
+        "unresolved_group_version": SEGMENTATION_UNRESOLVED_GROUP_VERSION,
+        "segmentation_group_index": segmentation_group_index,
+        "words": list(words),
+        "text": " ".join(words),
+        "source_word_start": source_word_start,
+        "source_word_end": source_word_end,
+        "speaker": speaker,
+        "source_utterance_id": source_utterance_id,
+        "transcription_provenance": provenance,
+        "reason": reason,
+    })
+
+
 def _explode_cjk_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Explode any CJK token carrying multiple 。-delimited sentences into one
     sub-token per sentence, interpolating timings by character count over the
@@ -218,8 +316,15 @@ def _explode_cjk_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if len(sentences) <= 1:
             out.append(token)
             continue
-        start = int(token.get("start_ms", 0) or 0)
-        end = int(token.get("end_ms", start) or start)
+        # AUDIT: only explode a TIMED token. An untimed token has no window to
+        # interpolate sub-token timings over — coercing its None start to 0 would
+        # fabricate timing. Pass it through unchanged (its text + order survive;
+        # downstream still treats it as untimed via has_timing()).
+        if not has_timing(token):
+            out.append(token)
+            continue
+        start = int(token.get("start_ms", token.get("start")) or 0)
+        end = int(token.get("end_ms", token.get("end")) or start)
         span = max(1, end - start)
         total_chars = sum(len(s) for s in sentences) or 1
         cursor = 0
@@ -237,6 +342,9 @@ def _explode_cjk_tokens(tokens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 # a sentence boundary, NOT an utterance boundary — the pause rule
                 # only fires between DISTINCT source utterances).
                 "source_utterance_id": _token_utterance_id(token),
+                # Carry the immutable transcription provenance onto every
+                # sub-token so a CJK unresolved group is still fully attributable.
+                "transcription_provenance": _token_provenance(token),
             })
     return out
 
@@ -258,15 +366,33 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
     Each returned group is:
       {
         "words":               [str, ...],   # the word texts in order
-        "start_ms":            int,          # first word start
-        "end_ms":              int,          # last word end
+        "start_ms":            int | None,   # first TIMED word start; None if all-untimed
+        "end_ms":              int | None,   # last TIMED word end; None if all-untimed
+        "timing_unresolved":   bool,         # True when NO token in the group was timed
         "speaker":             str | None,   # the group's OWN speaker (explicit)
         "speaker_known":       bool,         # False when the source had none
-        "review_required":     bool,         # True when speaker unknown (never inherit)
+        "review_required":     bool,         # True when speaker unknown OR timing unresolved
         "source_utterance_id": Any | None,   # the group's opening source utterance
         "hard_boundary_before":bool,         # immutable pause boundary before this group
+        "source_word_start":   int,          # ABSOLUTE first-word offset in the stream
+        "source_word_end":     int,          # ABSOLUTE one-past-last-word offset (half-open)
+        "transcription_provenance": dict|None,  # immutable provenance from normalization
         "speaker_runs":        [ {speaker, word_start}, ... ],  # per-speaker offsets
       }
+
+    ALL-UNTIMED GROUP (deliberate contract): a group whose every token is untimed
+    (has_timing() False for all of them — e.g. a lone quarantined one-word
+    utterance) carries start_ms=None / end_ms=None / timing_unresolved=True /
+    review_required=True. It NEVER emits a fabricated 0ms window. The cue builder
+    (_build_dialogue_cues) does NOT turn it into a timed cue and does NOT anchor it
+    to any neighbour (that would assert timing without evidence — the same
+    fabrication class as 0,0). Instead the group's TEXT + ORDER + PROVENANCE are
+    diverted to a SEPARATE transient unresolved-group collection that is fed to
+    Segmentation QC, which adjudicates it into one canonical UNRESOLVED_UNTIMED_
+    CONTENT fail issue (the single publication authority) so no timed deliverable
+    is published while unresolved content exists. The timing stays absent unless trustworthy
+    evidence is available. This is IMPROBABLE under ELS-v2 policy v1 but handled
+    intentionally rather than left to an accidental 0,0 fallback.
 
     SPEAKER-OWNERSHIP INVARIANT (the cross-speaker fusion fix):
     `speaker_runs` is ALWAYS materialized from the group's OWN first token — it
@@ -291,6 +417,16 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
     cur_speaker_known: bool = False
     cur_utterance_id: Optional[Any] = None
     cur_hard_boundary: bool = False
+    # ABSOLUTE word offset of the group's first word in the flattened token
+    # stream. Segmentation OWNS this (formatter no longer tracks a cursor). Paired
+    # with word_cursor (the running absolute index) it yields source_word_start/
+    # source_word_end on every group.
+    cur_word_start: int = 0
+    # Immutable transcription provenance carried from the group's FIRST token.
+    cur_provenance: Optional[Dict[str, Any]] = None
+    # Running absolute word index over the whole stream — advanced on every
+    # appended word (timed OR untimed) so offsets are exact regardless of timing.
+    word_cursor: int = 0
     # Bounded pause-provenance for a group opened at a hard pause: the measured
     # gap (ms) and the prior utterance id. None on a group that did not open at
     # a hard pause. Materialized on the first token of a hard-boundary group.
@@ -318,15 +454,44 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
         nonlocal cur_words, cur_start, cur_end, cur_speaker, cur_speaker_known
         nonlocal cur_utterance_id, cur_hard_boundary
         nonlocal cur_gap_before_ms, cur_prev_utterance_id
+        nonlocal cur_word_start, cur_provenance
         if cur_words:
             speaker_known = cur_speaker_known and cur_speaker is not None
+            # ── ALL-UNTIMED GROUP CONTRACT (deliberate, not accidental) ──────
+            # A group is "all-untimed" when NO token in it was timed, so cur_start
+            # stayed None and cur_end stayed 0 (no timed token ever advanced the
+            # window). Under ELS-v2 policy v1 this is IMPROBABLE — quarantine only
+            # ever withholds a single implausibly-long word, not a whole utterance
+            # — but it is NOT formally impossible (e.g. a one-word utterance that
+            # is itself quarantined, opened + closed by speaker changes, becomes a
+            # group of only that untimed word). Rather than let it fall through to
+            # a fabricated start_ms=0/end_ms=0 window (which would slam the cue to
+            # the TOP of the timeline — an invented 0ms event, the exact defect
+            # class this whole effort removes), we make the behaviour EXPLICIT:
+            # such a group carries start_ms=None / end_ms=None (honest "no
+            # trustworthy window") + timing_unresolved=True. The cue builder does
+            # NOT fabricate a window for it (no 0,0, no start==end, no neighbour
+            # anchor, no evidence-free interpolation) and does NOT emit it as a
+            # timed cue; it diverts the TEXT + provenance to a separate
+            # unresolved-content channel that gates publication. So the TEXT is
+            # never lost, no fabricated timing ever ships, and no invalid cue can
+            # reach a timed deliverable. Halting the whole job over one such group
+            # would be the wrong enterprise call (a bounded data edge becoming an
+            # outage under 100+ users). SOC 2 CC8.1 / FCC §79.1.
+            all_untimed = cur_start is None
             groups.append({
                 "words": cur_words,
-                "start_ms": cur_start if cur_start is not None else 0,
-                "end_ms": cur_end,
+                # None (not 0) on an all-untimed group — the honest "no window"
+                # signal the cue builder resolves deliberately. cur_end stays 0
+                # in that case but is IGNORED when start_ms is None.
+                "start_ms": cur_start,
+                "end_ms": None if all_untimed else cur_end,
+                "timing_unresolved": all_untimed,
                 "speaker": cur_speaker if speaker_known else None,
                 "speaker_known": speaker_known,
-                "review_required": not speaker_known,
+                # An all-untimed group is ALWAYS review-required (its window could
+                # not be resolved from any timed token), independent of speaker.
+                "review_required": (not speaker_known) or all_untimed,
                 "source_utterance_id": cur_utterance_id,
                 "hard_boundary_before": cur_hard_boundary,
                 # BOUNDED PAUSE PROVENANCE (item-4 contract). Only meaningful on a
@@ -335,6 +500,15 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
                 # prove the boundary reason from bounded scalars — never raw words.
                 "gap_before_ms": cur_gap_before_ms,
                 "prev_utterance_id": cur_prev_utterance_id,
+                # ABSOLUTE source-word offsets stamped by segmentation (the
+                # authoritative source-locator — formatter no longer computes it).
+                # Half-open [start, end): start = first word's index, end = one
+                # past the last word's index. len(words) == end - start.
+                "source_word_start": cur_word_start,
+                "source_word_end": word_cursor,
+                # Immutable transcription provenance carried from the first token.
+                # None on a legacy/fallback token that never carried one.
+                "transcription_provenance": cur_provenance,
                 # EXPLICIT ownership — always exactly one run, materialized from
                 # the group's own speaker. Never empty on a non-empty group.
                 "speaker_runs": [{"speaker": cur_speaker if speaker_known else None,
@@ -349,16 +523,32 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
         cur_hard_boundary = False
         cur_gap_before_ms = None
         cur_prev_utterance_id = None
+        cur_word_start = word_cursor
+        cur_provenance = None
 
     for token in tokens:
         text = (token.get("text") or "").strip()
         if not text:
             continue
+        # ── GENERAL TIMING CONTRACT (timing-aware, NOT quarantine-aware) ─────
+        # An UNTIMED token (has_timing() False — its timing was withheld upstream,
+        # e.g. a quarantined repair disposition, but segmentation neither knows nor
+        # cares WHY) is EXCLUDED from every timing-based boundary calculation: it
+        # never sets a group start/end window, never contributes a pause gap, and
+        # never becomes the reference frame for the NEXT token's gap/pause decision.
+        # Its TEXT is still appended in reading order, and it still participates in
+        # speaker-change + sentence-end decisions (those are text/speaker driven,
+        # not timing driven). SOC 2 CC8.1 / FCC §79.1.
+        token_timed = has_timing(token)
         # A token's speaker is "present" only when the key exists AND is non-None.
         speaker_present = token.get("speaker") is not None
         speaker = token.get("speaker") if speaker_present else None
-        start_ms = int(token.get("start_ms", 0) or 0)
-        end_ms = int(token.get("end_ms", start_ms) or start_ms)
+        # AUDIT: read start/end ONLY for timed tokens. NEVER coerce a missing/None
+        # timestamp to 0 — an untimed token has no numeric timing at all, and a 0ms
+        # substitution would re-introduce fabricated timing. start_ms/end_ms stay
+        # None for untimed tokens and are never used in timing math below.
+        start_ms = int(token.get("start_ms", token.get("start")) or 0) if token_timed else None
+        end_ms = int(token.get("end_ms", token.get("end")) or 0) if token_timed else None
         utt_id = _token_utterance_id(token)
 
         # ── Boundary decisions against the LAST real token ───────────────────
@@ -385,7 +575,13 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
             and prev_utterance_id is not None
             and utt_id != prev_utterance_id
         )
-        gap_ms = (start_ms - prev_end_ms) if (cur_words and prev_end_ms is not None) else 0
+        # Gap requires BOTH endpoints timed. An untimed current token (start_ms
+        # None) has no measurable gap, so it can never trigger a pause boundary —
+        # exactly the intended behaviour (its timing is untrustworthy). prev_end_ms
+        # only ever holds the last TIMED token's end.
+        gap_ms = (start_ms - prev_end_ms) if (
+            cur_words and token_timed and prev_end_ms is not None
+        ) else 0
         hard_pause = different_utterance and gap_ms >= threshold
 
         # Capture the measured gap + prior utterance id BEFORE the flush resets
@@ -402,9 +598,20 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
                 cur_gap_before_ms = int(pause_gap_ms) if pause_gap_ms is not None else None
                 cur_prev_utterance_id = pause_prev_utt
 
-        if cur_start is None:
-            cur_start = start_ms
+        # Adopt the group's source-utterance id on its first token so speaker/
+        # pause ownership stays consistent. Seed the group START window from the
+        # first TIMED token — an untimed token has no trustworthy cue-open time, so
+        # if the group opens on one, the first real (timed) word that follows seeds
+        # the start instead.
+        if not cur_words:
             cur_utterance_id = utt_id
+            # ABSOLUTE word offset + immutable provenance are stamped ONCE from
+            # the group's first token. cur_word_start is the running absolute
+            # index at the moment this group opens.
+            cur_word_start = word_cursor
+            cur_provenance = _token_provenance(token)
+        if cur_start is None and token_timed:
+            cur_start = start_ms
 
         # Materialize the group's OWN speaker on its first token. Once set for a
         # group it is fixed (a speaker change would have flushed above), so this
@@ -415,10 +622,16 @@ def segment_into_sentence_groups(tokens: List[Dict[str, Any]]) -> List[Dict[str,
             cur_speaker_known = speaker_present
 
         cur_words.append(text)
-        cur_end = end_ms
-
-        # Advance the reference frame to THIS token for the next iteration.
-        prev_end_ms = end_ms
+        # Advance the running absolute word index on EVERY appended word (timed
+        # or untimed) so source_word_start/end are exact for every group.
+        word_cursor += 1
+        # An UNTIMED token contributes its TEXT + order but NOT its timing: it
+        # never advances the group end window and never becomes the gap/pause
+        # reference frame for the next token. Speaker/utterance reference still
+        # advances so speaker-change + pause-boundary logic stay correct.
+        if token_timed:
+            cur_end = end_ms
+            prev_end_ms = end_ms
         prev_utterance_id = utt_id
         prev_speaker = speaker
         prev_speaker_present = speaker_present
