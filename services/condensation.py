@@ -51,6 +51,8 @@ provenance stamp.
 
 import json
 import os
+
+from .rules import get_rule as _rule_get
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -98,7 +100,7 @@ except Exception:  # pragma: no cover
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -111,15 +113,15 @@ def _mode() -> str:
     """CONDENSATION_MODE: 'off' | 'disfluency_only' | 'condense_to_cps'.
     Default 'disfluency_only' — the safe, deterministic, always-reproducible
     layer. Sent from the spec's condensation_rules via the producer mapper."""
-    return (os.getenv("CONDENSATION_MODE", "disfluency_only") or "disfluency_only").strip().lower()
+    return (_rule_get("CONDENSATION_MODE", "disfluency_only") or "disfluency_only").strip().lower()
 
 
 def _preserve_named_entities() -> bool:
-    return (os.getenv("CONDENSATION_PRESERVE_ENTITIES", "1") or "1") in ("1", "true", "True")
+    return (_rule_get("CONDENSATION_PRESERVE_ENTITIES", "1") or "1") in ("1", "true", "True")
 
 
 def _preserve_numbers() -> bool:
-    return (os.getenv("CONDENSATION_PRESERVE_NUMBERS", "1") or "1") in ("1", "true", "True")
+    return (_rule_get("CONDENSATION_PRESERVE_NUMBERS", "1") or "1") in ("1", "true", "True")
 
 
 def _max_cps() -> int:
@@ -135,7 +137,7 @@ def _max_chars() -> int:
 
 
 def _cps_measurement() -> str:
-    return (os.getenv("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
+    return (_rule_get("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
 
 
 # ─── CPS helpers (mirrors cps.py measurement contract) ───────────────
