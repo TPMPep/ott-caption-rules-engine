@@ -43,6 +43,8 @@ and surfaced via the producer's caption-options mapping):
 import os
 from typing import Any, Dict, List, Optional
 
+from .rules import get_rule as _rule_get
+
 try:
     from .rendering import render_lines
 except Exception:  # pragma: no cover — defensive for alternate import roots
@@ -86,12 +88,12 @@ except Exception:  # pragma: no cover
 def _measurement() -> str:
     """The spec's cps_measurement: 'characters' | 'words' | 'characters_no_spaces'.
     Sent from the spec via CPS_MEASUREMENT. Drives how _visible_chars counts."""
-    return (os.getenv("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
+    return (_rule_get("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
 
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
