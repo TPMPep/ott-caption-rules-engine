@@ -36,12 +36,14 @@ for two lines?" — the highest-frequency, highest-impact editorial decision.
 
 import os
 import re
+
+from .rules import get_rule as _rule_get
 from typing import List, Optional
 
 
 # ─── Spec flags (read once per call; cheap) ──────────────────────────
 def _flag(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
@@ -93,6 +95,78 @@ _DETERMINERS = {
     "this", "that", "these", "those", "some", "any", "no", "every", "each",
 }
 
+# ─── CLOSED-CLASS GRAMMATICAL BONDS (progressive-confidence tier 3) ──────────
+# These are HIGH-CONFIDENCE, CLOSED lexical classes — NOT a generic content-word
+# heuristic and NOT an attempt at POS tagging. They encode two universal English
+# bonds that a caption should not sever when a balance-equal alternative exists:
+#
+#   • FORWARD-BINDING words bind to what FOLLOWS them: a subject pronoun, an
+#     auxiliary/copula, a modal, or a subject+aux contraction ("I'm", "Let's",
+#     "we're", "he'll"). Stranding one at the END of line 1 severs it from the
+#     verb/complement it introduces ("Then we" | "saw …", "Let's" | "get …").
+#     Penalize a break whose line-1 LAST word is forward-binding.
+#     NOTE — this governs the CLOSED-CLASS seam only (pronoun/aux/modal/
+#     contraction). It deliberately does NOT address the verb→object seam
+#     ("want" | "Cypress speed") — "want" is a content word, and inferring
+#     verb→object cohesion would approximate POS tagging, which is out of scope.
+#   • PARTICLES bind BACKWARD to a preceding verb (phrasal verbs: "get up",
+#     "speed up", "back off"). Leading line 2 with a bare particle severs it from
+#     its verb ("get" | "up …"). Penalize a break whose line-2 FIRST word is a
+#     particle.
+#
+# Both are TIE-BREAKERS ONLY (weight below the sentence/clause rewards and the
+# weak-ending/leading-word rules, above raw balance) — they never select an
+# infeasible break, never override max_chars, and never beat a real punctuation
+# boundary. Deterministic, casing-independent, reproducible. SOC 2 CC8.1.
+
+# Subject pronouns + auxiliaries/copulas + modals that bind forward to a verb.
+# The bare-word forms (contraction suffixes are matched separately below).
+_FORWARD_BINDING = {
+    # Subject pronouns
+    "i", "we", "you", "he", "she", "they", "it",
+    # Copula / auxiliary "be"
+    "am", "is", "are", "was", "were", "be", "been", "being",
+    # Auxiliary "do" / "have"
+    "do", "does", "did", "have", "has", "had",
+    # Modals
+    "will", "would", "shall", "should", "can", "could",
+    "may", "might", "must", "ought",
+    # Common subject+aux / let-us contractions (whole-token forms)
+    "let's", "lets", "i'm", "i've", "i'll", "i'd",
+    "we're", "we've", "we'll", "we'd",
+    "you're", "you've", "you'll", "you'd",
+    "he's", "he'll", "he'd", "she's", "she'll", "she'd",
+    "they're", "they've", "they'll", "they'd",
+    "it's", "it'll", "that's", "there's", "here's",
+}
+
+# Phrasal-verb particles that bind BACKWARD to a preceding verb. Kept DISTINCT
+# from the prepositions in _LEADING_WORDS: as a PARTICLE ("get up", "speed up")
+# it must not lead a line; as a preposition it legitimately leads one ("up the
+# hill"). Because a bare particle at a LINE START almost always continues a
+# phrasal verb from the prior line in caption text, penalizing it here is the
+# safe, high-confidence call.
+_PARTICLES = {
+    "up", "down", "out", "off", "in", "on", "over",
+    "back", "away", "around", "through", "along", "apart",
+}
+
+
+def _is_forward_binding(word: str) -> bool:
+    """True when `word` (contraction-aware) is a subject pronoun / auxiliary /
+    modal / subject+aux contraction that binds FORWARD to a following verb."""
+    b = _bare(word)
+    if not b:
+        return False
+    # Keep the apostrophe for contraction matching (`_bare` preserves it).
+    return b in _FORWARD_BINDING
+
+
+def _is_particle(word: str) -> bool:
+    """True when `word` is a phrasal-verb particle that binds BACKWARD to a
+    preceding verb (never a good line-2 leader in caption text)."""
+    return _bare(word) in _PARTICLES
+
 _SENTENCE_PUNCT = (".", "!", "?")
 _CLAUSE_PUNCT = (",", ";", ":", "—", "–")
 
@@ -102,6 +176,54 @@ _STRIP_RE = re.compile(r"[^\w']+$")
 
 def _bare(word: str) -> str:
     return _STRIP_RE.sub("", (word or "")).strip().lower()
+
+
+def _is_capitalized_cohesion_token(word: str) -> bool:
+    """DETERMINISTIC CAPITALIZATION HEURISTIC — NOT named-entity recognition.
+
+    This is a *capitalized phrase-cohesion* proxy, not true proper-noun
+    recognition. It has NO dictionary, NO NER model, NO I/O — it reasons purely
+    about the SHAPE of a token. It returns True when a token:
+      • starts with an uppercase letter, AND
+      • has at least one lowercase letter after position 0 (so an ALL-CAPS
+        acronym like 'US' / 'FBI' / 'NASA' is deliberately EXCLUDED — those are
+        single lexical units, not a splittable multi-word phrase), AND
+      • is at least two characters, AND
+      • is not the pronoun 'I', AND
+      • is not a function word (article / conjunction / preposition / determiner
+        — 'The' / 'And' at a sentence start must never be read as part of a
+        capitalized phrase).
+
+    KNOWN LIMITATIONS (documented on purpose — do NOT overstate this as NER):
+      • It cannot tell a genuine proper name from any other capitalized word, so
+        a MID-SENTENCE capitalized common word would also count. In practice the
+        heuristic only ever fires as a −18 TIE-BREAK and only when line-1's last
+        word does NOT close a sentence/clause, so a sentence-initial capital
+        (the dominant false-positive source) is handled by the far stronger
+        +32/+28 boundary rewards long before this nudge matters.
+      • It is CAPITALIZATION-DEPENDENT: lowercased ASR output ('united states')
+        carries no capitalization evidence, so the heuristic correctly does
+        nothing — it neither helps nor harms.
+      • It is ENGLISH/Latin-casing oriented. Scripts without comparable
+        casing (CJK) never reach this path (rendering routes CJK to the
+        character wrapper), and casing-divergent languages simply get no nudge.
+      • A particle-led name ('de Gaulle') only coheres on the capitalized
+        tokens; the lowercase particle 'de' is a function-word-shaped token and
+        is scored by the ordinary leading/weak-ending rules, not here.
+
+    It ONLY ever adds a tie-breaking PREFERENCE — it never forces an infeasible
+    or worse-scoring break, never overrides a hard max_chars limit (an
+    over-width split is rejected as None before scoring), and never beats a real
+    sentence/clause boundary. Deterministic + reproducible. SOC 2 CC8.1."""
+    raw = _STRIP_RE.sub("", (word or "")).strip()
+    if len(raw) < 2 or not raw[0].isupper():
+        return False
+    if not any(c.islower() for c in raw[1:]):
+        return False  # acronym (US, FBI) — not a multi-word proper-noun phrase
+    b = raw.lower()
+    if b == "i":
+        return False
+    return b not in _LEADING_WORDS and b not in _DETERMINERS
 
 
 def _line_len(words: List[str], start: int, end: int) -> int:
@@ -174,6 +296,43 @@ def _score_break(words: List[str], i: int, max_chars: int) -> Optional[float]:
         # / determiner that should have led the next line instead.
         if last_bare in _LEADING_WORDS or last_bare in _DETERMINERS:
             score -= 25.0
+
+        # ── CLOSED-CLASS GRAMMATICAL-BOND COHESION (tier 3, tie-breaker) ─────
+        # Subordinate to the sentence/clause rewards (+32/+28) and the weak-
+        # ending/leading rules above — a real punctuation boundary or a dangling
+        # function word always dominates. Weight −12 sits BELOW those and only
+        # decides between otherwise-acceptable, balance-comparable candidates:
+        #   • line-1 ends on a FORWARD-BINDING word (subject pronoun / aux /
+        #     modal / "Let's"-type contraction) → it's severed from its verb.
+        #     (Closed-class only — the verb→object seam is NOT in scope here.)
+        #   • line-2 leads with a phrasal-verb PARTICLE → severed from its verb.
+        # A break that would strand a bare function word already earns −25, so a
+        # forward-binder that is ALSO a leading/determiner word isn't double-
+        # penalized here (the stronger −25 covers it). This term catches the
+        # class the weak-ending rule misses: pronouns/auxes/contractions/
+        # particles that are NOT prepositions/articles.
+        if last_bare not in _LEADING_WORDS and last_bare not in _DETERMINERS:
+            if _is_forward_binding(last_word):
+                score -= 12.0
+        if first_bare not in _LEADING_WORDS and _is_particle(first_word):
+            score -= 12.0
+
+    # CAPITALIZED PHRASE-COHESION PREFERENCE (deterministic capitalization
+    # heuristic — NOT NER; always on, not gated on the clause flag, since
+    # severing a capitalized multi-word phrase reads wrong regardless of the
+    # balance/clause posture): penalize a break that splits a run of consecutive
+    # capitalized cohesion tokens ('United | States', 'New | York', 'Mr. | Wang')
+    # when the word ending line 1 does NOT itself close a sentence/clause. Only a
+    # TIE-BREAKING nudge — it never selects an infeasible break, never overrides
+    # a hard max_chars limit, and is easily overridden by a real sentence/clause
+    # boundary (+32/+28) — so it keeps a capitalized phrase whole only when
+    # nothing better competes. Closes the 'The United States | government' vs
+    # 'The United | States government' tie in favour of keeping the phrase intact.
+    if (not last_word.endswith(_SENTENCE_PUNCT)
+            and not last_word.endswith(_CLAUSE_PUNCT)
+            and _is_capitalized_cohesion_token(last_word)
+            and _is_capitalized_cohesion_token(first_word)):
+        score -= 18.0
 
     return score
 
