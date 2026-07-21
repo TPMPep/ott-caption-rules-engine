@@ -60,6 +60,8 @@ always yields identical shaped cues.
 import os
 from typing import Any, Dict, List, Optional
 
+from .rules import get_rule as _rule_get
+
 try:
     from .rendering import render_lines as _render_lines, cue_fits_delivered as _cue_fits_delivered
 except Exception:  # pragma: no cover
@@ -100,7 +102,10 @@ except Exception:  # pragma: no cover
 # conjunction/article, never stranding a function word at a cue end) rather than a
 # blind midpoint. Shared import keeps segmentation identical to line-break logic.
 try:
-    from .linebreak import _LEADING_WORDS, _DETERMINERS, _bare as _bare_word
+    from .linebreak import (
+        _LEADING_WORDS, _DETERMINERS, _bare as _bare_word,
+        _is_forward_binding, _is_particle,
+    )
 except Exception:  # pragma: no cover
     _LEADING_WORDS = frozenset()
     _DETERMINERS = frozenset()
@@ -108,10 +113,16 @@ except Exception:  # pragma: no cover
     def _bare_word(w):
         return (w or "").strip(".,;:!?—–\"')]}").lower()
 
+    def _is_forward_binding(w):
+        return False
+
+    def _is_particle(w):
+        return False
+
 
 # ─── Spec knobs ──────────────────────────────────────────────────────
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -124,7 +135,7 @@ def _shaping_enabled() -> bool:
     """Master switch. Default ON — caption shaping is the professional baseline.
     A spec can disable it (CUSTOM_SHAPING_ENABLED=0) to ship raw-utterance cues
     verbatim (e.g. a 1:1 import that must not be re-timed)."""
-    return os.getenv("CUSTOM_SHAPING_ENABLED", "1") not in ("0", "false", "False")
+    return _rule_get("CUSTOM_SHAPING_ENABLED", "1") not in ("0", "false", "False")
 
 
 def _condensation_mode() -> str:
@@ -132,7 +143,7 @@ def _condensation_mode() -> str:
     'off' → verbatim spec, NEVER trim to avoid a split (go straight to split).
     Any other value permits the deterministic disfluency trim that can let a
     marginally-overflowing sentence stay ONE cue instead of being split."""
-    return (os.getenv("CONDENSATION_MODE", "disfluency_only") or "disfluency_only").strip().lower()
+    return (_rule_get("CONDENSATION_MODE", "disfluency_only") or "disfluency_only").strip().lower()
 
 
 def _max_chars() -> int:
@@ -377,6 +388,22 @@ def _pick_word_phrase_boundary(words: List[str]) -> Optional[int]:
             score += 10.0
         if last_bare in _LEADING_WORDS or last_bare in _DETERMINERS:
             score -= 12.0
+        # CLOSED-CLASS GRAMMATICAL-BOND COHESION — mirror of linebreak._score_break
+        # tier 3. Subordinate to the leading/weak rules above and to the balance
+        # term below (weight −6, half the −12 there so it stays a pure tie-break
+        # in the fallback splitter). Never applied to a word already scored by the
+        # leading/determiner rule (avoids double-counting). Keeps a cue SPLIT from
+        # severing the CLOSED-CLASS seam — a bare subject pronoun/aux at line-1 end
+        # ("Then we | saw"), a "Let's | get" contraction, or a "get | up" particle
+        # — exactly as the line wrapper avoids the same severs. It does NOT touch
+        # the verb→object seam ("want" | "Cypress speed"): that is a content-word
+        # relation, out of scope for this deterministic closed-class rule. SOC 2
+        # CC8.1 — one cohesion rule, both composition surfaces.
+        if last_bare not in _LEADING_WORDS and last_bare not in _DETERMINERS:
+            if _is_forward_binding(words[i - 1]):
+                score -= 6.0
+        if first_bare not in _LEADING_WORDS and _is_particle(words[i]):
+            score -= 6.0
         score -= abs(i - mid) * 1.0
         scored.append((score, i))
     if not scored:
