@@ -13,6 +13,8 @@ POST /v1/jobs payload). No hardcoded profile fallbacks.
 
 import os
 
+from .rules import get_rule as _rule_get
+
 # SINGLE SOURCE OF TRUTH for line rendering — the same module formatter.py uses
 # when it first builds a cue. The merge passes below recombine words + speaker
 # runs and RE-RENDER through this, so a merged cue is drawn identically to a
@@ -118,7 +120,7 @@ _BRIEF_RESPONSES = {
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -148,7 +150,7 @@ def _merge_gap_ms() -> int:
 
 
 def _speaker_label_mode() -> str:
-    return (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
+    return (_rule_get("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
 
 
 # Two-speaker grouping window. When two adjacent DIFFERENT-speaker dialogue
@@ -394,46 +396,51 @@ def reflow_orphans(cues):
 
 
 def group_two_speaker_cues(cues):
-    """SPEC-DRIVEN multi-speaker grouping (dash convention).
+    """Group eligible rapid A/B exchanges for every speaker-label mode.
 
-    Only active when the spec's SPEAKER_LABEL_MODE is 'dash' (Pluto / FAST and
-    any spec that carries the dash posture). For non-dash specs this is a no-op
-    — the professional default of one-speaker-per-cue (separate timecodes) is
-    correct and untouched.
-
-    When two ADJACENT dialogue cues belong to DIFFERENT speakers, sit inside a
-    tight back-and-forth window (small inter-cue gap), and their combined text
-    fits the spec's char×line budget, they are merged into ONE caption that the
-    shared renderer draws as:
-        - Speaker A line
-        - Speaker B line
-    This is the legitimate Pluto two-speakers-in-one-caption case. The merge
-    goes through merge_cue_meta + render_lines (the SAME universal renderer
-    every other stage uses), so the dash/label and one-speaker-per-line
-    invariant are guaranteed and auditor-consistent. SOC 2 CC8.1.
+    Structure and presentation are separate: the same two-run cue is rendered as
+    dashes, tags, names, or plain lines according to the spec. Exactly two known
+    speakers, one physical line each, no immutable wall, a tight gap, legal
+    duration/geometry, and label-inclusive CPS are mandatory.
     """
-    if _speaker_label_mode() != "dash":
+    if _max_lines() < 2:
         return cues
-
-    budget = _max_chars() * _max_lines()
     group_gap = _two_speaker_group_gap_ms()
+    rapid_max = max(1800, _min_dialogue_ms() * 2)
     out = []
     i = 0
     while i < len(cues):
         cue = cues[i]
         nxt = cues[i + 1] if i + 1 < len(cues) else None
-        if (nxt is not None
-                and cue.get("type") == "dialogue"
-                and nxt.get("type") == "dialogue"
-                and not _speakers_compatible(cue, nxt)  # genuinely DIFFERENT speakers
-                # Never group across a hard pause / authored wall / unknown-
-                # speaker cue, even though the two speakers genuinely differ.
-                and not _hard_wall_between(cue, nxt)
-                and (nxt["start_ms"] - cue["end_ms"]) <= group_gap):
+        speakers_a = cue_speakers(cue) if cue else set()
+        speakers_b = cue_speakers(nxt) if nxt else set()
+        dur_a = cue.get("end_ms", 0) - cue.get("start_ms", 0) if cue else 0
+        dur_b = nxt.get("end_ms", 0) - nxt.get("start_ms", 0) if nxt else 0
+        eligible = (
+            nxt is not None
+            and cue.get("type") == "dialogue"
+            and nxt.get("type") == "dialogue"
+            and len(speakers_a) == len(speakers_b) == 1
+            and speakers_a != speakers_b
+            and not _hard_wall_between(cue, nxt)
+            and 0 <= (nxt["start_ms"] - cue["end_ms"]) <= group_gap
+            and dur_a <= rapid_max and dur_b <= rapid_max
+        )
+        if eligible:
             combined = _rerender_merged(cue, nxt)
-            # Only accept the grouping if it still fits the on-screen budget
-            # DELIVERED (label/dash prefixes included) — the ONE shared fit test.
-            if cue_fits_delivered(combined, _max_lines(), _max_chars()):
+            merged_dur = combined["end_ms"] - combined["start_ms"]
+            lines = combined.get("lines") or []
+            if (len(lines) == 2
+                    and _min_dialogue_ms() <= merged_dur <= _max_display_ms()
+                    and cue_fits_delivered(combined, _max_lines(), _max_chars())
+                    and _cue_cps(combined) <= _max_cps()):
+                meta = dict(combined.get("meta") or {})
+                meta["rapid_two_speaker_group"] = {
+                    "source_cue_count": 2,
+                    "source_speakers": [next(iter(speakers_a)), next(iter(speakers_b))],
+                    "gap_ms": nxt["start_ms"] - cue["end_ms"],
+                }
+                combined["meta"] = meta
                 out.append(combined)
                 i += 2
                 continue
