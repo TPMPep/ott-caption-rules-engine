@@ -77,6 +77,8 @@ Pure functions only. No env writes.
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from .rules import get_rule as _rule_get
+
 # COLLISION-RESISTANT canonical hashing — SHA-256 over deterministic canonical
 # serialization, byte-identical to lib/cc-segmentation-audit.js canonicalSha256.
 # THE audit identity + idempotency hash for input_hash / candidate_set_hash /
@@ -99,8 +101,8 @@ LANGUAGE_POLICY_VERSION = 1
 # LOGIC changes in a way that could alter selected boundaries. Bump
 # OPTIMIZER_VERSION for any change to this module. Both are pinned into every
 # provenance block so an auditor can answer "which optimizer produced this cue?"
-OPTIMIZER_VERSION = 1
-SEGMENTATION_POLICY_VERSION = 1
+OPTIMIZER_VERSION = 2
+SEGMENTATION_POLICY_VERSION = 2
 
 # Shared linguistic tables + bare-word normalizer — the SAME ones the line
 # breaker and shaper use, so boundary quality is judged identically everywhere.
@@ -148,7 +150,7 @@ _DANGLING_TAIL_MARKERS = frozenset({
 
 # ─── Spec knobs (identical names/defaults to shaping.py + cps.py) ─────
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -161,7 +163,7 @@ def _enabled() -> bool:
     """Controlled rollout flag (Step 17). Default ON — the optimizer is the
     canonical path. A spec/run can disable it (SEQ_OPTIMIZER_ENABLED=0) for an
     A/B or a 1:1 import posture that must not be resegmented."""
-    return os.getenv("SEQ_OPTIMIZER_ENABLED", "1") not in ("0", "false", "False")
+    return _rule_get("SEQ_OPTIMIZER_ENABLED", "1") not in ("0", "false", "False")
 
 
 def _max_chars() -> int:
@@ -314,8 +316,29 @@ def _collect_windows(cues: List[Dict[str, Any]]) -> List[Tuple[int, int]]:
     return windows
 
 
+def _collect_geometry_repair_windows(cues: List[Dict[str, Any]]) -> List[Tuple[int, int]]:
+    """Return bounded same-speaker neighborhoods around ACTUAL stored CPL/line
+    failures. The final projection-aware pass must not reconsider an entire turn
+    when only one local boundary is defective; ±2 cues supplies enough capacity
+    to redistribute the boundary while preserving minimal disturbance."""
+    max_chars, max_lines = _max_chars(), _max_lines()
+    out: List[Tuple[int, int]] = []
+    for start, end in _collect_windows(cues):
+        failing = [i for i in range(start, end)
+                   if len(cues[i].get("lines") or []) > max_lines
+                   or any(len(str(line or "")) > max_chars
+                          for line in (cues[i].get("lines") or []))]
+        for idx in failing:
+            local = (max(start, idx - 2), min(end, idx + 3))
+            if out and local[0] <= out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], local[1]))
+            else:
+                out.append(local)
+    return out
+
+
 def _window_word_stream(cues: List[Dict[str, Any]], start: int, end: int
-                        ) -> Tuple[List[str], List[Dict[str, Any]], int, int, bool, List[bool]]:
+                         ) -> Tuple[List[str], List[Dict[str, Any]], int, int, bool, List[bool]]:
     """Flatten a window into (words, per_word_timings, win_start_ms, win_end_ms,
     have_timings, measured_flags). Word order is preserved exactly. Timings prefer
     the cue's real meta.word_timings; a cue lacking them contributes interpolated
@@ -397,8 +420,100 @@ def _cut_indices_to_cues(words, timings, cuts, win_start, win_end, speaker
     return out
 
 
-def _candidate_cut_sets(words: List[str], orig_cut_indices: Tuple[int, ...]
-                        ) -> List[Tuple[str, Tuple[int, ...]]]:
+def _bounded_complete_path(words, timings, win_start, win_end, speaker, label_aware=False,
+                           allow_paired_span_cuts=False,
+                           defer_timing_constraints=False):
+    """Return the best complete segmentation path with no output-count ceiling.
+
+    Dynamic programming evaluates bounded cue edges rather than enumerating all
+    partitions. Geometry naturally caps each edge; deterministic ties prefer
+    fewer parts then earlier cuts. The first pass excludes label overhead; when
+    final delivered validation fails, a second label-aware pass is used.
+    """
+    n = len(words)
+    if n == 0:
+        return None
+    max_chars, max_lines = _max_chars(), _max_lines()
+    budget = max_chars * max_lines
+    min_display, max_display = _min_display_ms(), _max_display_ms()
+    max_cps, target_dur = _max_cps(), _target_duration_ms()
+
+    def clean_cut(idx):
+        if idx <= 0 or idx >= n:
+            return True
+        if _split_breaks_paired_delimiter(words, idx) and not allow_paired_span_cuts:
+            return False
+        first = _bare_word(words[idx])
+        return first not in _LEADING_WORDS and first not in _DETERMINERS
+
+    boundaries = [0] + [i for i in range(1, n) if clean_cut(i)] + [n]
+    best = {0: (0.0, ())}
+    rejected = []
+    for boundary_pos, i in enumerate(boundaries[:-1]):
+        if i not in best:
+            continue
+        base_score, base_cuts = best[i]
+        for j in boundaries[boundary_pos + 1:]:
+            seg_words = words[i:j]
+            text = " ".join(seg_words)
+            if len(text) > budget and j > i + 1:
+                break
+            start = win_start if i == 0 else int(timings[i]["start_ms"])
+            end = win_end if j == n else int(timings[j - 1]["end_ms"])
+            dur = end - start
+            reason = None
+            if dur < min_display and not defer_timing_constraints:
+                reason = "DURATION_BELOW_MIN"
+            elif dur > max_display:
+                reason = "DURATION_ABOVE_MAX"
+            else:
+                runs = [{"speaker": speaker, "word_start": 0}]
+                lines = _render_lines(seg_words, runs, max_lines, max_chars, text) if label_aware else [text]
+                if label_aware and (len(lines) > max_lines or any(len(line) > max_chars for line in lines)):
+                    reason = "LINE_OR_CPL_FAIL"
+                elif not label_aware and len(text) > budget:
+                    reason = "LINE_OR_CPL_FAIL"
+                else:
+                    visible = " ".join(lines) if label_aware else text
+                    if (len(visible) / max(0.001, dur / 1000.0) > max_cps
+                            and not defer_timing_constraints):
+                        reason = "CPS_OVER_MAX"
+            if reason:
+                if reason not in rejected:
+                    rejected.append(reason)
+                continue
+            edge_score = -abs(dur - target_dur) / 1000.0 * 1.5 - 2.0
+            if j < n:
+                last = seg_words[-1].rstrip()
+                bare = _bare_word(last)
+                if last.endswith(_SENTENCE_END):
+                    edge_score += 14.0
+                elif last.endswith(_CLAUSE_END):
+                    edge_score += 8.0
+                else:
+                    edge_score -= 8.0
+                if bare in _DANGLING_TAIL_MARKERS or bare in _LEADING_WORDS or bare in _DETERMINERS:
+                    edge_score -= 16.0
+            cuts = base_cuts + (() if j == n else (j,))
+            candidate = (base_score + edge_score, cuts)
+            incumbent = best.get(j)
+            if (incumbent is None or candidate[0] > incumbent[0] + 1e-9
+                    or (abs(candidate[0] - incumbent[0]) < 1e-9
+                        and (len(candidate[1]), candidate[1]) < (len(incumbent[1]), incumbent[1]))):
+                best[j] = candidate
+    if n not in best:
+        return None
+    cuts = best[n][1]
+    parts = _cut_indices_to_cues(words, timings, cuts, win_start, win_end, speaker)
+    veto = (_veto(parts, words, defer_timing_constraints)
+            if parts else "EMPTY_CANDIDATE")
+    return {"cuts": cuts, "parts": parts, "veto": veto,
+            "rejected_reason_categories": rejected, "label_aware": label_aware}
+
+
+def _candidate_cut_sets(words: List[str], orig_cut_indices: Tuple[int, ...],
+                         allow_paired_span_cuts: bool = False
+                         ) -> List[Tuple[str, Tuple[int, ...]]]:
     """Generate deterministic candidate cut-index sets over the word stream.
     Each is (operation_code, tuple_of_cut_indices).
 
@@ -426,7 +541,7 @@ def _candidate_cut_sets(words: List[str], orig_cut_indices: Tuple[int, ...]
     def _clean_cut(idx: int) -> bool:
         if idx <= 0 or idx >= n:
             return False
-        if _split_breaks_paired_delimiter(words, idx):
+        if _split_breaks_paired_delimiter(words, idx) and not allow_paired_span_cuts:
             return False
         # Never start a part with a stranded leading function word / determiner.
         first = _bare_word(words[idx])
@@ -436,6 +551,13 @@ def _candidate_cut_sets(words: List[str], orig_cut_indices: Tuple[int, ...]
         return min(idx, n - idx) >= 3
 
     single = [i for i in range(1, n) if _clean_cut(i)]
+    # The complete-path DP is authoritative for long windows. Bound the legacy
+    # 2/3-cue comparison set so audit breadth cannot turn into quadratic work on
+    # feature-length same-speaker material. Small windows retain byte-identical
+    # exhaustive behavior; long windows sample deterministic, evenly-spaced cuts.
+    if len(single) > 24:
+        sample_positions = {round(i * (len(single) - 1) / 23) for i in range(24)}
+        single = [single[i] for i in sorted(sample_positions)]
     for i in single:
         cands.append(("resegment_2", (i,)))
     # 3-cue: pairs of clean cuts, each part ≥3 words.
@@ -468,8 +590,8 @@ def _tokens_conserved(parts: List[Dict[str, Any]], orig_words: List[str]) -> boo
     return all(a == b for a, b in zip(got, orig_words))
 
 
-def _veto(parts: List[Dict[str, Any]], orig_words: List[str]
-          ) -> Optional[str]:
+def _veto(parts: List[Dict[str, Any]], orig_words: List[str],
+          defer_timing_constraints: bool = False) -> Optional[str]:
     """Return a veto reason code, or None when the candidate is compliant.
     Vetoes run BEFORE scoring — a vetoed candidate is never selectable.
 
@@ -490,7 +612,7 @@ def _veto(parts: List[Dict[str, Any]], orig_words: List[str]
         return "TEXT_CONSERVATION_FAILED"
     for p in parts:
         dur = p["end_ms"] - p["start_ms"]
-        if dur < min_display:
+        if dur < min_display and not defer_timing_constraints:
             return "DURATION_BELOW_MIN"
         if dur > max_display:
             return "DURATION_ABOVE_MAX"
@@ -501,7 +623,7 @@ def _veto(parts: List[Dict[str, Any]], orig_words: List[str]
         # honest handling. (no_change is exempt: it's the baseline, not a fix.)
         body = " ".join(p.get("lines", [])).strip() or p["meta"]["dialogue_text"]
         dur_s = max(0.001, dur / 1000.0)
-        if (len(body) / dur_s) > max_cps:
+        if (len(body) / dur_s) > max_cps and not defer_timing_constraints:
             return "CPS_OVER_MAX"
     return None
 
@@ -614,7 +736,8 @@ def _summarize_candidate(op: str, cuts, parts, veto_reason) -> Dict[str, Any]:
 
 def _timing_provenance(op: str, parts: List[Dict[str, Any]],
                        timings: List[Dict[str, Any]], words: List[str],
-                       cuts: Tuple[int, ...], have_timings: bool
+                       cuts: Tuple[int, ...], have_timings: bool,
+                       measured_flags: List[bool]
                        ) -> Tuple[str, Dict[str, int]]:
     """Compute the PRECISE timing provenance of a selected arrangement, per the
     timing-provenance-precision contract. Distinguishes:
@@ -646,7 +769,7 @@ def _timing_provenance(op: str, parts: List[Dict[str, Any]],
         return "inherited", detail
     measured = 0
     interpolated = 0
-    flags = _MEASURED_FLAGS
+    flags = measured_flags
     for cut in cuts:
         # The boundary word is words[cut] (start of the next part). It is
         # 'measured' when that token carried a real provider timing.
@@ -789,19 +912,14 @@ def _passthrough_identity(transformation_sequence: int, words: List[str],
     }
 
 
-# Module-level index-aligned measured-timing flags for the window currently being
-# processed. Set by optimize_cue_sequence right after _window_word_stream so
-# _timing_provenance can tell a measured boundary from an interpolated one at the
-# exact cut index. Reset per window. Not thread-shared (the engine processes one
-# job per worker thread, one window at a time within it).
-_MEASURED_FLAGS: List[bool] = []
-
-
 # ─── Public entry ────────────────────────────────────────────────────
-def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def optimize_cue_sequence(cues: List[Dict[str, Any]],
+                          defer_timing_constraints: bool = False,
+                          repair_hard_geometry_only: bool = False) -> List[Dict[str, Any]]:
     """Canonical cross-cue optimization pass. For each maximal same-speaker
-    dialogue window: rebuild the word-timed stream, generate candidate 1/2/3-cue
-    arrangements, veto the non-compliant, score the rest, select the best, and
+    dialogue window: rebuild the word-timed stream, run a bounded dynamic-programming
+    complete-path search with no result-count ceiling (plus bounded legacy 1/2/3
+    comparisons), veto non-compliant paths, score the rest, select the best, and
     replace the window's cues with it — stamping full meta.seq_opt provenance +
     the condensation gate on every emitted cue. Non-dialogue cues, CJK windows,
     and single-cue windows with no better candidate pass through unchanged
@@ -813,7 +931,8 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             c["idx"] = i + 1
         return cues
 
-    windows = _collect_windows(cues)
+    windows = (_collect_geometry_repair_windows(cues)
+               if repair_hard_geometry_only else _collect_windows(cues))
     out: List[Dict[str, Any]] = []
     cursor = 0
     # Zero-based window index within this run's segmentation pass — the
@@ -831,8 +950,6 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         window_cues = cues[start:end]
         speaker = _primary_speaker(window_cues[0])
         words, timings, win_start, win_end, have_timings, measured_flags = _window_word_stream(cues, start, end)
-        global _MEASURED_FLAGS
-        _MEASURED_FLAGS = measured_flags
         orig_text = " ".join(words)
         orig_boundaries = [int(c.get("start_ms", 0)) for c in window_cues]
         # Original cut indices = cumulative word counts at each internal cue
@@ -864,12 +981,47 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             cursor = end
             continue
 
-        candidates = _candidate_cut_sets(words, orig_cuts_t)
+        # Legacy 1/2/3-way comparisons remain exhaustive for ordinary local
+        # windows. A >200-word window cannot possibly fit the configured display
+        # ceiling as one/three cues; evaluating those known-invalid arrangements
+        # only adds quadratic rendering work. For such windows the complete-path
+        # DP below is the sole candidate authority.
+        # If the incoming authored arrangement already spans a paired delimiter
+        # (for example a long quotation across several captions), alternative
+        # boundaries within that same span are legitimate. The strict delimiter
+        # guard remains in force for every window that did not already cross one.
+        allow_paired_span_cuts = any(
+            _split_breaks_paired_delimiter(words, cut) for cut in orig_cuts_t
+        )
+        candidates = (_candidate_cut_sets(words, orig_cuts_t, allow_paired_span_cuts)
+                      if len(words) <= 200 else [])
+        # Unbounded-result-count candidate: a bounded DP path through every
+        # feasible cue edge. Search spoken text first; only if final rendering
+        # fails because of label overhead do we rerun the local search label-aware.
+        path = _bounded_complete_path(
+            words, timings, win_start, win_end, speaker, label_aware=False,
+            allow_paired_span_cuts=allow_paired_span_cuts,
+            defer_timing_constraints=defer_timing_constraints)
+        if path and path.get("veto") in ("LINE_OR_CPL_FAIL", "CPS_OVER_MAX"):
+            label_path = _bounded_complete_path(
+                words, timings, win_start, win_end, speaker, label_aware=True,
+                allow_paired_span_cuts=allow_paired_span_cuts,
+            defer_timing_constraints=defer_timing_constraints)
+            if label_path is not None:
+                path = label_path
+        if path and path.get("cuts") not in [c for _, c in candidates]:
+            part_count = len(path.get("parts") or [])
+            # Persisted enum compatibility: result_cue_count/part_total carry the
+            # true arbitrary count; resegment_3 is the legacy multi-part code.
+            path_op = "resegment_2" if part_count == 2 else "resegment_3"
+            candidates.append((path_op, tuple(path["cuts"])))
+
         summaries: List[Dict[str, Any]] = []
         scored: List[Tuple[float, str, tuple, List[Dict[str, Any]]]] = []
         for op, cuts in candidates:
             parts = _cut_indices_to_cues(words, timings, cuts, win_start, win_end, speaker)
-            veto = _veto(parts, words) if parts else "EMPTY_CANDIDATE"
+            veto = (_veto(parts, words, defer_timing_constraints)
+                    if parts else "EMPTY_CANDIDATE")
             # no_change reproduces the ORIGINAL boundaries; if it vetoes on CPS or
             # over-rhythm that's the SIGNAL a fix is needed — recorded, not hidden.
             summaries.append(_summarize_candidate(op, cuts, parts, veto))
@@ -936,9 +1088,15 @@ def optimize_cue_sequence(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         # Precise timing provenance (measured/interpolated/mixed/inherited) +
         # bounded boundary counts — replaces the coarse timing_source verdict.
         timing_provenance, timing_detail = _timing_provenance(
-            op, parts, timings, words, cuts, have_timings)
+            op, parts, timings, words, cuts, have_timings, measured_flags)
         selected_reason_codes = _reason_codes(op, scored, chosen, no_change_over_cps)
+        if len(parts) > 3:
+            selected_reason_codes.append("variable_length_complete_path")
         rejected_categories = _rejected_reason_categories(summaries)
+        if path:
+            for reason in path.get("rejected_reason_categories", []):
+                if reason not in rejected_categories:
+                    rejected_categories.append(reason)
         review_required = (op == "no_change" and no_change_over_cps and not non_destructive_fix_exists)
         review_reason_codes = (["cps_over_max_no_resegmentation"] if review_required else [])
         input_hash, candidate_set_hash, output_hash = _decision_hashes(
