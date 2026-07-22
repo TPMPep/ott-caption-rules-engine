@@ -78,7 +78,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.37.0-measured-start-floor"
+VERSION = "5.38.0-scribe-timing-repair-wired"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -304,9 +304,12 @@ def baseline_to_assembly_result(baseline: Dict[str, Any]) -> Dict[str, Any]:
         "utterances": baseline.get("utterances") or [],
         "words": baseline.get("words") or [],
         "audio_events": baseline.get("audio_events") or [],
-        # Mark provenance so build_caption_inputs never cross-calls a provider
-        # for the backbone SRT (it builds locally from utterances).
+        # Restore the provider fingerprint so provider-specific normalization
+        # policies (notably Scribe v2 timing repair) run on baseline reformats.
+        "transcription_provider": baseline.get("transcription_provider") or "",
+        "transcription_model": baseline.get("transcription_model") or "",
         "_provider": baseline.get("transcription_provider") or "",
+        "_model_id": baseline.get("transcription_model") or "",
     }
 
 
