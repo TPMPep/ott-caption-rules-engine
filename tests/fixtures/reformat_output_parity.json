@@ -8,7 +8,8 @@
       "lines": ["- Now, today's story", "is about a father"],
       "speaker_label": "A",
       "speaker_segments": [],
-      "speaker_review_required": false
+      "speaker_review_required": false,
+      "position": "bottom"
     },
     {
       "type": "dialogue",
@@ -17,7 +18,8 @@
       "lines": ["That's not fair."],
       "speaker_label": "B",
       "speaker_segments": [],
-      "speaker_review_required": false
+      "speaker_review_required": false,
+      "position": "top"
     },
     {
       "type": "music",
@@ -26,7 +28,8 @@
       "lines": ["[GENTLE MUSIC]"],
       "speaker_label": "",
       "speaker_segments": [],
-      "speaker_review_required": false
+      "speaker_review_required": false,
+      "position": "bottom"
     }
   ],
   "seg_qc": {
@@ -47,5 +50,5 @@
       }
     ]
   },
-  "expected_canonical_output_hash": "a9732849209e7099ec416d242c6cee6b270e2cb9f3fca096c3aba260ce49fd9f"
+  "expected_canonical_output_hash": "a9b418607c9166025f2b00ce3c3ee36a92660f80b11c592af095f613f25b6123"
 }
