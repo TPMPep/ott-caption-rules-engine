@@ -42,6 +42,7 @@ import hashlib
 import json
 import math
 import unicodedata
+from collections.abc import Mapping
 from typing import Any
 
 CANONICAL_HASH_VERSION = 1
@@ -67,7 +68,15 @@ def _normalize(value: Any) -> Any:
         return float(repr(value))
     if isinstance(value, (list, tuple)):
         return [_normalize(v) for v in value]
-    if isinstance(value, dict):
+    # Accept any Mapping — NOT just a concrete `dict`. A FrozenDict (the immutable
+    # provenance / unresolved-group value object, services.immutable) is a
+    # collections.abc.Mapping but NOT a dict; a `dict`-only guard would skip it and
+    # fall through to the str() fallback below, serializing "FrozenDict({...})"
+    # instead of a canonical sorted-key object — silently corrupting the audit-
+    # identity / idempotency hash (a non-deterministic, non-canonical digest). The
+    # JS mirror (_canonicalize) already treats a frozen plain object as an object,
+    # so accepting Mapping here restores cross-language parity. SOC 2 CC8.1.
+    if isinstance(value, Mapping):
         # Sort keys ascending for stable ordering; coerce keys to str.
         return {str(k): _normalize(value[k]) for k in sorted(value.keys(), key=lambda x: str(x))}
     # Fallback — stringify unknown types deterministically.
