@@ -689,7 +689,7 @@ def _structured_speaker_fields(c: Dict[str, Any]) -> Dict[str, Any]:
 # delivery. Independent of the engine VERSION string (which also moves for
 # non-formatter changes) and of SEGMENTATION_POLICY_VERSION (the optimizer's
 # scoring policy). SOC 2 CC8.1.
-FORMATTER_VERSION = 1
+FORMATTER_VERSION = 2
 
 
 def process_caption_job(
