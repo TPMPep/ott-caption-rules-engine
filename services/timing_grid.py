@@ -138,6 +138,37 @@ def normalize_cue_timing(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         shift = -starts[0]
         starts = [s + shift for s in starts]
 
+    # ── MEASURED-START FLOOR — the timecode-integrity invariant ──────────────
+    # A caption may be nudged LATER (to resolve an overlap / honor the min gap),
+    # but it may NEVER start earlier than the moment its words are actually
+    # spoken. Without this, the isotonic solve treats a long inter-cue silence
+    # (e.g. a 14s gap between a music cue ending and the next line being spoken)
+    # as slack to squeeze out, and drags the dialogue cue seconds earlier onto
+    # the tail of the prior cue — the caption then fires long before the audio.
+    # The measured on-grid start is the source of truth; here it becomes a HARD
+    # LOWER BOUND, applied in one forward pass so ordering + non-overlap are
+    # preserved (each clamped start also pushes its successors' minimum). This
+    # preserves the legitimate rapid-dialogue behavior (which only ever moves
+    # starts LATER to fit min-duration) while making a real silence uncollapsible.
+    # Deterministic; SOC 2 CC8.1 / FCC 47 CFR §79.1 — delivered timecodes never
+    # precede the measured audio.
+    running_min = None
+    for i in range(len(cues)):
+        # Round the measured source start UP to the frame grid. Using the
+        # nearest frame could still place a caption up to half a frame before
+        # the spoken word, which violates the no-early-caption invariant.
+        measured_start_f = ms_to_frame(int(cues[i].get("start_ms", 0)), "ceil")
+        floored = max(starts[i], measured_start_f)
+        if running_min is not None:
+            floored = max(floored, running_min)
+        starts[i] = floored
+        both_dialogue = (
+            i + 1 < len(cues)
+            and cues[i].get("type", "dialogue") == "dialogue"
+            and cues[i + 1].get("type", "dialogue") == "dialogue"
+        )
+        running_min = starts[i] + durations[i] + (gap_f if both_dialogue else 0)
+
     decision_groups: Dict[str, List[Dict[str, Any]]] = {}
     for i, cue in enumerate(cues):
         start_f, end_f = starts[i], starts[i] + durations[i]
