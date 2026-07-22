@@ -71,11 +71,11 @@ def normalize_cue_timing(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Project the complete delivered sequence onto one legal frame lattice.
 
     The projection is a deterministic least-squares isotonic solve: every cue
-    keeps its original duration unless a dialogue cue needs the contractual
-    minimum; starts are then moved by the smallest aggregate amount that can
-    satisfy ordering, non-overlap, and frame-gap constraints. Dense rapid-dialogue
-    groups borrow capacity from the nearest surrounding pauses instead of leaving
-    an illegal child for final QC. No text or cue-specific rule is involved.
+    keeps its source-derived duration, and starts are moved only by the smallest
+    amount needed to satisfy ordering, non-overlap, and frame-gap constraints.
+    Reading-speed and minimum-duration remediation belong to the earlier CPS/QC
+    stages; this final lattice pass must never lengthen every cue and cascade the
+    whole program away from measured speech. No text rewrite is involved.
     """
     if not cues:
         return cues
@@ -85,24 +85,15 @@ def normalize_cue_timing(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     original = []
     durations = []
     desired_starts = []
-    max_cps = max(1, int(get_rule("CUSTOM_MAX_CPS", "17") or 17))
-    max_duration_f = max(1, ms_to_frame(int(get_rule("CUSTOM_MAX_DISPLAY_MS", "7000") or 7000), "floor"))
-    measurement = str(get_rule("CPS_MEASUREMENT", "characters") or "characters").strip().lower()
     for cue in cues:
         start_f = ms_to_frame(int(cue.get("start_ms", 0)), "nearest")
         end_f = ms_to_frame(int(cue.get("end_ms", 0)), "nearest")
-        raw_duration = max(1, end_f - start_f)
-        duration = raw_duration
-        if cue.get("type", "dialogue") == "dialogue":
-            delivered = " ".join(str(line) for line in (cue.get("lines") or [])).strip()
-            if measurement == "characters_no_spaces":
-                units = len("".join(delivered.split()))
-            elif measurement == "words":
-                units = len(delivered.split())
-            else:
-                units = len(delivered)
-            cps_required_f = ceil(Fraction(units, max_cps) * frame_rate()) if units else min_f
-            duration = max(raw_duration, min_f, min(cps_required_f, max_duration_f))
+        # Frame normalization owns lattice projection only. CPS extension already
+        # ran upstream, bounded by real idle gaps; unresolved minimum-duration or
+        # reading-speed defects are intentionally left for blocking QC. Growing
+        # durations here would push every successor later and detach captions
+        # from measured speech.
+        duration = max(1, end_f - start_f)
         original.append((start_f, end_f))
         durations.append(duration)
         desired_starts.append(Fraction(start_f + end_f - duration, 2))
