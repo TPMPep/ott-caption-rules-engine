@@ -461,7 +461,10 @@ def normalize_scribe_result(raw: Dict[str, Any]) -> Dict[str, Any]:
         "utterances": finalized,
         "words": flat_words,
         "audio_events": audio_events,
-        # Provider fingerprint — survives all the way to the auditor row.
+        # Canonical provider fingerprint consumed by timing repair + audit.
+        "transcription_provider": "elevenlabs",
+        "transcription_model": SCRIBE_MODEL_ID,
+        # Back-compat aliases retained for older readers.
         "_provider": "elevenlabs",
         "_model_id": SCRIBE_MODEL_ID,
     }
