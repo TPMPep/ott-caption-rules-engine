@@ -18,6 +18,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from .immutable import freeze
+from .timing_repair import repair_word_timings_with_summary
+
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2"
 
@@ -241,20 +244,116 @@ def fetch_srt(transcript_id: str) -> str:
 
 
 def build_word_timestamps_from_result(assembly_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # ── CLASS A TIMING-DATA INTEGRITY (Phase 1) ──────────────────────────────
+    # Repair implausible provider word timings on the NORMALIZED result BEFORE
+    # tokenization, so NO downstream stage (segmentation → shaping → optimizer →
+    # readability → condensation → QC → export) ever sees a corrupt frame (the
+    # 14,340ms "There" fan-out class). Runs EXACTLY ONCE here, before BOTH token
+    # builders (_build_tokens_from_utterances / _build_tokens_from_words) which
+    # read this same repaired stream. Provider/model-specific + versioned
+    # (ElevenLabs Scribe v2 only); a no-op for every other provider and every
+    # already-plausible word — non-Scribe output is byte-identical.
+    #
+    # WHERE EVIDENCE LIVES vs WHERE REPAIRED/QUARANTINED TIMING LIVES:
+    #   • The immutable baseline JSON on S3 is NEVER touched — only this in-memory
+    #     normalized stream is mutated.
+    #   • ORIGINAL provider values (start/end/duration) are preserved on each
+    #     word's `timing_anomaly` audit block (the evidence layer).
+    #   • A REPAIRED word's new (shortened) end is written onto the word's
+    #     start/end — the effective timing the tokens inherit.
+    #   • A QUARANTINED word's end is NEUTRALIZED to a zero-width point (end:=start)
+    #     and the word is stamped timing_quarantined=True, so it can never distort
+    #     a cue window, pause gap, or shaper midpoint. Its text + order survive.
+    # The per-run summary (detected/repaired/quarantined) is stashed on the result
+    # under `_timing_repair_summary` so the ingester/formatter can surface an
+    # operator-visible review signal when quarantined > 0. See services.timing_repair.
+    # SOC 2 CC7.4 / CC8.1.
+    _prov = (assembly_result.get("transcription_provider")
+             or assembly_result.get("_provider") or "")
+    _model = (assembly_result.get("transcription_model")
+              or assembly_result.get("model")
+              or assembly_result.get("_model_id") or "")
+    if assembly_result.get("utterances"):
+        _summary = repair_word_timings_with_summary(
+            assembly_result["utterances"], provider=_prov, model=_model)
+        # Timing integrity is load-bearing: never silently bypass this pass.
+        # A missing module or execution error fails the job before any malformed
+        # timing can reach segmentation or a deliverable.
+        assembly_result["_timing_repair_summary"] = _summary
+
+    # ── TRANSCRIPTION PROVENANCE (immutable, monotonic through the pipeline) ──
+    # Provider/model/version/job-id are TRANSCRIPTION provenance — they become
+    # known HERE, at normalization, and nowhere earlier. We build ONE frozen
+    # (genuinely read-only) provenance object at this origin and stamp it by
+    # shared reference onto every token — a downstream write physically raises
+    # TypeError rather than silently corrupting the run. Segmentation carries it
+    # forward unchanged; the formatter
+    # forwards it unchanged; Segmentation QC copies the relevant fields into
+    # unresolved-group evidence. A small object (not standalone provider/model
+    # fields) so future transcription-provenance attributes never force a schema
+    # revisit downstream. SOC 2 CC8.1 — the provenance chain is complete + honest
+    # from the point transcription provenance first exists.
+    provenance = build_transcription_provenance(assembly_result)
+
     words = assembly_result.get("words") or []
     utterances = assembly_result.get("utterances") or []
     if utterances:
         # Preferred path: utterances carry the diarized speaker; each word
         # inherits its parent utterance's speaker. This is the speaker-correct
         # source of truth (FCC 47 CFR §79.1 — speaker identification).
-        return _build_tokens_from_utterances(utterances)
+        return _build_tokens_from_utterances(utterances, provenance)
     # Fallback path: only a flat word array is available. Some providers /
     # stored baselines leave per-word `speaker` null even when utterance-level
     # diarization existed. Reconcile word speakers from the utterance time
     # windows so the downstream segmenter still sees real speaker boundaries
     # (the dash / one-speaker-per-line rules depend on this). SOC 2 CC8.1 —
     # speaker identity is never silently lost on the fallback path.
-    return _build_tokens_from_words(words, utterances)
+    return _build_tokens_from_words(words, utterances, provenance)
+
+
+# =============================================================================
+# Transcription provenance — the immutable object attached to every token.
+# =============================================================================
+# Versioned so a later schema extension (a new provenance attribute) never
+# retro-changes the audit meaning of an existing object, and downstream
+# consumers can distinguish versions deterministically rather than sniffing for
+# optional fields. Bump ONLY when the provenance object's SHAPE changes.
+TRANSCRIPTION_PROVENANCE_VERSION = 1
+
+
+def build_transcription_provenance(assembly_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the immutable transcription-provenance object from the normalized
+    result. Provider/model/version/job-id are the provenance that becomes known
+    at normalization; each field is honestly None when the provider did not
+    supply it (never fabricated). The object travels UNCHANGED through
+    segmentation → formatter → Segmentation QC. SOC 2 CC8.1."""
+    def _clean(v: Any) -> Optional[str]:
+        s = str(v).strip() if v is not None else ""
+        return s or None
+
+    provider = _clean(assembly_result.get("transcription_provider")
+                      or assembly_result.get("_provider"))
+    model = _clean(assembly_result.get("transcription_model")
+                   or assembly_result.get("model"))
+    provider_version = _clean(assembly_result.get("transcription_provider_version")
+                              or assembly_result.get("provider_version"))
+    job_id = _clean(assembly_result.get("transcription_job_id")
+                    or assembly_result.get("id"))
+    confidence_source = _clean(assembly_result.get("confidence_source"))
+    # ENFORCED IMMUTABILITY (not merely documented). The provenance object is
+    # stamped by SHARED REFERENCE onto every token in the run, so a single
+    # accidental write anywhere downstream would corrupt provenance for the
+    # whole run. `freeze` returns a genuinely read-only FrozenDict whose every
+    # mutating operation raises TypeError — correctness never depends on each
+    # consumer honoring immutability. SOC 2 CC8.1.
+    return freeze({
+        "provenance_version": TRANSCRIPTION_PROVENANCE_VERSION,
+        "provider": provider,
+        "model": model,
+        "provider_version": provider_version,
+        "transcription_job_id": job_id,
+        "confidence_source": confidence_source,
+    })
 
 
 def _reconcile_word_speaker(
@@ -279,6 +378,7 @@ def _reconcile_word_speaker(
 def _build_tokens_from_words(
     words: List[Dict[str, Any]],
     utterances: Optional[List[Dict[str, Any]]] = None,
+    provenance: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     # Pre-build utterance time-windows once so per-word reconciliation is O(1)
     # amortised — never re-scans utterances per word. Each window carries its
@@ -314,21 +414,30 @@ def _build_tokens_from_words(
         text = (word.get("text") or "").strip()
         if not text:
             continue
-        start_ms = int(word.get("start", 0))
-        end_ms = int(word.get("end", start_ms))
+        raw_start = word.get("start")
+        raw_end = word.get("end")
+        start_ms = int(raw_start) if raw_start is not None else None
+        end_ms = int(raw_end) if raw_end is not None else None
         speaker = word.get("speaker")
-        # Backfill a missing word-level speaker from the utterance windows so
-        # the segmenter sees real speaker boundaries even when the provider /
-        # stored baseline left per-word speaker null.
-        if speaker is None and utterance_windows:
+        # Backfill identity only from trustworthy effective timing. A quarantined
+        # word stays untimed; its original provider values remain audit evidence.
+        if speaker is None and utterance_windows and start_ms is not None and end_ms is not None:
             speaker = _reconcile_word_speaker(start_ms, end_ms, utterance_windows)
+        source_utt = (_reconcile_word_utterance_id(start_ms, end_ms)
+                      if start_ms is not None and end_ms is not None else None)
         tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms,
                        "speaker": speaker,
-                       "source_utterance_id": _reconcile_word_utterance_id(start_ms, end_ms)})
+                       "source_utterance_id": source_utt,
+                       "timing_quarantined": bool(word.get("timing_quarantined", False)),
+                       "timing_anomaly": word.get("timing_anomaly"),
+                       "transcription_provenance": provenance})
     return tokens
 
 
-def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_tokens_from_utterances(
+    utterances: List[Dict[str, Any]],
+    provenance: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     tokens: List[Dict[str, Any]] = []
     for utt_index, utterance in enumerate(utterances):
         utt_speaker = utterance.get("speaker")
@@ -344,8 +453,10 @@ def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict
             text = (word.get("text") or "").strip()
             if not text:
                 continue
-            start_ms = int(word.get("start", 0))
-            end_ms = int(word.get("end", start_ms))
+            raw_start = word.get("start")
+            raw_end = word.get("end")
+            start_ms = int(raw_start) if raw_start is not None else None
+            end_ms = int(raw_end) if raw_end is not None else None
             # Speaker precedence: the word's OWN speaker wins when present
             # (post-fix Scribe baselines carry it on every word); otherwise
             # inherit the utterance's authoritative speaker. A word can NEVER
@@ -356,7 +467,10 @@ def _build_tokens_from_utterances(utterances: List[Dict[str, Any]]) -> List[Dict
             if speaker is None:
                 speaker = utt_speaker
             tokens.append({"text": text, "start_ms": start_ms, "end_ms": end_ms,
-                           "speaker": speaker, "source_utterance_id": utt_index})
+                           "speaker": speaker, "source_utterance_id": utt_index,
+                           "timing_quarantined": bool(word.get("timing_quarantined", False)),
+                           "timing_anomaly": word.get("timing_anomaly"),
+                           "transcription_provenance": provenance})
     return tokens
 
 
@@ -547,7 +661,18 @@ def extract_audio_events_from_assembly_result(result: Dict[str, Any]) -> List[Di
 
 def merge_and_dedup_tokens(spoken: List[Dict[str, Any]], sound: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged = spoken + sound
-    merged.sort(key=lambda x: (x["start_ms"], x["end_ms"], x["text"]))
+
+    def _source_order(token: Dict[str, Any]) -> Tuple[int, int, str]:
+        anomaly = token.get("timing_anomaly") or {}
+        start = token.get("start_ms")
+        end = token.get("end_ms")
+        # Untimed quarantined words retain their original positions for linguistic
+        # ordering only; those values never re-enter timing calculations.
+        order_start = start if start is not None else anomaly.get("original_start_ms", 0)
+        order_end = end if end is not None else anomaly.get("original_end_ms", order_start)
+        return int(order_start), int(order_end), str(token.get("text", ""))
+
+    merged.sort(key=_source_order)
     deduped: List[Dict[str, Any]] = []
     seen = set()
     for tok in merged:
