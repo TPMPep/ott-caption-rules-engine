@@ -78,7 +78,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.36.0-deterministic-reformat-no-editorial-ai"
+VERSION = "5.37.0-measured-start-floor"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
