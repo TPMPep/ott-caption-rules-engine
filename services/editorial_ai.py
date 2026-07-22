@@ -42,6 +42,8 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from .rules import get_rule as _rule_get
+
 _WORD_RE = re.compile(r"\b[\w']+\b")
 _STYLE_TAG_RE = re.compile(r"\{\\+an\d\}")
 _ITALIC_TAG_RE = re.compile(r"</?i>")
@@ -59,7 +61,7 @@ except Exception:
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+    raw = _rule_get(name)
     if raw is None or raw == "":
         return default
     try:
@@ -77,7 +79,7 @@ def _max_chars() -> int:
 
 
 def _speaker_label_mode() -> str:
-    return (os.getenv("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
+    return (_rule_get("SPEAKER_LABEL_MODE", "") or "dash").strip().lower()
 
 
 def _build_system_prompt(max_lines: int, max_chars: int, speaker_mode: str) -> str:
@@ -110,7 +112,7 @@ def _build_system_prompt(max_lines: int, max_chars: int, speaker_mode: str) -> s
         parts.append("If there are multiple speaker runs, prefix each speaker's line with their "
                      "letter label followed by a colon (e.g. 'A: Hello' / 'B: Hi there').")
     elif speaker_mode == "generic":
-        gp = os.getenv("SPEAKER_GENERIC_PREFIX", "SPEAKER") or "SPEAKER"
+        gp = _rule_get("SPEAKER_GENERIC_PREFIX", "SPEAKER") or "SPEAKER"
         parts.append(f"If there are multiple speaker runs, prefix each speaker's line with "
                      f"'{gp} N:' where N is the speaker number.")
     elif speaker_mode == "named":
@@ -124,12 +126,29 @@ def _build_system_prompt(max_lines: int, max_chars: int, speaker_mode: str) -> s
     return " ".join(parts)
 
 
+# DESIGN A determinism guard. process_caption_job NEVER calls this on the
+# reformat_from_baseline path (allow_editorial_ai=False), so no OpenAI call can
+# occur on Apply Spec. This module-level flag lets the deterministic-reformat
+# acceptance harness assert the guarantee at the SOURCE — the test sets it True
+# and fails LOUD if the reformat path ever reaches editorial_refine_cues. It is
+# a test hook + belt-and-suspenders runtime guard, NOT the primary control (the
+# primary control is the allow_editorial_ai gate in formatter.process_caption_job).
+# Default False = normal production behavior (transcription/authoring may polish).
+FORBID_EDITORIAL_AI = False
+
+
 def editorial_refine_cues(
     cues: List[Dict[str, Any]],
     protected_phrases: List[str],
     heartbeat: Optional[Callable[[int, int], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Apply the optional editorial-AI polish pass to dialogue cues.
+
+    DESIGN A: if FORBID_EDITORIAL_AI is set (deterministic-reformat acceptance
+    context), reaching this function is a contract breach — raise immediately so
+    an accidental call on the reformat path is caught as a hard failure, never a
+    silent OpenAI invocation. SOC 2 CC8.1 — the no-AI guarantee is enforced, not
+    merely logged.
 
     Args:
         cues: Rules-engine output cues. Non-dialogue cues pass through.
@@ -144,6 +163,11 @@ def editorial_refine_cues(
         List of cues. AI-improved where successful, original where not.
         Length always equals len(cues) — no cues are dropped.
     """
+    if FORBID_EDITORIAL_AI:
+        raise RuntimeError(
+            "editorial_refine_cues called while FORBID_EDITORIAL_AI is set — the "
+            "deterministic reformat path must never invoke the editorial-AI stage."
+        )
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return cues
