@@ -1,0 +1,104 @@
+{
+  "_readme": "IMMUTABLE baseline fixture for the Design A reformat determinism acceptance harness (test_reformat_determinism.py). This is the {utterances, words, audio_events} shape main.baseline_to_assembly_result consumes — the SAME shape Base44 persists at cc-baselines/{project_id}/aai-baseline.json and the engine fetches on a reformat_from_baseline run. FROZEN CONTRACT: do not hand-edit as a scratch fixture. Editing it changes the acceptance baseline and MUST be a deliberate, reviewed change (a new expected canonical output hash). It deliberately mixes: multi-sentence utterances (drive shaping + sequence-optimizer resegmentation), a hard inter-utterance pause (>=1200ms → immutable boundary, the 'Cookie?' class), a distinct second speaker (dash grouping), and a native music audio_event (non-dialogue coverage). Word timings are real so boundaries land on measured word ends, not interpolation. SOC 2 CC8.1.",
+  "language_code": "en",
+  "transcription_provider": "elevenlabs",
+  "audio_duration_sec": 22.0,
+  "utterances": [
+    {
+      "source_utterance_id": 1,
+      "speaker": "A",
+      "start": 0,
+      "end": 4200,
+      "text": "Now, today's story is about a father who was obsessed with buying antiques.",
+      "words": [
+        { "text": "Now,", "start": 0, "end": 360 },
+        { "text": "today's", "start": 360, "end": 820 },
+        { "text": "story", "start": 820, "end": 1180 },
+        { "text": "is", "start": 1180, "end": 1360 },
+        { "text": "about", "start": 1360, "end": 1720 },
+        { "text": "a", "start": 1720, "end": 1820 },
+        { "text": "father", "start": 1820, "end": 2260 },
+        { "text": "who", "start": 2260, "end": 2460 },
+        { "text": "was", "start": 2460, "end": 2680 },
+        { "text": "obsessed", "start": 2680, "end": 3260 },
+        { "text": "with", "start": 3260, "end": 3480 },
+        { "text": "buying", "start": 3480, "end": 3860 },
+        { "text": "antiques.", "start": 3860, "end": 4200 }
+      ]
+    },
+    {
+      "source_utterance_id": 2,
+      "speaker": "A",
+      "start": 4600,
+      "end": 8200,
+      "text": "He spent every weekend at flea markets, and he never once asked what we needed.",
+      "words": [
+        { "text": "He", "start": 4600, "end": 4780 },
+        { "text": "spent", "start": 4780, "end": 5100 },
+        { "text": "every", "start": 5100, "end": 5460 },
+        { "text": "weekend", "start": 5460, "end": 5900 },
+        { "text": "at", "start": 5900, "end": 6040 },
+        { "text": "flea", "start": 6040, "end": 6320 },
+        { "text": "markets,", "start": 6320, "end": 6820 },
+        { "text": "and", "start": 6820, "end": 7000 },
+        { "text": "he", "start": 7000, "end": 7160 },
+        { "text": "never", "start": 7160, "end": 7500 },
+        { "text": "once", "start": 7500, "end": 7760 },
+        { "text": "asked", "start": 7760, "end": 8040 },
+        { "text": "what", "start": 8040, "end": 8180 },
+        { "text": "we", "start": 8180, "end": 8260 },
+        { "text": "needed.", "start": 8260, "end": 8600 }
+      ]
+    },
+    {
+      "source_utterance_id": 3,
+      "speaker": "B",
+      "start": 9200,
+      "end": 11400,
+      "text": "That's not fair. He was doing his best for us.",
+      "words": [
+        { "text": "That's", "start": 9200, "end": 9560 },
+        { "text": "not", "start": 9560, "end": 9780 },
+        { "text": "fair.", "start": 9780, "end": 10100 },
+        { "text": "He", "start": 10100, "end": 10280 },
+        { "text": "was", "start": 10280, "end": 10460 },
+        { "text": "doing", "start": 10460, "end": 10780 },
+        { "text": "his", "start": 10780, "end": 10960 },
+        { "text": "best", "start": 10960, "end": 11220 },
+        { "text": "for", "start": 11220, "end": 11340 },
+        { "text": "us.", "start": 11340, "end": 11500 }
+      ]
+    },
+    {
+      "source_utterance_id": 4,
+      "speaker": "B",
+      "start": 12000,
+      "end": 13400,
+      "text": "Not as much, but I'm easier to handle.",
+      "words": [
+        { "text": "Not", "start": 12000, "end": 12220 },
+        { "text": "as", "start": 12220, "end": 12360 },
+        { "text": "much,", "start": 12360, "end": 12680 },
+        { "text": "but", "start": 12680, "end": 12860 },
+        { "text": "I'm", "start": 12860, "end": 13060 },
+        { "text": "easier", "start": 13060, "end": 13360 },
+        { "text": "to", "start": 13360, "end": 13480 },
+        { "text": "handle.", "start": 13480, "end": 13800 }
+      ]
+    },
+    {
+      "source_utterance_id": 5,
+      "speaker": "B",
+      "start": 15260,
+      "end": 16060,
+      "text": "Cookie?",
+      "words": [
+        { "text": "Cookie?", "start": 15260, "end": 16060 }
+      ]
+    }
+  ],
+  "words": [],
+  "audio_events": [
+    { "event_type": "music", "start": 18000, "end": 21000, "text": "gentle music" }
+  ]
+}
