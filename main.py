@@ -78,7 +78,7 @@ import urllib.request
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.38.0-scribe-timing-repair-wired"
+VERSION = "5.39.0-cue-placement-aware"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -416,6 +416,9 @@ def canonical_output_hash(cues: List[Dict[str, Any]], qc: Optional[Dict[str, Any
             "seg": [{"sp": str(s.get("speaker")), "t": str(s.get("text", ""))}
                     for s in seg if s and s.get("speaker") is not None],
             "rr": bool(c.get("speaker_review_required", False)),
+            # Screen placement is delivery-relevant (SCC PAC / VTT line / TTML
+            # region), so top↔bottom MUST change the canonical output hash.
+            "pos": c.get("position", "bottom") or "bottom",
             # LINE STRUCTURE — the explicit line array (count + exact text),
             # never a flattened join, so a re-line-break with identical joined
             # text is still detected as a different delivery.
