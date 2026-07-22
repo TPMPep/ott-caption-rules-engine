@@ -1,0 +1,51 @@
+{
+  "_readme": "SHARED engine↔JS parity vector. FROZEN CONTRACT. test_reformat_determinism.py (Python, services.canonical_hash via main.canonical_output_hash) and src/lib/__tests__/cc-reformat-determinism-parity.test.js (JS, canonicalDeliveryOutputHash) BOTH hash `cues`+`seg_qc` and MUST get `expected_canonical_output_hash` byte-for-byte. This is acceptance point 1: proof the two hashers agree on a known payload, not merely that their projections 'look equivalent'. To change: update the Python authority, re-run pytest (it re-emits + asserts), update this file, and confirm both suites green.",
+  "cues": [
+    {
+      "type": "dialogue",
+      "start_ms": 0,
+      "end_ms": 1400,
+      "lines": ["- Now, today's story", "is about a father"],
+      "speaker_label": "A",
+      "speaker_segments": [],
+      "speaker_review_required": false
+    },
+    {
+      "type": "dialogue",
+      "start_ms": 9200,
+      "end_ms": 11500,
+      "lines": ["That's not fair."],
+      "speaker_label": "B",
+      "speaker_segments": [],
+      "speaker_review_required": false
+    },
+    {
+      "type": "music",
+      "start_ms": 18000,
+      "end_ms": 21000,
+      "lines": ["[GENTLE MUSIC]"],
+      "speaker_label": "",
+      "speaker_segments": [],
+      "speaker_review_required": false
+    }
+  ],
+  "seg_qc": {
+    "cue_summaries": [
+      {
+        "cue_id": "#0",
+        "segmentation_qc_status": "pass",
+        "segmentation_qc_highest_severity": "info",
+        "segmentation_qc_issue_codes": [],
+        "segmentation_qc_review_required": false
+      },
+      {
+        "cue_id": "#1",
+        "segmentation_qc_status": "warn",
+        "segmentation_qc_highest_severity": "warn",
+        "segmentation_qc_issue_codes": ["MICRO_CUE"],
+        "segmentation_qc_review_required": false
+      }
+    ]
+  },
+  "expected_canonical_output_hash": "a9732849209e7099ec416d242c6cee6b270e2cb9f3fca096c3aba260ce49fd9f"
+}
