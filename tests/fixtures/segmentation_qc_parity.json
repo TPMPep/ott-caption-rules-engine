@@ -1,0 +1,252 @@
+{
+  "fixture_schema_version": 1,
+  "policy_version": 2,
+  "max_remediation_attempts": 1,
+  "_README": "FROZEN, version-controlled parity contract for the deterministic Segmentation QC stage. Consumed byte-for-byte by BOTH engines: the JavaScript reference (src/lib/__tests__/cc-segmentation-qc.test.js via runSegmentationQc) AND the canonical Python authority (src/cc-rules-engine/tests/test_segmentation_qc_parity.py via services.segmentation_qc.run_segmentation_qc). This file is the SOURCE OF TRUTH — never regenerate it from either engine's output. Any change to it is a deliberate policy change that must bump fixture_schema_version and be reviewed. The fixtures store INPUTS + NORMALIZED expected outputs (plain JSON: arrays, not Python tuples / not JS frozen arrays). Both engines must normalize frozen `words` (Python tuple, JS Object.frozen array) to the same JSON array before comparison — the parity tests deep-freeze the group inputs to prove each reader tolerates immutable inputs and still emits identical JSON. policy_version MUST equal QC_POLICY_VERSION in both engines; max_remediation_attempts MUST equal QC_MAX_REMEDIATION_ATTEMPTS in both engines (locked at 1 — the Python authority's stricter, publication-safe posture). The behavioral effect of that cap is asserted INDIRECTLY through the unresolved-after-attempt fixtures (an over-CPS/flash cue with no room to remedy stays unresolved), never by comparing the numeric constant alone. SOC 2 CC8.1 / FCC 47 CFR 79.1.",
+  "rules": {
+    "line_rules": { "max_chars_per_line": 32, "max_lines_per_caption": 2, "min_gap_between_captions_ms": 80 },
+    "reading_speed_rules": { "max_cps": 17, "cps_measurement": "characters" },
+    "protected_phrases": ["andy cohen", "watch what happens live"]
+  },
+  "fixtures": [
+    {
+      "name": "no_issues",
+      "_desc": "A clean, well-timed cue produces zero issues and is exportable.",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Hello there my friend." }],
+      "unresolved_groups": [],
+      "expect": {
+        "technical_violations": [],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": []
+      }
+    },
+    {
+      "name": "ordinary_hard_issue_present",
+      "_desc": "A hard QC defect exists (flash cue under 400ms). Presence of the hard issue is asserted; whether it resolves is covered by the two cases below.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 200, "text": "Hi." },
+        { "id": "c2", "start_ms": 250, "end_ms": 2200, "text": "Right after." }
+      ],
+      "unresolved_groups": [],
+      "expect": {
+        "technical_violations": ["min_caption_duration_ms"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "unresolved" }
+        ]
+      }
+    },
+    {
+      "name": "hard_issue_resolved_first_attempt",
+      "_desc": "A flash cue WITH idle room before the next cue is resolved by the single bounded timing_extension attempt. review_required=false because the hard defect was corrected.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 200, "text": "Hi." },
+        { "id": "c2", "start_ms": 5000, "end_ms": 7000, "text": "Later on." }
+      ],
+      "unresolved_groups": [],
+      "expect": {
+        "technical_violations": ["min_caption_duration_ms"],
+        "review_required": false,
+        "export_blocked": false,
+        "issues": [
+          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "resolved" }
+        ]
+      }
+    },
+    {
+      "name": "hard_issue_unresolved_after_allowed_attempt",
+      "_desc": "A flash cue with NO idle room (next cue immediately after) cannot be remedied within the single allowed attempt (QC_MAX_REMEDIATION_ATTEMPTS=1) and stays unresolved -> export blocked. This is the fixture that asserts the attempt-cap behavior INDIRECTLY.",
+      "cues": [
+        { "id": "c1", "start_ms": 0, "end_ms": 200, "text": "Hi." },
+        { "id": "c2", "start_ms": 250, "end_ms": 2200, "text": "Right after." }
+      ],
+      "unresolved_groups": [],
+      "expect": {
+        "technical_violations": ["min_caption_duration_ms"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "unresolved" }
+        ]
+      }
+    },
+    {
+      "name": "one_unresolved_untimed_group",
+      "_desc": "A single all-untimed linguistic group is adjudicated into ONE UNRESOLVED_UNTIMED_CONTENT fail issue -> timing_completeness violation, export blocked. Provenance complete.",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Hello there my friend." }],
+      "unresolved_groups": [
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 7,
+          "words": ["Cookie", "?"],
+          "text": "Cookie ?",
+          "source_word_start": 5,
+          "source_word_end": 7,
+          "speaker": "A",
+          "source_utterance_id": 3,
+          "reason": "all_tokens_untimed",
+          "transcription_provenance": { "provider": "assemblyai", "model": "universal-3-5-pro", "provider_version": null, "transcription_job_id": "job123", "confidence_source": "word" }
+        }
+      ],
+      "expect": {
+        "technical_violations": ["timing_completeness"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" }
+        ],
+        "unresolved_evidence": [
+          {
+            "unresolved_group_id": "ug#0",
+            "segmentation_group_index": 7,
+            "unresolved_group_version": 1,
+            "text": "Cookie ?",
+            "text_truncated": false,
+            "original_text_length": 8,
+            "words": ["Cookie", "?"],
+            "word_count": 2,
+            "source_word_range": [5, 7],
+            "source_utterance_id": "3",
+            "speaker": "A",
+            "provider": "assemblyai",
+            "model": "universal-3-5-pro",
+            "provider_version": null,
+            "transcription_job_id": "job123",
+            "confidence_source": "word",
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          }
+        ]
+      }
+    },
+    {
+      "name": "multiple_unresolved_untimed_groups_routing_vs_segindex_and_provenance",
+      "_desc": "Two all-untimed groups. Asserts: (a) each yields its own fail issue; (b) deterministic ug#N routing IDs assigned in array order (ug#0, ug#1); (c) segmentation_group_index (2, 9) is DISTINCT from the routing ordinal (0, 1); (d) the second group has NO transcription_provenance -> provider/model/etc normalize to null (missing optional provenance).",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Ok." }],
+      "unresolved_groups": [
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 2,
+          "words": ["One"],
+          "text": "One",
+          "source_word_start": 1,
+          "source_word_end": 2,
+          "speaker": "A",
+          "source_utterance_id": 1,
+          "reason": "all_tokens_untimed",
+          "transcription_provenance": { "provider": "assemblyai", "model": "universal-3-5-pro", "provider_version": null, "transcription_job_id": "j1", "confidence_source": "word" }
+        },
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 9,
+          "words": ["Two", "words"],
+          "text": "Two words",
+          "source_word_start": 4,
+          "source_word_end": 6,
+          "speaker": "B",
+          "source_utterance_id": 2,
+          "reason": "all_tokens_untimed"
+        }
+      ],
+      "expect": {
+        "technical_violations": ["timing_completeness"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" },
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" }
+        ],
+        "unresolved_evidence": [
+          {
+            "unresolved_group_id": "ug#0",
+            "segmentation_group_index": 2,
+            "unresolved_group_version": 1,
+            "text": "One",
+            "text_truncated": false,
+            "original_text_length": 3,
+            "words": ["One"],
+            "word_count": 1,
+            "source_word_range": [1, 2],
+            "source_utterance_id": "1",
+            "speaker": "A",
+            "provider": "assemblyai",
+            "model": "universal-3-5-pro",
+            "provider_version": null,
+            "transcription_job_id": "j1",
+            "confidence_source": "word",
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          },
+          {
+            "unresolved_group_id": "ug#1",
+            "segmentation_group_index": 9,
+            "unresolved_group_version": 1,
+            "text": "Two words",
+            "text_truncated": false,
+            "original_text_length": 9,
+            "words": ["Two", "words"],
+            "word_count": 2,
+            "source_word_range": [4, 6],
+            "source_utterance_id": "2",
+            "speaker": "B",
+            "provider": null,
+            "model": null,
+            "provider_version": null,
+            "transcription_job_id": null,
+            "confidence_source": null,
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          }
+        ]
+      }
+    },
+    {
+      "name": "bounded_text_truncation",
+      "_desc": "An untimed group whose text far exceeds UNRESOLVED_TEXT_MAX_CHARS (2000). Asserts text is truncated to exactly 2000 chars, text_truncated=true, original_text_length preserved (2600), and words[] capped is not needed here (only 1 word). Hostile-input boundedness. text/original_text_length are computed by the test from the input to avoid embedding a 2600-char literal; see _text_repeat.",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Ok." }],
+      "unresolved_groups": [
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 0,
+          "_text_repeat": { "unit": "x", "count": 2600 },
+          "words": ["x"],
+          "source_word_start": 0,
+          "source_word_end": 1,
+          "reason": "all_tokens_untimed"
+        }
+      ],
+      "expect": {
+        "technical_violations": ["timing_completeness"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" }
+        ],
+        "unresolved_evidence": [
+          {
+            "unresolved_group_id": "ug#0",
+            "segmentation_group_index": 0,
+            "unresolved_group_version": 1,
+            "_text_expect": { "truncated_to": 2000, "unit": "x" },
+            "text_truncated": true,
+            "original_text_length": 2600,
+            "words": ["x"],
+            "word_count": 1,
+            "source_word_range": [0, 1],
+            "source_utterance_id": null,
+            "speaker": null,
+            "provider": null,
+            "model": null,
+            "provider_version": null,
+            "transcription_job_id": null,
+            "confidence_source": null,
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          }
+        ]
+      }
+    }
+  ]
+}
