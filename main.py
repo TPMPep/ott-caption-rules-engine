@@ -135,17 +135,25 @@ class CreateJobRequest(BaseModel):
     protected_phrases: Optional[List[str]] = None
     protectedPhrases: Optional[List[str]] = None  # camelCase alias
 
-    # ── Reformat-from-baseline mode (engine 5.0.0) ──────────────────────
+    # ── Reformat-from-baseline mode (Design A: DETERMINISTIC, no editorial-AI) ──
     # The auditor-grade re-format path. When `baselineUrl` is set, the engine
     # SKIPS transcription entirely: it fetches the immutable baseline JSON
     # (the same {utterances, words, audio_events} shape produced by Scribe/AAI
     # and persisted by Base44 at cc-baselines/{project_id}/aai-baseline.json),
-    # and runs the FULL formatting pipeline against it — including the
-    # editorial-AI grammar pass. This is what powers a spec swap (e.g. 32×2 →
-    # 42×3): the new spec geometry flows in via captionOptions/env, so the
-    # grammar-AI re-decides line breaks for the new width (killing orphan
-    # lines), NOT a crude mechanical re-wrap. Provider-agnostic — works for
-    # any baseline regardless of which provider originally transcribed it.
+    # and runs the DETERMINISTIC formatting pipeline against it — segmentation →
+    # shaping → sequence optimizer → readability → condensation → QC → export —
+    # with the non-deterministic editorial-AI (OpenAI) grammar pass EXPLICITLY
+    # SKIPPED (run_caption_job sets allow_editorial_ai = not reformat_from_baseline;
+    # process_caption_job then never calls editorial_refine_cues). This is what
+    # powers a spec swap (e.g. 32×2 → 42×3): the new spec geometry flows in via
+    # captionOptions/env, so the DETERMINISTIC line-breaker (linebreak.py)
+    # re-decides line breaks for the new width (killing orphan lines) — NOT an
+    # LLM and NOT a crude mechanical re-wrap. Because no LLM runs, the path is
+    # byte-reproducible: same baseline + same spec version + same overrides →
+    # identical canonical_output_hash on every run, across restarts and repeated
+    # dispatch, with zero OpenAI calls. Provider-agnostic — works for any
+    # baseline regardless of which provider originally transcribed it.
+    # SOC 2 CC8.1 — the reformat critical path is provably deterministic.
     #
     # baselineUrl is a short-TTL signed S3 GET URL (Base44 signs it; the
     # engine fetches it). We use a signed URL instead of an inline body so a
@@ -310,9 +318,114 @@ def _sha256_hex_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def baseline_content_hash(baseline: Dict[str, Any]) -> str:
+    """CANONICAL CONTENT hash of the immutable baseline — the DETERMINISM-IDENTITY
+    hash used in the deterministic input tuple (Design A, acceptance point 1).
+
+    Distinct from the artifact-byte hash (_sha256_hex_bytes): two byte-different
+    serializations of the SAME logical baseline (whitespace, key order, an added
+    non-content field like a re-sign timestamp) MUST yield the SAME content hash,
+    or a cosmetic re-serialization of S3 bytes would falsely read as a different
+    deterministic input. We therefore hash ONLY the delivery-relevant baseline
+    content in canonical order: every utterance's (source id, speaker, start,
+    end, text, ordered word timings) plus every audio event's (type, start, end,
+    text). Canonical via canonical_sha256 (sorted keys, NFC, fixed separators,
+    version-prefixed) so it is byte-identical in Python + JS. The byte hash is
+    ALSO recorded on the tuple (baseline_artifact_hash) for tamper evidence; the
+    CONTENT hash is what proves 'same logical baseline'. SOC 2 CC8.1."""
+    utterances = []
+    for u in (baseline.get("utterances") or []):
+        words = []
+        for w in (u.get("words") or []):
+            words.append({
+                "t": w.get("text", ""),
+                "s": w.get("start", w.get("start_ms")),
+                "e": w.get("end", w.get("end_ms")),
+            })
+        utterances.append({
+            "u": u.get("source_utterance_id", u.get("utterance_index")),
+            "sp": u.get("speaker"),
+            "s": u.get("start"),
+            "e": u.get("end"),
+            "t": u.get("text", ""),
+            "w": words,
+        })
+    audio_events = []
+    for ev in (baseline.get("audio_events") or []):
+        audio_events.append({
+            "et": ev.get("event_type") or ev.get("type"),
+            "s": ev.get("start", ev.get("start_ms")),
+            "e": ev.get("end", ev.get("end_ms")),
+            "t": ev.get("text", ""),
+        })
+    return canonical_sha256({
+        "kind": "cc_baseline_content",
+        "language_code": baseline.get("language_code"),
+        "utterances": utterances,
+        "audio_events": audio_events,
+    })
+
+
+def canonical_output_hash(cues: List[Dict[str, Any]], qc: Optional[Dict[str, Any]] = None) -> str:
+    """CANONICAL delivery-output hash covering ALL delivery-relevant fields in
+    canonical order (Design A, acceptance point 5). This is the reproducibility
+    probe: two deterministic runs of the same tuple MUST produce the same value.
+
+    Covers, per cue, in sequence order: cue index, cue type, start_ms, end_ms,
+    speaker_label, structured speaker_segments (per-line speaker attribution),
+    review-required flag, and the LINE STRUCTURE (the explicit lines[] array —
+    line count + each line's exact text, NOT a flattened string), plus the
+    relevant per-cue QC disposition (segmentation_qc status/severity/codes/
+    review from the engine's QC result when present). Deterministic via
+    canonical_sha256 (byte-identical to the JS mirror in ccIngestReformatResult).
+    SOC 2 CC8.1 — the delivered bytes are provably reproducible from the tuple."""
+    # Build a per-cue QC disposition lookup keyed by 0-based cue index, if the
+    # engine QC result is supplied. The engine's segmentation QC cue_summaries
+    # carry cue_id '#<0-based>'.
+    qc_by_index: Dict[int, Dict[str, Any]] = {}
+    if isinstance(qc, dict):
+        for summ in (qc.get("cue_summaries") or []):
+            cid = summ.get("cue_id")
+            if isinstance(cid, str) and cid.startswith("#"):
+                rest = cid[1:]
+                if rest.isdigit():
+                    qc_by_index[int(rest)] = summ
+
+    projected = []
+    for i, c in enumerate(cues):
+        lines = c.get("lines") or []
+        seg = c.get("speaker_segments") or []
+        summ = qc_by_index.get(i)
+        qc_disp = None
+        if summ:
+            qc_disp = {
+                "st": summ.get("segmentation_qc_status"),
+                "sev": summ.get("segmentation_qc_highest_severity"),
+                "codes": sorted([str(x) for x in (summ.get("segmentation_qc_issue_codes") or [])]),
+                "rr": bool(summ.get("segmentation_qc_review_required")),
+            }
+        projected.append({
+            "i": i,
+            "tp": c.get("type", "dialogue"),
+            "s": int(c.get("start_ms", 0)),
+            "e": int(c.get("end_ms", 0)),
+            "sp": c.get("speaker_label", "") or "",
+            "seg": [{"sp": str(s.get("speaker")), "t": str(s.get("text", ""))}
+                    for s in seg if s and s.get("speaker") is not None],
+            "rr": bool(c.get("speaker_review_required", False)),
+            # LINE STRUCTURE — the explicit line array (count + exact text),
+            # never a flattened join, so a re-line-break with identical joined
+            # text is still detected as a different delivery.
+            "lines": [str(ln) for ln in lines],
+            "qc": qc_disp,
+        })
+    return canonical_sha256({"kind": "cc_delivery_output", "cues": projected})
+
+
 def build_deterministic_inputs(
     *,
     baseline_hash: Optional[str],
+    baseline_artifact_hash: Optional[str],
     overlay_hash: Optional[str],
     spec_version: Any,
     spec_slug: Optional[str],
@@ -356,7 +469,13 @@ def build_deterministic_inputs(
         "overrides": {str(k): str(v) for k, v in (overrides_source or {}).items()},
     })
     return {
+        # baseline_hash IS the canonical CONTENT hash (the determinism-identity
+        # anchor, acceptance point 1). Two logically-identical baselines share it
+        # even if their S3 bytes differ cosmetically.
         "baseline_hash": baseline_hash,
+        # baseline_artifact_hash is the raw byte hash of the exact fetched S3
+        # object — tamper evidence, NOT part of the determinism identity.
+        "baseline_artifact_hash": baseline_artifact_hash,
         "overlay_hash": overlay_hash if overlay_hash else "NONE",
         "spec_slug": spec_slug,
         "spec_version": spec_version,
@@ -464,6 +583,7 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         # immutable baseline artifact the reformat operated on. SOC 2 CC8.1.
         allow_editorial_ai = not payload.get("reformat_from_baseline")
         baseline_hash: Optional[str] = None
+        baseline_artifact_hash: Optional[str] = None
         if payload.get("reformat_from_baseline"):
             # ── Reformat-from-baseline (Design A: DETERMINISTIC) ─────────
             # Skip transcription entirely. Fetch the immutable baseline JSON
@@ -484,7 +604,11 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
                        transcription_model=model_id)
             print(f"[{job_id}] Reformat-from-baseline (deterministic, no editorial-AI): fetching baseline JSON")
             baseline, baseline_raw = fetch_baseline_json(str(baseline_url))
-            baseline_hash = _sha256_hex_bytes(baseline_raw)
+            # Point 1: record BOTH hashes. The CONTENT hash is the determinism
+            # identity (goes into the tuple's baseline_hash); the ARTIFACT byte
+            # hash is tamper evidence (baseline_artifact_hash).
+            baseline_artifact_hash = _sha256_hex_bytes(baseline_raw)
+            baseline_hash = baseline_content_hash(baseline)
             assembly_result = baseline_to_assembly_result(baseline)
             print(f"[{job_id}] Baseline loaded: {len(assembly_result.get('utterances') or [])} utterances, "
                   f"{len(assembly_result.get('audio_events') or [])} audio events, "
@@ -623,12 +747,21 @@ def run_caption_job(job_id: str, payload: Dict[str, Any]) -> None:
         # consumed. editorial_mode records whether the LLM stage was permitted.
         caption_result["deterministic_inputs"] = build_deterministic_inputs(
             baseline_hash=baseline_hash,
+            baseline_artifact_hash=baseline_artifact_hash,
             overlay_hash=None,  # Phase 1: no overlay is ever applied → 'NONE'
             spec_version=env_overrides.get("SPEC_VERSION"),
             spec_slug=env_overrides.get("SPEC_SLUG"),
             overrides_source=env_overrides,
             editorial_mode=("ai_assist" if allow_editorial_ai else "deterministic"),
         )
+        # Point 5: the engine ALSO computes the canonical delivery-output hash
+        # over all delivery-relevant fields (sequence, type, timing, speaker,
+        # segments, line structure, per-cue QC disposition) and pins it on the
+        # result. The Base44 ingester persists this as the run's output_hash so
+        # the reproducibility probe is byte-identical Python↔JS. On a
+        # deterministic reformat, an identical tuple MUST reproduce this value.
+        caption_result["canonical_output_hash"] = canonical_output_hash(
+            caption_result.get("cues") or [], caption_result.get("segmentation_qc"))
 
         update_job(job_id, status="completed", stage="completed",
                    result=caption_result, error=None,
