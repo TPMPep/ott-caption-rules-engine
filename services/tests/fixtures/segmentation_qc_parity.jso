@@ -1,11 +1,8 @@
 {
-  "_comment": "FROZEN shared parity fixtures for Segmentation QC. Consumed by BOTH src/lib/__tests__/cc-segmentation-qc.test.js (JS reference) AND src/cc-rules-engine/tests/test_segmentation_qc_parity.py (Python canonical). For each fixture, both engines must produce a matching NORMALIZED public contract: sorted technical_violations, the set of {issue_code, severity, remediation_attempted (sorted), remediation_result} per issue, review_required, export_blocked, and segmentation_qc_policy_version. Internal debug fields (evidence blobs, metrics, hashes) are NOT compared — only the normalized contract. NEVER renumber issue codes. Timings chosen so remediation feasibility is deterministic across both engines.",
-  "policy_version": 1,
-  "policy_invariants": {
-    "_comment": "POLICY-VERSION-1 invariants asserted by BOTH suites (test_segmentation_qc_parity.py + cc-segmentation-qc.test.js). These are VERSIONED, not permanent semantic guarantees — a future QC_POLICY_VERSION may relax them, at which point the fixture's policy_version bumps and the assertions are updated.",
-    "review_required_count_equals_unresolved_count": true,
-    "note": "Under v1 a cue is review-required IFF it carries an unresolved hard defect, so the run rollup's segmentation_qc_review_required_count == segmentation_qc_unresolved_count. Both fields are persisted separately on CCFormatRun so this equality can diverge in a later policy with no schema migration."
-  },
+  "fixture_schema_version": 1,
+  "policy_version": 3,
+  "max_remediation_attempts": 1,
+  "_README": "FROZEN, version-controlled parity contract for the deterministic Segmentation QC stage. Consumed byte-for-byte by BOTH engines: the JavaScript reference (src/lib/__tests__/cc-segmentation-qc.test.js via runSegmentationQc) AND the canonical Python authority (src/cc-rules-engine/tests/test_segmentation_qc_parity.py via services.segmentation_qc.run_segmentation_qc). This file is the SOURCE OF TRUTH — never regenerate it from either engine's output. Any change to it is a deliberate policy change that must bump fixture_schema_version and be reviewed. The fixtures store INPUTS + NORMALIZED expected outputs (plain JSON: arrays, not Python tuples / not JS frozen arrays). Both engines must normalize frozen `words` (Python tuple, JS Object.frozen array) to the same JSON array before comparison — the parity tests deep-freeze the group inputs to prove each reader tolerates immutable inputs and still emits identical JSON. policy_version MUST equal QC_POLICY_VERSION in both engines; max_remediation_attempts MUST equal QC_MAX_REMEDIATION_ATTEMPTS in both engines (locked at 1 — the Python authority's stricter, publication-safe posture). The behavioral effect of that cap is asserted INDIRECTLY through the unresolved-after-attempt fixtures (an over-CPS/flash cue with no room to remedy stays unresolved), never by comparing the numeric constant alone. SOC 2 CC8.1 / FCC 47 CFR 79.1.",
   "rules": {
     "line_rules": { "max_chars_per_line": 32, "max_lines_per_caption": 2, "min_gap_between_captions_ms": 80 },
     "reading_speed_rules": { "max_cps": 17, "cps_measurement": "characters" },
@@ -13,58 +10,10 @@
   },
   "fixtures": [
     {
-      "name": "speaker_label_caused_cps_failure_unresolvable",
-      "note": "Label tips cue over CPS; next cue is immediate so timing extension cannot help. Hard, unresolved.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 1400, "text": "[JOHN:] twenty character line", "speaker_label": "JOHN", "speaker_id": "s1" },
-        { "id": "c2", "start_ms": 1500, "end_ms": 3000, "text": "next cue.", "speaker_label": "MARY", "speaker_id": "s2" }
-      ],
-      "expect": {
-        "technical_violations": ["max_cps"],
-        "review_required": true,
-        "export_blocked": true,
-        "issues": [
-          { "issue_code": "SPEAKER_LABEL_CAUSED_CPS_FAILURE", "severity": "fail", "remediation_attempted": ["line_reflow", "timing_extension"], "remediation_result": "unresolved" }
-        ]
-      }
-    },
-    {
-      "name": "speaker_label_caused_cps_failure_resolvable_by_extension",
-      "note": "Same over-CPS label cue but with a large idle gap before the next cue → timing extension resolves it.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 1400, "text": "[JOHN:] twenty character line", "speaker_label": "JOHN", "speaker_id": "s1" },
-        { "id": "c2", "start_ms": 9000, "end_ms": 10000, "text": "next cue.", "speaker_label": "MARY", "speaker_id": "s2" }
-      ],
-      "expect": {
-        "technical_violations": ["max_cps"],
-        "review_required": false,
-        "export_blocked": false,
-        "issues": [
-          { "issue_code": "SPEAKER_LABEL_CAUSED_CPS_FAILURE", "severity": "fail", "remediation_attempted": ["line_reflow", "timing_extension"], "remediation_result": "resolved" }
-        ]
-      }
-    },
-    {
-      "name": "speaker_label_caused_cpl_failure_resolvable_by_reflow",
-      "note": "Single-line label cue over CPL but with plenty of duration; a 2-line reflow fits both lines → resolved.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 6000, "text": "[MARY:] this line is just over the limit", "speaker_label": "MARY", "speaker_id": "s2" }
-      ],
-      "expect": {
-        "technical_violations": ["max_chars_per_line"],
-        "review_required": false,
-        "export_blocked": false,
-        "issues": [
-          { "issue_code": "SPEAKER_LABEL_CAUSED_CPL_FAILURE", "severity": "fail", "remediation_attempted": ["line_reflow", "shorter_label"], "remediation_result": "resolved" }
-        ]
-      }
-    },
-    {
-      "name": "protected_phrase_preserved_no_issue",
-      "note": "Phrase-safe layout used; phrase intact on one line. No protected-phrase issue at all.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "I had dinner with Andy Cohen\nat the restaurant." }
-      ],
+      "name": "no_issues",
+      "_desc": "A clean, well-timed cue produces zero issues and is exportable.",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Hello there my friend." }],
+      "unresolved_groups": [],
       "expect": {
         "technical_violations": [],
         "review_required": false,
@@ -73,58 +22,13 @@
       }
     },
     {
-      "name": "protected_phrase_geometry_conflict",
-      "note": "Phrase split across the line break AND no phrase-safe layout fits max_cpl → geometry conflict, unresolved.",
+      "name": "ordinary_hard_issue_present",
+      "_desc": "A hard QC defect exists (flash cue under 400ms). Presence of the hard issue is asserted; whether it resolves is covered by the two cases below.",
       "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "Tonight on Watch What\nHappens Live we discuss it" }
+        { "id": "c1", "start_ms": 0, "end_ms": 200, "text": "Hi." },
+        { "id": "c2", "start_ms": 250, "end_ms": 2200, "text": "Right after." }
       ],
-      "expect": {
-        "technical_violations": ["protected_phrase"],
-        "review_required": true,
-        "export_blocked": true,
-        "issues": [
-          { "issue_code": "PROTECTED_PHRASE_GEOMETRY_CONFLICT", "severity": "fail", "remediation_attempted": ["phrase_safe_reflow"], "remediation_result": "unresolved" }
-        ]
-      }
-    },
-    {
-      "name": "protected_phrase_split_avoidable_resolved",
-      "note": "Phrase split across line break BUT a phrase-safe layout fits → avoidable split, reflow resolves it.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "I met Andy\nCohen at the bar." }
-      ],
-      "expect": {
-        "technical_violations": ["protected_phrase"],
-        "review_required": false,
-        "export_blocked": false,
-        "issues": [
-          { "issue_code": "PROTECTED_PHRASE_SPLIT", "severity": "fail", "remediation_attempted": ["phrase_safe_reflow"], "remediation_result": "resolved" }
-        ]
-      }
-    },
-    {
-      "name": "flash_cue_resolvable",
-      "note": "Sub-400ms cue with idle room to extend past the flash floor → resolved.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 250, "text": "Hey!", "speaker_id": "s1" },
-        { "id": "c2", "start_ms": 5000, "end_ms": 6000, "text": "Later on.", "speaker_id": "s1" }
-      ],
-      "expect": {
-        "technical_violations": ["min_caption_duration_ms"],
-        "review_required": false,
-        "export_blocked": false,
-        "issues": [
-          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "resolved" }
-        ]
-      }
-    },
-    {
-      "name": "flash_cue_unresolvable",
-      "note": "Sub-400ms cue with an immediate next cue → no room to extend, unresolved.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 250, "text": "Hey!", "speaker_id": "s1" },
-        { "id": "c2", "start_ms": 300, "end_ms": 1500, "text": "Right now.", "speaker_id": "s1" }
-      ],
+      "unresolved_groups": [],
       "expect": {
         "technical_violations": ["min_caption_duration_ms"],
         "review_required": true,
@@ -135,63 +39,213 @@
       }
     },
     {
-      "name": "micro_cue_soft",
-      "note": "Between flash floor and micro floor → soft MICRO_CUE, non-blocking.",
+      "name": "hard_issue_resolved_first_attempt",
+      "_desc": "A flash cue WITH idle room before the next cue is resolved by the single bounded timing_extension attempt. review_required=false because the hard defect was corrected.",
       "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 800, "text": "A short line here.", "speaker_id": "s1" }
+        { "id": "c1", "start_ms": 0, "end_ms": 200, "text": "Hi." },
+        { "id": "c2", "start_ms": 5000, "end_ms": 7000, "text": "Later on." }
       ],
+      "unresolved_groups": [],
       "expect": {
-        "technical_violations": [],
+        "technical_violations": ["min_caption_duration_ms"],
         "review_required": false,
         "export_blocked": false,
         "issues": [
-          { "issue_code": "MICRO_CUE", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" }
+          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "resolved" }
         ]
       }
     },
     {
-      "name": "avoidable_fragment_soft",
-      "note": "Two-word incomplete fragment → soft AVOIDABLE_FRAGMENT, non-blocking. Long duration so no micro/flash overlap.",
+      "name": "hard_issue_unresolved_after_allowed_attempt",
+      "_desc": "A flash cue with NO idle room (next cue immediately after) cannot be remedied within the single allowed attempt (QC_MAX_REMEDIATION_ATTEMPTS=1) and stays unresolved -> export blocked. This is the fixture that asserts the attempt-cap behavior INDIRECTLY.",
       "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 3000, "text": "And I", "speaker_id": "s1" }
+        { "id": "c1", "start_ms": 0, "end_ms": 200, "text": "Hi." },
+        { "id": "c2", "start_ms": 250, "end_ms": 2200, "text": "Right after." }
       ],
+      "unresolved_groups": [],
       "expect": {
-        "technical_violations": [],
-        "review_required": false,
-        "export_blocked": false,
+        "technical_violations": ["min_caption_duration_ms"],
+        "review_required": true,
+        "export_blocked": true,
         "issues": [
-          { "issue_code": "AVOIDABLE_FRAGMENT", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" }
+          { "issue_code": "FLASH_CUE", "severity": "fail", "remediation_attempted": ["timing_extension"], "remediation_result": "unresolved" }
         ]
       }
     },
     {
-      "name": "reading_speed_imbalance_soft",
-      "note": "Adjacent same-speaker cues with a >2.2x CPS ratio → soft READING_SPEED_IMBALANCE.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 4000, "text": "Short.", "speaker_id": "s1" },
-        { "id": "c2", "start_ms": 4100, "end_ms": 5100, "text": "This one is packed with far more reading.", "speaker_id": "s1" }
+      "name": "one_unresolved_untimed_group",
+      "_desc": "A single all-untimed linguistic group is adjudicated into ONE UNRESOLVED_UNTIMED_CONTENT fail issue -> timing_completeness violation, export blocked. Provenance complete.",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Hello there my friend." }],
+      "unresolved_groups": [
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 7,
+          "words": ["Cookie", "?"],
+          "text": "Cookie ?",
+          "source_word_start": 5,
+          "source_word_end": 7,
+          "speaker": "A",
+          "source_utterance_id": 3,
+          "reason": "all_tokens_untimed",
+          "transcription_provenance": { "provider": "assemblyai", "model": "universal-3-5-pro", "provider_version": null, "transcription_job_id": "job123", "confidence_source": "word" }
+        }
       ],
       "expect": {
-        "technical_violations": [],
-        "review_required": false,
-        "export_blocked": false,
+        "technical_violations": ["timing_completeness"],
+        "review_required": true,
+        "export_blocked": true,
         "issues": [
-          { "issue_code": "OVERLOADED_UNDERFILLED_ADJACENCY", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" },
-          { "issue_code": "READING_SPEED_IMBALANCE", "severity": "warn", "remediation_attempted": [], "remediation_result": "flagged" }
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" }
+        ],
+        "unresolved_evidence": [
+          {
+            "unresolved_group_id": "ug#0",
+            "segmentation_group_index": 7,
+            "unresolved_group_version": 1,
+            "text": "Cookie ?",
+            "text_truncated": false,
+            "original_text_length": 8,
+            "words": ["Cookie", "?"],
+            "word_count": 2,
+            "source_word_range": [5, 7],
+            "source_utterance_id": "3",
+            "speaker": "A",
+            "provider": "assemblyai",
+            "model": "universal-3-5-pro",
+            "provider_version": null,
+            "transcription_job_id": "job123",
+            "confidence_source": "word",
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          }
         ]
       }
     },
     {
-      "name": "clean_no_issues",
-      "note": "A perfectly compliant cue → empty contract.",
-      "cues": [
-        { "id": "c1", "start_ms": 0, "end_ms": 3000, "text": "A clean readable line.", "speaker_id": "s1" }
+      "name": "multiple_unresolved_untimed_groups_routing_vs_segindex_and_provenance",
+      "_desc": "Two all-untimed groups. Asserts: (a) each yields its own fail issue; (b) deterministic ug#N routing IDs assigned in array order (ug#0, ug#1); (c) segmentation_group_index (2, 9) is DISTINCT from the routing ordinal (0, 1); (d) the second group has NO transcription_provenance -> provider/model/etc normalize to null (missing optional provenance).",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Ok." }],
+      "unresolved_groups": [
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 2,
+          "words": ["One"],
+          "text": "One",
+          "source_word_start": 1,
+          "source_word_end": 2,
+          "speaker": "A",
+          "source_utterance_id": 1,
+          "reason": "all_tokens_untimed",
+          "transcription_provenance": { "provider": "assemblyai", "model": "universal-3-5-pro", "provider_version": null, "transcription_job_id": "j1", "confidence_source": "word" }
+        },
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 9,
+          "words": ["Two", "words"],
+          "text": "Two words",
+          "source_word_start": 4,
+          "source_word_end": 6,
+          "speaker": "B",
+          "source_utterance_id": 2,
+          "reason": "all_tokens_untimed"
+        }
       ],
       "expect": {
-        "technical_violations": [],
-        "review_required": false,
-        "export_blocked": false,
-        "issues": []
+        "technical_violations": ["timing_completeness"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" },
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" }
+        ],
+        "unresolved_evidence": [
+          {
+            "unresolved_group_id": "ug#0",
+            "segmentation_group_index": 2,
+            "unresolved_group_version": 1,
+            "text": "One",
+            "text_truncated": false,
+            "original_text_length": 3,
+            "words": ["One"],
+            "word_count": 1,
+            "source_word_range": [1, 2],
+            "source_utterance_id": "1",
+            "speaker": "A",
+            "provider": "assemblyai",
+            "model": "universal-3-5-pro",
+            "provider_version": null,
+            "transcription_job_id": "j1",
+            "confidence_source": "word",
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          },
+          {
+            "unresolved_group_id": "ug#1",
+            "segmentation_group_index": 9,
+            "unresolved_group_version": 1,
+            "text": "Two words",
+            "text_truncated": false,
+            "original_text_length": 9,
+            "words": ["Two", "words"],
+            "word_count": 2,
+            "source_word_range": [4, 6],
+            "source_utterance_id": "2",
+            "speaker": "B",
+            "provider": null,
+            "model": null,
+            "provider_version": null,
+            "transcription_job_id": null,
+            "confidence_source": null,
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          }
+        ]
+      }
+    },
+    {
+      "name": "bounded_text_truncation",
+      "_desc": "An untimed group whose text far exceeds UNRESOLVED_TEXT_MAX_CHARS (2000). Asserts text is truncated to exactly 2000 chars, text_truncated=true, original_text_length preserved (2600), and words[] capped is not needed here (only 1 word). Hostile-input boundedness. text/original_text_length are computed by the test from the input to avoid embedding a 2600-char literal; see _text_repeat.",
+      "cues": [{ "id": "c1", "start_ms": 0, "end_ms": 2000, "text": "Ok." }],
+      "unresolved_groups": [
+        {
+          "unresolved_group_version": 1,
+          "segmentation_group_index": 0,
+          "_text_repeat": { "unit": "x", "count": 2600 },
+          "words": ["x"],
+          "source_word_start": 0,
+          "source_word_end": 1,
+          "reason": "all_tokens_untimed"
+        }
+      ],
+      "expect": {
+        "technical_violations": ["timing_completeness"],
+        "review_required": true,
+        "export_blocked": true,
+        "issues": [
+          { "issue_code": "UNRESOLVED_UNTIMED_CONTENT", "severity": "fail", "remediation_attempted": [], "remediation_result": "unresolved" }
+        ],
+        "unresolved_evidence": [
+          {
+            "unresolved_group_id": "ug#0",
+            "segmentation_group_index": 0,
+            "unresolved_group_version": 1,
+            "_text_expect": { "truncated_to": 2000, "unit": "x" },
+            "text_truncated": true,
+            "original_text_length": 2600,
+            "words": ["x"],
+            "word_count": 1,
+            "source_word_range": [0, 1],
+            "source_utterance_id": null,
+            "speaker": null,
+            "provider": null,
+            "model": null,
+            "provider_version": null,
+            "transcription_job_id": null,
+            "confidence_source": null,
+            "reason": "all_tokens_untimed",
+            "disposition": "unresolved_untimed"
+          }
+        ]
       }
     }
   ]
