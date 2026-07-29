@@ -50,13 +50,16 @@ QC_POLICY_VERSION).
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple
+
+from .timing_grid import is_on_grid, minimum_gap_frames, minimum_gap_ms
 
 # Versioned so a later policy change never retro-changes the audit meaning of a
 # stored verdict. Bump ONLY when the issue catalog / thresholds / remediation
 # contract change. MUST stay in lockstep with cc-segmentation-qc.js
 # QC_POLICY_VERSION so JS/Python parity fixtures agree.
-QC_POLICY_VERSION = 1
+QC_POLICY_VERSION = 3
 
 # Hard cap on bounded remediation attempts per cue window. One retry maximum:
 # the loop may make at most this many APPLIED remedy attempts regardless of how
@@ -67,9 +70,21 @@ QC_MAX_REMEDIATION_ATTEMPTS = 1
 # Stable machine-readable codes. NEVER renumber/rename — persisted on
 # CaptionCue.segmentation_qc_issue_codes + CCFormatRun.segmentation_qc_issue_counts
 # and asserted byte-for-byte by the JS/Python parity fixtures.
+QC_ISSUE_DURATION_BELOW_MIN = "DURATION_BELOW_MIN"
+QC_ISSUE_FRAME_GRID_MISALIGNMENT = "FRAME_GRID_MISALIGNMENT"
+QC_ISSUE_MIN_GAP_FRAMES = "MIN_GAP_FRAMES"
 QC_ISSUE_FLASH_CUE = "FLASH_CUE"
 QC_ISSUE_PROTECTED_PHRASE_SPLIT = "PROTECTED_PHRASE_SPLIT"
 QC_ISSUE_PROTECTED_PHRASE_GEOMETRY_CONFLICT = "PROTECTED_PHRASE_GEOMETRY_CONFLICT"
+# HARD. The delivered cue reads FASTER than the spec's max_cps for the ordinary
+# reason (the speaker simply spoke faster than the reading limit) — NOT because a
+# speaker label tipped it over (that is SPEAKER_LABEL_CAUSED_CPS_FAILURE). This is
+# the plain over-reading-speed floor: every genuinely-too-fast cue is caught here,
+# the bounded timing-extension remedy is attempted (grow into idle silence at head
+# OR tail), and if no safe extension resolves it the cue is left review-required so
+# the export gate blocks a clean export. The last-resort B1 floor — never a silent
+# over-CPS ship. FCC 47 CFR §79.1 (readability) / SOC 2 CC8.1.
+QC_ISSUE_CPS_OVER_MAX = "CPS_OVER_MAX"
 QC_ISSUE_SPEAKER_LABEL_CAUSED_CPS_FAILURE = "SPEAKER_LABEL_CAUSED_CPS_FAILURE"
 QC_ISSUE_SPEAKER_LABEL_CAUSED_CPL_FAILURE = "SPEAKER_LABEL_CAUSED_CPL_FAILURE"
 QC_ISSUE_SPEAKER_LABEL_UNRESOLVED = "SPEAKER_LABEL_UNRESOLVED"
@@ -82,8 +97,28 @@ QC_ISSUE_TIMING_PROVENANCE_MISSING = "TIMING_PROVENANCE_MISSING"
 QC_ISSUE_SEGMENTATION_PROVENANCE_MISSING = "SEGMENTATION_PROVENANCE_MISSING"
 QC_ISSUE_OPTIMIZER_BOUNDARY_VIOLATION = "OPTIMIZER_BOUNDARY_VIOLATION"
 QC_ISSUE_PROVENANCE_INCOMPLETE = "PROVENANCE_INCOMPLETE"
+# HARD + NON-OVERRIDABLE. A linguistic group whose EVERY source token had no
+# trustworthy timing (all quarantined/untimed) → it is excluded from every timed
+# cue and would be SILENTLY OMITTED from the exported deliverable. This is not a
+# quality imperfection (content present but imperfect) — it is MISSING content.
+# The export gate refuses it unconditionally (see NON_OVERRIDABLE_QC_CODES in
+# lib/cc-export-gate.js). FCC 47 CFR §79.1 / SOC 2 CC8.1.
+QC_ISSUE_UNRESOLVED_UNTIMED_CONTENT = "UNRESOLVED_UNTIMED_CONTENT"
+
+# ── Evidence bound constants (deterministic, hostile-input-safe) ─────────────
+# A malformed/oversized provider response must NEVER produce an unbounded issue
+# or database record. Every unresolved-group evidence field is clamped to these.
+UNRESOLVED_TEXT_MAX_CHARS = 2000       # preserve the text up to this; then truncate + flag
+UNRESOLVED_MAX_WORDS = 400             # cap on the words[] array length
+UNRESOLVED_ID_MAX_LEN = 128            # cap on any identifier string (speaker/utterance)
+UNRESOLVED_REASON_MAX_LEN = 64         # cap on the reason code string
 
 QC_SEVERITY = {
+    QC_ISSUE_CPS_OVER_MAX: "fail",
+    QC_ISSUE_DURATION_BELOW_MIN: "fail",
+    QC_ISSUE_FRAME_GRID_MISALIGNMENT: "fail",
+    QC_ISSUE_MIN_GAP_FRAMES: "fail",
+    QC_ISSUE_UNRESOLVED_UNTIMED_CONTENT: "fail",
     QC_ISSUE_FLASH_CUE: "fail",
     QC_ISSUE_PROTECTED_PHRASE_SPLIT: "fail",
     QC_ISSUE_PROTECTED_PHRASE_GEOMETRY_CONFLICT: "fail",
@@ -108,6 +143,10 @@ _SEVERITY_RANK = {"info": 0, "warn": 1, "fail": 2}
 # build technical_violations — the honest compliance surface that is NEVER
 # filtered by workflow disposition. Parity with cc-segmentation-qc.js ISSUE_TO_RULE.
 _ISSUE_TO_RULE = {
+    QC_ISSUE_CPS_OVER_MAX: "max_cps",
+    QC_ISSUE_DURATION_BELOW_MIN: "min_caption_duration_ms",
+    QC_ISSUE_FRAME_GRID_MISALIGNMENT: "frame_grid",
+    QC_ISSUE_MIN_GAP_FRAMES: "min_gap_between_captions_frames",
     QC_ISSUE_SPEAKER_LABEL_CAUSED_CPS_FAILURE: "max_cps",
     QC_ISSUE_SPEAKER_LABEL_CAUSED_CPL_FAILURE: "max_chars_per_line",
     QC_ISSUE_PROTECTED_PHRASE_GEOMETRY_CONFLICT: "protected_phrase",
@@ -115,12 +154,99 @@ _ISSUE_TO_RULE = {
     QC_ISSUE_FLASH_CUE: "min_caption_duration_ms",
     QC_ISSUE_MEANINGFUL_TEXT_REMOVED: "text_conservation",
     QC_ISSUE_OPTIMIZER_BOUNDARY_VIOLATION: "segmentation_boundary",
+    QC_ISSUE_UNRESOLVED_UNTIMED_CONTENT: "timing_completeness",
 }
+
+
+def _clamp_str(v: Any, limit: int) -> str:
+    """Coerce to str and hard-cap length. Deterministic; hostile-input-safe."""
+    s = str(v if v is not None else "")
+    return s[:limit]
+
+
+def build_unresolved_untimed_evidence(group: Dict[str, Any], routing_index: int) -> Dict[str, Any]:
+    """Bounded, deterministic evidence for ONE all-untimed linguistic group.
+
+    OWNERSHIP: the `group` is the IMMUTABLE unresolved-group object SEGMENTATION
+    owns (segmentation.build_unresolved_group). Segmentation QC READS its fields
+    and COPIES the relevant ones into bounded issue evidence — it never reinterprets
+    or augments the object. Two distinct index concepts are kept separate:
+      • `segmentation_group_index` — the group's INTRINSIC absolute index in
+        segmentation's output (read from the object, echoed for audit).
+      • `unresolved_group_id` (ug#N) — a QC ROUTING artifact assigned HERE from
+        `routing_index` (the ordinal AMONG unresolved groups). Never a cue id.
+
+    Provenance ONLY — never a timestamp, never a cue id. Every field is clamped so
+    a malformed/oversized provider response cannot bloat the issue or the row.
+    Transcription provenance (provider/model/version/job-id/confidence-source) is
+    copied from the object's immutable `transcription_provenance` block — the
+    monotonic chain that originated at normalization. SOC 2 CC8.1.
+    """
+    # Accept BOTH list and tuple — the immutable unresolved-group object freezes
+    # `words` to a tuple (FrozenDict deep-freeze), so a `list`-only guard would
+    # silently drop every word (word_count → 0). Any other type is rejected.
+    words = group.get("words")
+    words = list(words) if isinstance(words, (list, tuple)) else []
+    full_text = group.get("text")
+    if full_text is None:
+        full_text = " ".join(str(w) for w in words)
+    full_text = str(full_text)
+    original_len = len(full_text)
+    truncated = original_len > UNRESOLVED_TEXT_MAX_CHARS
+    text = full_text[:UNRESOLVED_TEXT_MAX_CHARS]
+    bounded_words = [str(w) for w in words[:UNRESOLVED_MAX_WORDS]]
+
+    # Absolute source-word offsets (half-open) owned by segmentation.
+    word_start = group.get("source_word_start")
+    word_end = group.get("source_word_end")
+    source_word_range = (
+        [int(word_start), int(word_end)]
+        if isinstance(word_start, int) and isinstance(word_end, int)
+        else None
+    )
+
+    # Transcription provenance copied from the immutable object (never fabricated).
+    # Accept any Mapping — the frozen unresolved-group nests a FrozenDict here,
+    # which is a collections.abc.Mapping but NOT a `dict`. A `dict`-only guard
+    # would silently discard real provenance (provider/model → None) the instant
+    # segmentation emits a frozen group. SOC 2 CC8.1 / FCC §79.1.
+    prov = group.get("transcription_provenance")
+    prov = prov if isinstance(prov, Mapping) else {}
+
+    seg_index = group.get("segmentation_group_index")
+
+    return {
+        # QC ROUTING identity — the ordinal among unresolved groups. Never a cue id.
+        "unresolved_group_id": f"ug#{routing_index}",
+        # INTRINSIC segmentation identity — echoed for audit, distinct from ug#N.
+        "segmentation_group_index": seg_index if isinstance(seg_index, int) else None,
+        # Schema version the object was emitted at (deterministic version pinning).
+        "unresolved_group_version": group.get("unresolved_group_version"),
+        # Preserved text (bounded) + truncation provenance.
+        "text": text,
+        "text_truncated": truncated,
+        "original_text_length": original_len,
+        "words": bounded_words,
+        "word_count": len(words),
+        # Non-temporal source locator (absolute word offsets from segmentation).
+        "source_word_range": source_word_range,
+        "source_utterance_id": _clamp_str(group.get("source_utterance_id"), UNRESOLVED_ID_MAX_LEN) or None,
+        "speaker": _clamp_str(group.get("speaker"), UNRESOLVED_ID_MAX_LEN) or None,
+        # Transcription provenance (copied from the immutable object).
+        "provider": _clamp_str(prov.get("provider"), UNRESOLVED_ID_MAX_LEN) or None,
+        "model": _clamp_str(prov.get("model"), UNRESOLVED_ID_MAX_LEN) or None,
+        "provider_version": _clamp_str(prov.get("provider_version"), UNRESOLVED_ID_MAX_LEN) or None,
+        "transcription_job_id": _clamp_str(prov.get("transcription_job_id"), UNRESOLVED_ID_MAX_LEN) or None,
+        "confidence_source": _clamp_str(prov.get("confidence_source"), UNRESOLVED_ID_MAX_LEN) or None,
+        "reason": _clamp_str(group.get("reason") or "all_tokens_untimed", UNRESOLVED_REASON_MAX_LEN),
+        "disposition": "unresolved_untimed",
+    }
 
 # Deterministic remedy operations the engine attempts per hard issue, in order.
 # NO AI. NO word deletion. Recorded even when a remedy fails so the audit shows
 # the bounded attempt set. Parity with cc-segmentation-qc.js attemptedOps().
 _REMEDIATION_OPS = {
+    QC_ISSUE_CPS_OVER_MAX: ["timing_extension"],
     QC_ISSUE_SPEAKER_LABEL_CAUSED_CPS_FAILURE: ["timing_extension", "line_reflow"],
     QC_ISSUE_SPEAKER_LABEL_CAUSED_CPL_FAILURE: ["line_reflow", "shorter_label"],
     QC_ISSUE_PROTECTED_PHRASE_GEOMETRY_CONFLICT: ["phrase_safe_reflow"],
@@ -476,6 +602,45 @@ def _extend_timing_for_cps(
     return None
 
 
+def _extend_timing_bidirectional_for_cps(
+    cue: Dict[str, Any],
+    prev_cue: Optional[Dict[str, Any]],
+    next_cue: Optional[Dict[str, Any]],
+    delivered_chars: int,
+    max_cps: int,
+    min_gap_ms: int,
+) -> Optional[Tuple[int, int]]:
+    """Return (new_start_ms, new_end_ms) that bring the DELIVERED cue within
+    max_cps by growing the window into idle silence at the TAIL first (preferred —
+    never moves the in-time), then, if still over, into idle silence at the HEAD.
+    Returns None when no safe extension in either direction is available.
+
+    Never overlaps a neighbour (honors min_gap on both sides), never shortens the
+    cue. Deterministic. This is the B1-floor free reducer — head-room the tail-only
+    extender left on the table is exactly what let a genuinely-over-CPS cue ship."""
+    if max_cps <= 0 or delivered_chars <= 0:
+        return None
+    required_dur = int((delivered_chars / max_cps) * 1000) + 1
+    start = int(cue.get("start_ms", 0) or 0)
+    end = int(cue.get("end_ms", 0) or 0)
+    cur_dur = max(1, end - start)
+    if required_dur <= cur_dur:
+        return None
+    # TAIL first — extend end into the gap before the next cue (no in-time move).
+    tail_ceiling = (int(next_cue.get("start_ms", 0)) - min_gap_ms) if next_cue else (start + required_dur)
+    new_end = min(start + required_dur, tail_ceiling)
+    new_end = max(new_end, end)  # never shorten
+    if (new_end - start) >= required_dur:
+        return (start, new_end)
+    # Still short → also pull the start earlier into leading idle silence.
+    head_floor = (int(prev_cue.get("end_ms", 0)) + min_gap_ms) if prev_cue else (new_end - required_dur)
+    new_start = max(new_end - required_dur, head_floor)
+    new_start = min(new_start, start)  # never move the in-time later
+    if (new_end - new_start) >= required_dur and new_start < start:
+        return (new_start, new_end)
+    return None
+
+
 # =============================================================================
 # Per-cue label-splitting
 # =============================================================================
@@ -533,7 +698,11 @@ def run_segmentation_qc(cues: List[Dict[str, Any]], rules: Optional[Dict[str, An
     reading_rules = spec_rules["reading_speed_rules"]
     max_cpl = int(line_rules.get("max_chars_per_line", 42) or 42)
     max_cps = int(reading_rules.get("max_cps", 17) or 17)
-    min_gap_ms = int(line_rules.get("min_gap_between_captions_ms", 80) or 80)
+    # The frame lattice is authoritative. A millisecond guide such as 83 ms at
+    # 25 fps resolves to two frames (80 ms); grading the projected 80 ms gap
+    # against the unprojected 83 ms number would falsely fail every legal pair.
+    min_gap_ms = minimum_gap_ms()
+    min_caption_ms = int(line_rules.get("min_caption_duration_ms", 800) or 800)
 
     provenance_expected = bool(rules.get("provenance_expected", False))
     original_word_bag = rules.get("original_word_bag")
@@ -557,6 +726,32 @@ def run_segmentation_qc(cues: List[Dict[str, Any]], rules: Optional[Dict[str, An
         next_cue = cue_list[i + 1] if i + 1 < len(cue_list) else None
         meta = cue.get("meta") or {}
         seq_op = (meta.get("seq_opt") or {}).get("operation")
+
+        # ── Contractual timing floor + frame-grid policy ───────────────────
+        if cue.get("type", "dialogue") == "dialogue" and duration_ms < min_caption_ms:
+            _push(cid, make_issue(
+                QC_ISSUE_DURATION_BELOW_MIN, cue_ids=[cid], window_index=i,
+                evidence={"duration_ms": duration_ms, "minimum_ms": min_caption_ms},
+                metrics={"duration_ms": duration_ms},
+                remediation_attempted=["local_group_recomposition"],
+                remediation_result="unresolved",
+            ))
+        if not is_on_grid(int(cue.get("start_ms", 0))) or not is_on_grid(int(cue.get("end_ms", 0))):
+            _push(cid, make_issue(
+                QC_ISSUE_FRAME_GRID_MISALIGNMENT, cue_ids=[cid], window_index=i,
+                evidence={"start_ms": cue.get("start_ms"), "end_ms": cue.get("end_ms")},
+                remediation_result="unresolved",
+            ))
+        if (next_cue is not None and cue.get("type", "dialogue") == "dialogue"
+                and next_cue.get("type", "dialogue") == "dialogue"):
+            actual_gap = int(next_cue.get("start_ms", 0)) - int(cue.get("end_ms", 0))
+            if actual_gap < min_gap_ms:
+                _push(cid, make_issue(
+                    QC_ISSUE_MIN_GAP_FRAMES, cue_ids=[cid, _cue_id(i + 1, next_cue)], window_index=i,
+                    evidence={"actual_gap_ms": actual_gap, "minimum_gap_ms": min_gap_ms,
+                              "minimum_gap_frames": minimum_gap_frames()},
+                    remediation_result="unresolved",
+                ))
 
         # ── Rhythm: flash + micro cue (every script incl. CJK) ──────────────
         if 0 < duration_ms < FLASH_CUE_MAX_MS:
@@ -661,6 +856,36 @@ def run_segmentation_qc(cues: List[Dict[str, Any]], rules: Optional[Dict[str, An
                     _remediate_label_cpl(issue, cue, label_prefix, dialogue_body, max_cpl)
                     _push(cid, issue)
 
+        # ── Plain over-CPS floor (hard) — the B1 last-resort gate ───────────
+        # The delivered cue reads faster than max_cps for the ORDINARY reason
+        # (spoken too fast), independent of any speaker label. This is the check
+        # that was missing: the label-CPS check above fires ONLY when the label
+        # itself tipped an otherwise-compliant cue over, so a cue that is over on
+        # its own merits reached export silently. Here every genuinely-too-fast
+        # dialogue cue is caught, the bounded bidirectional timing-extension remedy
+        # is attempted, and if no safe extension resolves it the cue is left
+        # review-required → the export gate blocks. All the safe upstream fixes
+        # (reflow, resegmentation, extend, spec-gated condense) already ran before
+        # QC; this is the honest floor after them. FCC §79.1 / SOC 2 CC8.1.
+        if cue.get("type", "dialogue") == "dialogue":
+            delivered_measure = measure_delivered_cue(_cue_text(cue), "", cue, spec_rules)
+            if delivered_measure["cps"] > max_cps:
+                issue = make_issue(
+                    QC_ISSUE_CPS_OVER_MAX, cue_ids=[cid], window_index=i,
+                    evidence={
+                        "cps": delivered_measure["cps"],
+                        "max_cps": max_cps,
+                        "delivered_chars": delivered_measure["chars"],
+                        "duration_ms": delivered_measure["duration_ms"],
+                    },
+                    metrics={"cps": delivered_measure["cps"]},
+                )
+                _remediate_cps_over_max(
+                    issue, cue,
+                    cue_list[i - 1] if i > 0 else None,
+                    next_cue, spec_rules, max_cps, min_gap_ms)
+                _push(cid, issue)
+
         # ── Meaningful-text removal (hard) ──────────────────────────────────
         # If an original spoken-word bag is supplied and the delivered sequence
         # dropped a meaningful (non-stopword) token that was NOT an attributed
@@ -697,6 +922,37 @@ def run_segmentation_qc(cues: List[Dict[str, Any]], rules: Optional[Dict[str, An
                     metrics={"ratio": hi_ch / lo_ch},
                     remediation_result="flagged",
                 ))
+
+    # ── Unresolved all-untimed groups (transient input from the formatter) ──
+    # Detection lives in segmentation; ADJUDICATION lives HERE. The formatter
+    # passes each all-untimed linguistic group (never a cue) via rules; we emit
+    # ONE canonical fail/unresolved issue per group. This is the ONLY persisted
+    # representation of the condition — there is no parallel unresolved_content
+    # channel. Each issue carries bounded provenance evidence and a NON-CUE
+    # identifier. Its severity=fail + remediation_result=unresolved drive
+    # has_unresolved_hard → review_required + export_blocked, exactly like every
+    # other hard segmentation defect. SOC 2 CC8.1 / FCC §79.1.
+    unresolved_groups = rules.get("unresolved_groups") or []
+    for routing_index, group in enumerate(unresolved_groups):
+        # Accept any Mapping — the immutable unresolved-group object segmentation
+        # emits is a FrozenDict (a collections.abc.Mapping, NOT a `dict`). A
+        # `dict`-only guard would SKIP every frozen group, silently omitting the
+        # UNRESOLVED_UNTIMED_CONTENT gate → untimed content ships unnoticed. This
+        # is the exact FCC §79.1 failure the gate exists to prevent. SOC 2 CC8.1.
+        if not isinstance(group, Mapping):
+            continue
+        # routing_index = the ordinal AMONG unresolved groups (drives ug#N).
+        # The group's INTRINSIC segmentation_group_index rides inside the object.
+        ev = build_unresolved_untimed_evidence(group, routing_index)
+        issue = make_issue(
+            QC_ISSUE_UNRESOLVED_UNTIMED_CONTENT,
+            cue_ids=[], window_index=None,
+            evidence=ev,
+            remediation_attempted=[], remediation_result="unresolved",
+        )
+        # Anchor on the group's non-cue identity so the per-cue rollup counts it
+        # without inventing a fake cue row. The key is the stable ug# id.
+        _push(ev["unresolved_group_id"], issue)
 
     # ── Assemble the canonical contract ─────────────────────────────────────
     technical_violations = sorted({
@@ -755,6 +1011,36 @@ def _remediate_flash(issue, cue, next_cue, spec_rules, cue_list, idx, min_gap_ms
                 issue["remediation_result"] = "resolved"
                 issue["evidence"]["resolved_by"] = op
                 issue["evidence"]["new_end_ms"] = candidate_end
+                return
+    issue["remediation_result"] = "unresolved"
+
+
+def _remediate_cps_over_max(issue, cue, prev_cue, next_cue, spec_rules,
+                            max_cps, min_gap_ms) -> None:
+    """Bounded remedy for a plain over-CPS cue: attempt a bidirectional timing
+    extension (grow into idle silence at tail, then head) and mark 'resolved'
+    only when the re-measured delivered CPS clears max_cps. Otherwise
+    'unresolved' → review_required + export_blocked (the B1 floor). One retry
+    max via the shared guard. No word change, no reflow — every words-changing /
+    resegmentation remedy already ran upstream before QC. SOC 2 CC7.4."""
+    guard = RemediationGuard()
+    ops = _REMEDIATION_OPS.get(QC_ISSUE_CPS_OVER_MAX, [])
+    issue["remediation_attempted"] = list(ops)
+    delivered = measure_delivered_cue(_cue_text(cue), "", cue, spec_rules)
+    extended = _extend_timing_bidirectional_for_cps(
+        cue, prev_cue, next_cue, delivered["chars"], max_cps, min_gap_ms)
+    if extended is not None:
+        new_start, new_end = extended
+        trial = {**cue, "start_ms": new_start, "end_ms": new_end}
+        state = window_state_hash([trial])
+        if guard.should_attempt(state, "timing_extension"):
+            guard.record(state, "timing_extension")
+            recheck = measure_delivered_cue(_cue_text(cue), "", trial, spec_rules)
+            if recheck["cps"] <= max_cps:
+                issue["remediation_result"] = "resolved"
+                issue["evidence"]["resolved_by"] = "timing_extension"
+                issue["evidence"]["new_start_ms"] = new_start
+                issue["evidence"]["new_end_ms"] = new_end
                 return
     issue["remediation_result"] = "unresolved"
 
