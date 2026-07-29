@@ -23,12 +23,19 @@ from .rules import activate_rule_context, reset_rule_context, get_rule as _rule_
 
 # Project imports with local fallbacks
 try:
-    from .rendering import render_lines as _render_lines, segments_from_runs as _segments_from_runs
+    from .rendering import (
+        render_lines as _render_lines,
+        segments_from_runs as _segments_from_runs,
+        resolve_speaker_display_name as _resolve_speaker_display_name,
+    )
 except Exception:
     # Defensive: must never crash a job. Falls back to a plain join. This
     # path should never fire in production (rendering.py ships with the engine).
     def _render_lines(words, speaker_runs, max_lines, max_chars, dialogue_text=None):
         return [dialogue_text if dialogue_text is not None else " ".join(words)]
+
+    def _resolve_speaker_display_name(raw):
+        return raw
 
     def _segments_from_runs(words, speaker_runs):
         if not speaker_runs:
@@ -664,7 +671,7 @@ def _structured_speaker_fields(c: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     if len(distinct_known) == 1:
-        return {"speaker_label": distinct_known[0]}
+        return {"speaker_label": _resolve_speaker_display_name(distinct_known[0])}
 
     # Legitimate multi-speaker cue — bounded per-run attribution + scalar primary.
     segments = _segments_from_runs(words, runs)
@@ -673,7 +680,7 @@ def _structured_speaker_fields(c: Dict[str, Any]) -> Dict[str, Any]:
         for s in segments if s.get("speaker") is not None
     ][:8]
     return {
-        "speaker_label": distinct_known[0],
+        "speaker_label": _resolve_speaker_display_name(distinct_known[0]),
         "speaker_segments": speaker_segments,
     }
 
@@ -689,7 +696,7 @@ def _structured_speaker_fields(c: Dict[str, Any]) -> Dict[str, Any]:
 # delivery. Independent of the engine VERSION string (which also moves for
 # non-formatter changes) and of SEGMENTATION_POLICY_VERSION (the optimizer's
 # scoring policy). SOC 2 CC8.1.
-FORMATTER_VERSION = 2
+FORMATTER_VERSION = 5
 
 
 def process_caption_job(
