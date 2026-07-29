@@ -451,6 +451,95 @@ def split_fast_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+# ─── (1b) NEIGHBOR TIME-DONATION ─────────────────────────────────────
+def donate_time_from_neighbors(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """CROSS-CUE TIMING REBALANCE — the genuine structural CPS reducer that
+    extend_fast_cues cannot be: when an over-CPS cue is boxed in by an adjacent
+    cue (no idle gap to grow into), but that NEIGHBOR is reading SLOWER than
+    target_cps (it has on-screen time to spare), MOVE the shared boundary so the
+    fast cue borrows the neighbor's surplus display time. Pure timing — no text
+    changes, no overlap, no new cue. This is NOT the impossible timing-neutral
+    single-cue split (that keeps each cue's window fixed): it changes each cue's
+    duration T by relocating a real boundary between two cues, which provably
+    lowers the fast cue's C/T while keeping the donor at/above target_cps.
+
+    Contract, per adjacent (donor, fast) or (fast, donor) pair:
+      • Same single speaker AND not an immutable boundary between them — a beat
+        of shared reading time may only move within one speaker's own turn,
+        never across a pause / speaker-change / authored wall.
+      • The donor must stay at or below target_cps AFTER donating (we never
+        rush the donor past its own comfortable reading speed to rescue a
+        neighbor — that just moves the violation).
+      • Each cue stays ≥ min_display and the min_gap is preserved.
+    Two directions, tried in order for each over-CPS cue: pull the boundary with
+    the NEXT cue earlier is impossible (that shortens the fast cue); instead we
+    (i) push the boundary with the PREVIOUS donor later is impossible too — so
+    the only physically meaningful donations are: borrow from the NEXT cue by
+    moving the fast→next boundary LATER (grows fast, shrinks next), or borrow
+    from the PREV cue by moving the prev→fast boundary EARLIER (grows fast,
+    shrinks prev). Both are applied here. SOC 2 CC8.1 / FCC 47 CFR §79.1."""
+    max_cps = _max_cps()
+    target_cps = _target_cps()
+    min_gap = _merge_gap_ms()
+    min_display = _min_display_ms()
+
+    def _speaker(c):
+        for r in ((c.get("meta") or {}).get("runs") or []):
+            if r.get("speaker") is not None:
+                return r.get("speaker")
+        return None
+
+    def _cps_at(cue, start_ms, end_ms):
+        dur = max(1, int(end_ms) - int(start_ms))
+        return _visible_chars(cue) / (dur / 1000.0)
+
+    for i, cue in enumerate(cues):
+        if cue.get("type") != "dialogue" or cue_cps(cue) <= max_cps:
+            continue
+        chars = _visible_chars(cue)
+        # The end_ms that would put THIS cue exactly at target_cps.
+        ideal_dur = int((chars / max(1, target_cps)) * 1000)
+
+        # ── Borrow from the NEXT cue: move the shared boundary LATER ──
+        nxt = cues[i + 1] if i + 1 < len(cues) else None
+        if (cue_cps(cue) > max_cps and nxt is not None
+                and nxt.get("type") == "dialogue"
+                and _speaker(nxt) == _speaker(cue)
+                and _speaker(cue) is not None
+                and not _is_immutable_boundary(cue, nxt)):
+            # New boundary sits between the fast cue's current end and the point
+            # where either the fast cue hits target OR the donor drops to target.
+            desired_end = cue["start_ms"] + ideal_dur
+            # Cap 1: donor must remain ≤ target_cps after losing head time.
+            donor_chars = _visible_chars(nxt)
+            donor_min_dur = int((donor_chars / max(1, target_cps)) * 1000)
+            donor_latest_start = int(nxt["end_ms"]) - max(donor_min_dur, min_display)
+            # Cap 2: keep min_gap between the moved boundary and the donor start.
+            new_boundary = min(desired_end, donor_latest_start - min_gap)
+            if new_boundary > cue["end_ms"] and new_boundary - cue["start_ms"] >= min_display:
+                cue["end_ms"] = int(new_boundary)
+                nxt["start_ms"] = int(new_boundary + min_gap)
+
+        # ── Still over? Borrow from the PREV cue: move that boundary EARLIER ──
+        prev = cues[i - 1] if i > 0 else None
+        if (cue_cps(cue) > max_cps and prev is not None
+                and prev.get("type") == "dialogue"
+                and _speaker(prev) == _speaker(cue)
+                and _speaker(cue) is not None
+                and not _is_immutable_boundary(prev, cue)):
+            desired_start = cue["end_ms"] - ideal_dur
+            donor_chars = _visible_chars(prev)
+            donor_min_dur = int((donor_chars / max(1, target_cps)) * 1000)
+            donor_earliest_end = int(prev["start_ms"]) + max(donor_min_dur, min_display)
+            new_boundary = max(desired_start, donor_earliest_end + min_gap)
+            if (new_boundary < cue["start_ms"]
+                    and cue["end_ms"] - new_boundary >= min_display
+                    and new_boundary - min_gap - prev["start_ms"] >= min_display):
+                cue["start_ms"] = int(new_boundary)
+                prev["end_ms"] = int(new_boundary - min_gap)
+    return cues
+
+
 # ─── (3) TRIM slow cues ──────────────────────────────────────────────
 def trim_slow_cues(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Trim trailing dead air from cues reading BELOW min_cps (lingering). Pull
@@ -664,6 +753,13 @@ def enforce_cps_rules(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
       1. LEGAL TIMING EXTENSION — extend_fast_cues stretches an over-fast cue into
          adjacent idle SILENCE toward target_cps, bounded by min_gap to the next
          cue. The primary free reducer applied here.
+      1b. NEIGHBOR TIME-DONATION — donate_time_from_neighbors moves the shared
+         boundary between an over-CPS cue and an adjacent SAME-SPEAKER cue that
+         is reading BELOW target_cps, so the fast cue borrows the slow neighbor's
+         surplus on-screen time (never across an immutable boundary, donor kept
+         at/above target, both cues ≥ min_display, min_gap preserved). This is the
+         genuine boundary-moving rebalance the timing-neutral split cannot be —
+         it changes each cue's window T, so it lowers C/T without touching text.
       2. CROSS-CUE REDISTRIBUTION / RESEGMENTATION over the larger word-timed
          window — services.sequence_optimizer (runs EARLIER in the formatter),
          which can move words across cue boundaries to rebalance local CPS. The
@@ -691,6 +787,7 @@ def enforce_cps_rules(cues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tests/test_split_fast_cues_viability.py (empirical sweep). SOC 2 CC8.1."""
     cues = split_overlong_cues(cues)
     cues = extend_fast_cues(cues)
+    cues = donate_time_from_neighbors(cues)
     cues = absorb_sliver_cues(cues)
     cues = trim_slow_cues(cues)
     for i, cue in enumerate(cues):
