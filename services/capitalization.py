@@ -80,6 +80,20 @@ except Exception:  # pragma: no cover
     def _is_cjk(text):
         return False
 
+# Immutable-boundary primitive — the SINGLE source of truth every composition
+# stage consults for "is the wall between these two cues immutable?" (speaker
+# change / hard inter-utterance pause / authored wall). The continuation tracker
+# below MUST honour it: a cue that opens across an immutable boundary is a new
+# sentence START, never a continuation of the previous cue — even when the
+# previous cue's text lacked terminal punctuation (a fused stutter like
+# "...Chest pass" with no period must NOT cause the next SPEAKER's "For..." to
+# be downcased). This closed the real-world A→B "for the town of..." defect.
+try:
+    from .boundaries import is_immutable_boundary as _is_immutable_boundary
+except Exception:  # pragma: no cover — defensive for alternate import roots
+    def _is_immutable_boundary(prev_cue, next_cue):
+        return False
+
 
 # Leading-label matcher — identical shape to condensation._strip_leading_label
 # so the two stages agree byte-for-byte on where a label ends and the body
@@ -408,7 +422,8 @@ def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, 
 
     prev_ended_sentence = True  # first dialogue cue starts a sentence
     prev_last_word = ""         # previous DIALOGUE cue's last word (abbrev guard)
-    stats = {"lowered": 0, "raised": 0, "line_synced": 0}
+    prev_cue = None             # previous DIALOGUE cue object (immutable-boundary check)
+    stats = {"lowered": 0, "raised": 0, "line_synced": 0, "boundary_starts": 0}
 
     for cue in cues:
         if cue.get("type") != "dialogue":
@@ -420,7 +435,20 @@ def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, 
         if not body.strip():
             continue
 
-        if prev_ended_sentence:
+        # IMMUTABLE-BOUNDARY OVERRIDE — a cue that opens across a hard wall
+        # (speaker change / inter-utterance pause / authored boundary) begins a
+        # NEW sentence, no matter what the previous cue's trailing punctuation
+        # was. Without this, a fused stutter ("...Chest pass" with no period)
+        # made the NEXT speaker's cue ("For the town...") read as a continuation
+        # and get downcased ("for the town..."). A speaker never continues the
+        # previous speaker's sentence. Deterministic; reads only bounded cue meta.
+        starts_new_sentence = prev_ended_sentence
+        if prev_cue is not None and _is_immutable_boundary(prev_cue, cue):
+            if not starts_new_sentence:
+                stats["boundary_starts"] += 1
+            starts_new_sentence = True
+
+        if starts_new_sentence:
             new_body = _capitalize_first_word(body)
             if new_body != body:
                 stats["raised"] += 1
@@ -442,7 +470,9 @@ def apply_sentence_capitalization(cues: List[Dict[str, Any]]) -> List[Dict[str, 
         _, fb = _split_label(final_body)
         prev_last_word = fb.split()[-1] if fb.split() else ""
         prev_ended_sentence = _ends_sentence(prev_last_word)
+        prev_cue = cue
 
     print(f"[CAPITALIZATION] lowered_continuations={stats['lowered']} "
-          f"raised_starts={stats['raised']} line_synced={stats['line_synced']}")
+          f"raised_starts={stats['raised']} line_synced={stats['line_synced']} "
+          f"boundary_sentence_starts={stats['boundary_starts']}")
     return cues
