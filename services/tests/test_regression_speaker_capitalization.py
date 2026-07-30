@@ -299,3 +299,25 @@ def test_reformat_makes_zero_openai_calls():
     result, chash = _run_reformat_once()
     assert result.get("cues"), "reformat produced no cues"
     assert chash
+
+
+# ─── DIAGNOSTIC — dump every delivered cue (always passes; prints to stdout) ──
+# Run with `-s` to see the output:
+#   python -m pytest services/tests/test_regression_speaker_capitalization.py \
+#       -k dump_delivered_cues -s
+# This is the ground-truth surface for the two label failures: it shows the
+# EXACT delivered lines + the structured speaker_label the engine produced for
+# every cue, so we can see whether render_lines emitted a label that suppression
+# then stripped, or never emitted one at all. Not a compliance assertion —
+# a debugging aid retained in the suite for reproducibility.
+def test_dump_delivered_cues(result):
+    print("\n===== DELIVERED CUES (regression fixture, alpha mode) =====")
+    for c in (result.get("cues") or []):
+        print(
+            f"idx={c.get('idx')} type={c.get('type')} "
+            f"speaker_label={c.get('speaker_label')!r} "
+            f"start={c.get('start_ms')} end={c.get('end_ms')} "
+            f"lines={c.get('lines')!r}"
+        )
+    print("===== END DELIVERED CUES =====\n")
+    assert True
