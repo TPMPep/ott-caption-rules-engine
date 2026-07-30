@@ -1,0 +1,126 @@
+{
+  "_readme": "FROZEN regression fixture for the FINAL-PRESENTATION-ORDER fix (formatter v6, 2026-07-30). Baseline-shaped input (same shape main.baseline_to_assembly_result consumes) that reproduces the exact production regression the operator flagged on project 6a1d3079d8c8f415659d45fd: (1) two separate 'Chest pass' utterances, the second WITHOUT terminal punctuation; (2) an A->B speaker change immediately after; (3) 'For the town of Everwood,' capitalized in the immutable baseline; (4) >=5 consecutive Speaker B cues; (5) an intervening music cue between two same-speaker B continuation cues; (6) a later change to Speaker C; (7) Speaker B returning afterward. Consumed by test_regression_speaker_capitalization.py via the REAL formatter path. Do NOT regenerate from engine output — this is a hand-authored specification.",
+  "transcript_id": "regression-speaker-cap-0001",
+  "language_code": "en",
+  "transcription_provider": "elevenlabs",
+  "transcription_model": "scribe_v2",
+  "audio_duration_sec": 40.0,
+  "audio_events": [
+    { "event_type": "music", "start": 20000, "end": 22000 }
+  ],
+  "utterances": [
+    {
+      "source_utterance_id": 0, "speaker": "A", "start": 240, "end": 1350,
+      "text": "That's it. Chest pass.",
+      "words": [
+        { "text": "That's", "start": 240, "end": 480, "speaker": "A", "confidence": 1 },
+        { "text": "it.", "start": 500, "end": 640, "speaker": "A", "confidence": 1 },
+        { "text": "Chest", "start": 800, "end": 1030, "speaker": "A", "confidence": 1 },
+        { "text": "pass.", "start": 1050, "end": 1350, "speaker": "A", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 1, "speaker": "A", "start": 2120, "end": 2630,
+      "text": "Chest pass",
+      "words": [
+        { "text": "Chest", "start": 2120, "end": 2329, "speaker": "A", "confidence": 1 },
+        { "text": "pass", "start": 2350, "end": 2630, "speaker": "A", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 2, "speaker": "B", "start": 2900, "end": 4140,
+      "text": "For the town of Everwood,",
+      "words": [
+        { "text": "For", "start": 2900, "end": 3000, "speaker": "B", "confidence": 1 },
+        { "text": "the", "start": 3020, "end": 3140, "speaker": "B", "confidence": 1 },
+        { "text": "town", "start": 3160, "end": 3420, "speaker": "B", "confidence": 1 },
+        { "text": "of", "start": 3440, "end": 3560, "speaker": "B", "confidence": 1 },
+        { "text": "Everwood,", "start": 3580, "end": 4140, "speaker": "B", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 3, "speaker": "B", "start": 4680, "end": 6070,
+      "text": "basketball is like kindling.",
+      "words": [
+        { "text": "basketball", "start": 4680, "end": 5180, "speaker": "B", "confidence": 1 },
+        { "text": "is", "start": 5200, "end": 5320, "speaker": "B", "confidence": 1 },
+        { "text": "like", "start": 5340, "end": 5540, "speaker": "B", "confidence": 1 },
+        { "text": "kindling.", "start": 5560, "end": 6070, "speaker": "B", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 4, "speaker": "B", "start": 6860, "end": 10200,
+      "text": "What happens on the court may be small.",
+      "words": [
+        { "text": "What", "start": 6860, "end": 7060, "speaker": "B", "confidence": 1 },
+        { "text": "happens", "start": 7080, "end": 7460, "speaker": "B", "confidence": 1 },
+        { "text": "on", "start": 7480, "end": 7600, "speaker": "B", "confidence": 1 },
+        { "text": "the", "start": 7620, "end": 7740, "speaker": "B", "confidence": 1 },
+        { "text": "court", "start": 7760, "end": 8080, "speaker": "B", "confidence": 1 },
+        { "text": "may", "start": 8100, "end": 8300, "speaker": "B", "confidence": 1 },
+        { "text": "be", "start": 8320, "end": 8460, "speaker": "B", "confidence": 1 },
+        { "text": "small.", "start": 8480, "end": 10200, "speaker": "B", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 5, "speaker": "B", "start": 10780, "end": 13280,
+      "text": "But it fuels a much larger fire.",
+      "words": [
+        { "text": "But", "start": 10780, "end": 10980, "speaker": "B", "confidence": 1 },
+        { "text": "it", "start": 11000, "end": 11120, "speaker": "B", "confidence": 1 },
+        { "text": "fuels", "start": 11140, "end": 11460, "speaker": "B", "confidence": 1 },
+        { "text": "a", "start": 11480, "end": 11560, "speaker": "B", "confidence": 1 },
+        { "text": "much", "start": 11580, "end": 11820, "speaker": "B", "confidence": 1 },
+        { "text": "larger", "start": 11840, "end": 12180, "speaker": "B", "confidence": 1 },
+        { "text": "fire.", "start": 12200, "end": 13280, "speaker": "B", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 6, "speaker": "B", "start": 14140, "end": 16720,
+      "text": "The Peak County Miners take their game seriously.",
+      "words": [
+        { "text": "The", "start": 14140, "end": 14300, "speaker": "B", "confidence": 1 },
+        { "text": "Peak", "start": 14320, "end": 14600, "speaker": "B", "confidence": 1 },
+        { "text": "County", "start": 14620, "end": 14980, "speaker": "B", "confidence": 1 },
+        { "text": "Miners", "start": 15000, "end": 15380, "speaker": "B", "confidence": 1 },
+        { "text": "take", "start": 15400, "end": 15620, "speaker": "B", "confidence": 1 },
+        { "text": "their", "start": 15640, "end": 15860, "speaker": "B", "confidence": 1 },
+        { "text": "game", "start": 15880, "end": 16180, "speaker": "B", "confidence": 1 },
+        { "text": "seriously.", "start": 16200, "end": 16720, "speaker": "B", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 7, "speaker": "B", "start": 22500, "end": 24800,
+      "text": "They ruled the state.",
+      "words": [
+        { "text": "They", "start": 22500, "end": 22760, "speaker": "B", "confidence": 1 },
+        { "text": "ruled", "start": 22780, "end": 23100, "speaker": "B", "confidence": 1 },
+        { "text": "the", "start": 23120, "end": 23260, "speaker": "B", "confidence": 1 },
+        { "text": "state.", "start": 23280, "end": 24800, "speaker": "B", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 8, "speaker": "C", "start": 25600, "end": 28200,
+      "text": "Coach says we start again tomorrow.",
+      "words": [
+        { "text": "Coach", "start": 25600, "end": 25980, "speaker": "C", "confidence": 1 },
+        { "text": "says", "start": 26000, "end": 26240, "speaker": "C", "confidence": 1 },
+        { "text": "we", "start": 26260, "end": 26400, "speaker": "C", "confidence": 1 },
+        { "text": "start", "start": 26420, "end": 26720, "speaker": "C", "confidence": 1 },
+        { "text": "again", "start": 26740, "end": 27060, "speaker": "C", "confidence": 1 },
+        { "text": "tomorrow.", "start": 27080, "end": 28200, "speaker": "C", "confidence": 1 }
+      ]
+    },
+    {
+      "source_utterance_id": 9, "speaker": "B", "start": 29000, "end": 31600,
+      "text": "Everwood never forgets a champion.",
+      "words": [
+        { "text": "Everwood", "start": 29000, "end": 29500, "speaker": "B", "confidence": 1 },
+        { "text": "never", "start": 29520, "end": 29820, "speaker": "B", "confidence": 1 },
+        { "text": "forgets", "start": 29840, "end": 30220, "speaker": "B", "confidence": 1 },
+        { "text": "a", "start": 30240, "end": 30320, "speaker": "B", "confidence": 1 },
+        { "text": "champion.", "start": 30340, "end": 31600, "speaker": "B", "confidence": 1 }
+      ]
+    }
+  ]
+}
