@@ -689,14 +689,52 @@ def _structured_speaker_fields(c: Dict[str, Any]) -> Dict[str, Any]:
 
 # FORMATTER PIPELINE VERSION — the deterministic-formatter generation. Bumped
 # when any DETERMINISTIC stage (segmentation → shaping → optimizer → readability
-# → condensation → timecode/italics/alignment → label suppression → sentence
-# capitalization → frame-grid → segmentation QC → export) changes in a way that
-# could alter delivered bytes. Pinned into every run's deterministic input tuple
-# (main.deterministic_inputs) so an auditor can prove which formatter produced a
-# delivery. Independent of the engine VERSION string (which also moves for
-# non-formatter changes) and of SEGMENTATION_POLICY_VERSION (the optimizer's
-# scoring policy). SOC 2 CC8.1.
-FORMATTER_VERSION = 5
+# → condensation → timecode/italics/alignment → final sequence reconsideration →
+# final CPL reflow → frame-grid → label suppression → sentence capitalization →
+# segmentation QC → export) changes in a way that could alter delivered bytes.
+# Pinned into every run's deterministic input tuple (main.deterministic_inputs)
+# so an auditor can prove which formatter produced a delivery. Independent of the
+# engine VERSION string (which also moves for non-formatter changes) and of
+# SEGMENTATION_POLICY_VERSION (the optimizer's scoring policy). SOC 2 CC8.1.
+#
+# v6 (2026-07-30): PRESENTATION-PASS ORDER FIX. Repeated-speaker-label
+# suppression + sentence-boundary capitalization now run LAST — AFTER the final
+# sequence reconsideration, the final delivered-fit CPL reflow, and frame-grid
+# normalization — so nothing can re-render a cue from meta.runs/meta.dialogue_text
+# and undo them (the regression that re-added suppressed [SPEAKER X:] labels and
+# downcased a new-sentence first word across a speaker boundary). The six
+# correctness-critical deterministic stages are now FAIL-CLOSED (a failure sets
+# review_required + export_blocked + a stable mandatory_stage_error code, never a
+# silent log-and-continue). Only the optional editorial-AI stage may fail open.
+FORMATTER_VERSION = 6
+
+# ─── Mandatory deterministic stages — fail-closed contract ───────────
+# These six stages are load-bearing for a shippable, spec-correct result. If any
+# ONE of them raises, the pipeline must NOT pretend the output is normal: the run
+# is marked review_required + export_blocked with a STABLE machine-readable code
+# (result.mandatory_stage_error). Only the optional editorial-AI polish (step 6)
+# may fail open — deterministic correctness stages may not. SOC 2 CC7.4 / CC8.1 /
+# FCC 47 CFR §79.1 — a correctness stage never silently degrades a deliverable.
+MANDATORY_STAGE_ERROR_CODES = {
+    "sequence_optimizer": "MANDATORY_STAGE_SEQUENCE_OPTIMIZER_FAILED",
+    "cpl_fit": "MANDATORY_STAGE_CPL_FIT_FAILED",
+    "frame_grid": "MANDATORY_STAGE_FRAME_GRID_FAILED",
+    "label_suppression": "MANDATORY_STAGE_LABEL_SUPPRESSION_FAILED",
+    "capitalization": "MANDATORY_STAGE_CAPITALIZATION_FAILED",
+    "segmentation_qc": "MANDATORY_STAGE_SEGMENTATION_QC_FAILED",
+}
+
+
+class MandatoryStageError(Exception):
+    """Raised when a mandatory deterministic stage fails. Carries the stable
+    machine-readable code so the run can be marked export_blocked with an
+    attributable reason instead of silently shipping a degraded result."""
+
+    def __init__(self, stage: str, cause: Exception):
+        self.stage = stage
+        self.code = MANDATORY_STAGE_ERROR_CODES.get(stage, "MANDATORY_STAGE_UNKNOWN_FAILED")
+        self.cause = cause
+        super().__init__(f"{self.code}: {cause}")
 
 
 def process_caption_job(
@@ -909,107 +947,168 @@ def process_caption_job(
     # emit one even if an earlier stage added it. Universal mechanism, per-spec flag.
     cues = _apply_no_formatting_tags(cues)
 
-    # 10c. first_occurrence_per_scene label suppression. render_lines is stateless
-    # per-cue so it labels EVERY cue; this single stateful post-pass strips the
-    # repeat labels so each speaker is labeled only on their first cue in the scene
-    # (MVP: whole output = one scene). No-op for every other label_mode. Runs AFTER
-    # readability (cues are final) and BEFORE QC so CPS/CPL grade the delivered text.
-    try:
-        from .rendering import suppress_repeat_speaker_labels
-        cues = suppress_repeat_speaker_labels(cues)
-    except Exception as _e:
-        print(f"[FORMATTER] label-suppression skipped (non-fatal): {_e}")
-
-    # 10d. SENTENCE-BOUNDARY CAPITALIZATION — the DETERMINISTIC final authority.
-    # Runs LAST (after every stage that could have split, merged, condensed, or
-    # AI-polished a cue) so the delivered text always has correct sentence-
-    # boundary casing regardless of whether the optional editorial-AI ran:
-    #   • a cue that CONTINUES the prior sentence keeps its first word lowercase
-    #     (proper-noun-safe — never downcases "I", an acronym, or a proven
-    #     proper noun), and
-    #   • a cue that STARTS a new sentence capitalizes its first word.
-    # This closes the two shaping/transcript casing defects (mid-sentence "This
-    # place" left capitalized after a split; a new sentence "you've" left
-    # lowercase) deterministically, with NO AI dependency. Idempotent. SOC 2
-    # CC8.1 — reproducible casing an auditor can re-derive.
-    try:
-        from .capitalization import apply_sentence_capitalization
-        cues = apply_sentence_capitalization(cues)
-    except Exception as _e:
-        print(f"[FORMATTER] sentence-capitalization skipped (non-fatal): {_e}")
-
-    # 10d.1 FINAL LOCAL RECONSIDERATION — condensation and repeat-label
-    # suppression run after the earlier optimizer pass and can change delivered
-    # geometry. Reconsider complete local windows once more before the final CPL
-    # fit so quote/phrase spans are rebalanced as a sequence, not split in
-    # isolation. Deterministic and idempotent.
-    try:
-        from .sequence_optimizer import optimize_cue_sequence
-        cues = optimize_cue_sequence(
-            cues, defer_timing_constraints=True, repair_hard_geometry_only=True)
-    except Exception as _e:
-        print(f"[FORMATTER] final local reconsideration skipped (non-fatal): {_e}")
-
-    # 10d.2 FINAL DELIVERED-FIT REFLOW — run the same deterministic shaper on
-    # the actual delivered text before timing projection.
-    try:
-        from .shaping import enforce_cpl_fit
-        cues = enforce_cpl_fit(cues)
-    except Exception as _e:
-        print(f"[FORMATTER] final delivered-fit reflow skipped (non-fatal): {_e}")
-
-    # 10d.3 FRAME-GRID NORMALIZATION — final generated boundaries are resolved
-    # against the immutable per-job frame policy before delivery validation.
-    try:
-        from .timing_grid import normalize_cue_timing
-        cues = normalize_cue_timing(cues)
-    except Exception as _e:
-        print(f"[FORMATTER] frame-grid normalization skipped (non-fatal): {_e}")
-
-    # 10e. SEGMENTATION QC — the canonical (production-authority) deterministic
-    # inspection + bounded remediation stage. Runs AFTER every deterministic
-    # transform that could change delivered text or timing (shaping → sequence
-    # optimizer → readability + CPS remediation → condensation → timecode/italics/
-    # alignment → label suppression → sentence capitalization) so it measures the
-    # cue exactly as the viewer sees it, and BEFORE general QC (step 11) + export
-    # serialization (step 12). It keeps TECHNICAL COMPLIANCE separate from WORKFLOW
-    # DISPOSITION: technical_violations always lists the raw failing rules; an
-    # unresolved hard defect additionally sets review_required + export_blocked.
-    # Its per-cue summaries + run rollup are carried on result.segmentation_qc for
-    # the Base44 ingester to persist verbatim — the ingester NEVER recomputes QC.
-    # SOC 2 CC7.4 (bounded, attributable auto-correction) / CC8.1.
+    # ═══════════════════════════════════════════════════════════════════════
+    # FINAL DETERMINISTIC PRESENTATION PIPELINE — STRICT, FAIL-CLOSED ORDER.
+    #
+    #   (A) final sequence reconsideration   →  optimize_cue_sequence(...)
+    #   (B) final delivered-fit CPL reflow    →  enforce_cpl_fit(cues)
+    #   (C) frame-grid normalization          →  normalize_cue_timing(cues)
+    #   (D) repeated-speaker-label suppression →  suppress_repeat_speaker_labels(cues)
+    #   (E) sentence-boundary capitalization   →  apply_sentence_capitalization(cues)
+    #   (F) segmentation QC                    →  run_segmentation_qc(cues, ...)
+    #   → general QC (step 11) → export (step 12)
+    #
+    # WHY THIS ORDER IS LOAD-BEARING (v6 fix, 2026-07-30):
+    # Stages (A) and (B) RE-RENDER cues from meta.runs / meta.dialogue_text (the
+    # optimizer resegments; enforce_cpl_fit / _split_cue_once call render_lines,
+    # which is stateless-per-cue and therefore re-adds a [SPEAKER X:] label to
+    # EVERY cue and rebuilds the split text). Running the two PRESENTATION passes
+    # — label suppression (D) and sentence capitalization (E) — BEFORE (A)/(B),
+    # as the pipeline previously did, let those re-renders silently UNDO them:
+    # suppressed labels came back on every same-speaker continuation cue, and a
+    # new-sentence first word ("For" across an A→B boundary) got downcased.
+    # (D) and (E) now run LAST, after every text/geometry-mutating stage, so
+    # NOTHING re-renders or reconstructs caption text after them. Both passes only
+    # ever SHORTEN a line (suppression strips a leading label) or recase ONE
+    # character (capitalization) — neither can create a new CPL overflow — so
+    # running them after the CPL reflow is geometry-safe. (F) then grades the
+    # EXACT delivered text the viewer sees. The structured speaker data in
+    # meta.runs is never mutated by (D) — only the delivered presentation label is
+    # suppressed, so audit + persistence keep full speaker identity.
+    #
+    # FAIL-CLOSED CONTRACT: (A)–(F) are mandatory deterministic correctness
+    # stages. A failure in any one raises MandatoryStageError, which the outer
+    # handler turns into review_required + export_blocked + a stable
+    # mandatory_stage_error code — never a silent log-and-continue. Only the
+    # optional editorial-AI polish (step 6, above) fails open.
+    # SOC 2 CC7.4 / CC8.1 / FCC 47 CFR §79.1.
+    # ═══════════════════════════════════════════════════════════════════════
+    mandatory_stage_error: Optional[str] = None
     seg_qc: Dict[str, Any] = {}
     try:
-        from .segmentation_qc import run_segmentation_qc
-        seg_qc = run_segmentation_qc(cues, {
-            "line_rules": {
-                "max_chars_per_line": max_chars,
-                "max_lines_per_caption": max_lines,
-                "min_gap_between_captions_ms": _merge_gap_ms(),
-                "min_caption_duration_ms": _min_display_ms(),
-            },
-            "reading_speed_rules": {
-                "max_cps": _max_cps(),
-                "cps_measurement": _env_str("CPS_MEASUREMENT", "characters") or "characters",
-            },
-            "protected_phrases": protected_phrases,
-            # TRANSIENT INPUT — the all-untimed linguistic groups detected in
-            # segmentation. Segmentation QC adjudicates each into ONE canonical
-            # UNRESOLVED_UNTIMED_CONTENT fail issue. This is the ONLY place the
-            # unresolved groups are consumed; they are NOT exposed on the result.
-            # Detection (segmentation) → adjudication (QC) → one canonical issue.
-            "unresolved_groups": unresolved_groups,
-        })
-        print(f"[FORMATTER] Segmentation QC: completeness="
-              f"{seg_qc.get('rollup', {}).get('segmentation_qc_completeness')} "
-              f"review_required={seg_qc.get('review_required')} "
-              f"export_blocked={seg_qc.get('export_blocked')}")
-    except Exception as _e:
-        # NEVER crash a job on the QC stage. Record an honest 'unavailable'
-        # verdict so the Base44 ingester marks the audit not-applicable (not
-        # failed) rather than silently shipping without a QC record.
-        print(f"[FORMATTER] segmentation QC skipped (non-fatal): {_e}")
-        seg_qc = {"error": str(_e)[:300], "segmentation_qc_policy_version": None}
+        # (A) FINAL LOCAL RECONSIDERATION — condensation + earlier passes can
+        # change delivered geometry. Reconsider complete local windows once more
+        # before the CPL fit so quote/phrase spans are rebalanced as a sequence,
+        # not split in isolation. Deterministic and idempotent. MANDATORY.
+        try:
+            from .sequence_optimizer import optimize_cue_sequence
+            cues = optimize_cue_sequence(
+                cues, defer_timing_constraints=True, repair_hard_geometry_only=True)
+        except Exception as _e:
+            raise MandatoryStageError("sequence_optimizer", _e)
+
+        # (B) FINAL DELIVERED-FIT CPL REFLOW — run the deterministic shaper on the
+        # actual delivered text (speaker label included) before timing projection.
+        # This is the LAST stage that may re-render / re-split a cue. MANDATORY.
+        try:
+            from .shaping import enforce_cpl_fit
+            cues = enforce_cpl_fit(cues)
+        except Exception as _e:
+            raise MandatoryStageError("cpl_fit", _e)
+
+        # (C) FRAME-GRID NORMALIZATION — resolve final generated boundaries
+        # against the immutable per-job frame policy before delivery validation.
+        # Pure timing (never touches text/labels/casing). MANDATORY.
+        try:
+            from .timing_grid import normalize_cue_timing
+            cues = normalize_cue_timing(cues)
+        except Exception as _e:
+            raise MandatoryStageError("frame_grid", _e)
+
+        # (D) REPEATED-SPEAKER-LABEL SUPPRESSION — turn-based, universal across
+        # every repeat-suppressing label mode (alpha / named /
+        # first_occurrence_per_scene / every_change). render_lines is stateless
+        # per-cue so it labels EVERY cue; this single stateful pass strips the
+        # repeat labels so a speaker is labeled only on the FIRST cue of an
+        # uninterrupted turn, and re-labeled the moment a different speaker
+        # speaks (a music/SFX cue between two same-speaker cues does NOT reset
+        # the turn). No-op for 'always' / 'dash' / 'none'. Only the delivered
+        # presentation label is suppressed — meta.runs speaker identity is
+        # untouched for audit + persistence. Runs AFTER (A)/(B)/(C) so nothing
+        # re-renders a suppressed label back on. MANDATORY when the selected mode
+        # requires suppression (the pass itself is a safe no-op otherwise).
+        try:
+            from .rendering import suppress_repeat_speaker_labels
+            cues = suppress_repeat_speaker_labels(cues)
+        except Exception as _e:
+            raise MandatoryStageError("label_suppression", _e)
+
+        # (E) SENTENCE-BOUNDARY CAPITALIZATION — the DETERMINISTIC final authority
+        # on casing, run IMMEDIATELY after label suppression and after every
+        # stage that could split/merge/condense/AI-polish/re-render a cue:
+        #   • a cue that CONTINUES the prior sentence keeps its first word
+        #     lowercase (proper-noun-safe — never downcases "I", an acronym, or a
+        #     proven proper noun), and
+        #   • a cue that STARTS a new sentence capitalizes its first word.
+        # A cue that opens across an IMMUTABLE boundary (speaker change / hard
+        # source pause / authored hard boundary / unknown-speaker review wall) is
+        # treated as a NEW sentence start — so "For the town of Everwood," stays
+        # capitalized across an A→B boundary even when the prior "Chest pass"
+        # lacked terminal punctuation. This flows entirely from the shared
+        # boundaries.is_immutable_boundary primitive, NOT a special-case phrase
+        # rule. Idempotent, no AI dependency. MANDATORY.
+        try:
+            from .capitalization import apply_sentence_capitalization
+            cues = apply_sentence_capitalization(cues)
+        except Exception as _e:
+            raise MandatoryStageError("capitalization", _e)
+
+        # (F) SEGMENTATION QC — the canonical (production-authority) deterministic
+        # inspection + bounded remediation stage. Runs AFTER both final
+        # presentation passes (D)+(E) so it measures the cue EXACTLY as the viewer
+        # sees it (suppressed labels + corrected casing), and BEFORE general QC
+        # (step 11) + export serialization (step 12). Keeps TECHNICAL COMPLIANCE
+        # separate from WORKFLOW DISPOSITION: technical_violations always lists the
+        # raw failing rules; an unresolved hard defect additionally sets
+        # review_required + export_blocked. Per-cue summaries + run rollup are
+        # carried on result.segmentation_qc for the Base44 ingester to persist
+        # verbatim — the ingester NEVER recomputes QC. MANDATORY: unlike before,
+        # a QC-stage failure is NO LONGER swallowed as 'not-applicable' — it
+        # fails closed, because shipping without a real QC verdict is exactly the
+        # silent-degradation this fix forbids. SOC 2 CC7.4 / CC8.1.
+        try:
+            from .segmentation_qc import run_segmentation_qc
+            seg_qc = run_segmentation_qc(cues, {
+                "line_rules": {
+                    "max_chars_per_line": max_chars,
+                    "max_lines_per_caption": max_lines,
+                    "min_gap_between_captions_ms": _merge_gap_ms(),
+                    "min_caption_duration_ms": _min_display_ms(),
+                },
+                "reading_speed_rules": {
+                    "max_cps": _max_cps(),
+                    "cps_measurement": _env_str("CPS_MEASUREMENT", "characters") or "characters",
+                },
+                "protected_phrases": protected_phrases,
+                # TRANSIENT INPUT — the all-untimed linguistic groups detected in
+                # segmentation. Segmentation QC adjudicates each into ONE canonical
+                # UNRESOLVED_UNTIMED_CONTENT fail issue. This is the ONLY place the
+                # unresolved groups are consumed; they are NOT exposed on the result.
+                # Detection (segmentation) → adjudication (QC) → one canonical issue.
+                "unresolved_groups": unresolved_groups,
+            })
+            print(f"[FORMATTER] Segmentation QC: completeness="
+                  f"{seg_qc.get('rollup', {}).get('segmentation_qc_completeness')} "
+                  f"review_required={seg_qc.get('review_required')} "
+                  f"export_blocked={seg_qc.get('export_blocked')}")
+        except Exception as _e:
+            raise MandatoryStageError("segmentation_qc", _e)
+
+    except MandatoryStageError as _mse:
+        # FAIL-CLOSED. A mandatory deterministic correctness stage failed. Do NOT
+        # ship as normal: mark the run review_required + export_blocked and stamp
+        # the stable machine-readable code so the Base44 ingester (and an auditor)
+        # can attribute the block from the row alone. The optional editorial-AI is
+        # the ONLY stage permitted to fail open. SOC 2 CC7.4 / CC8.1 / FCC §79.1.
+        mandatory_stage_error = _mse.code
+        print(f"[FORMATTER] MANDATORY STAGE FAILED — export blocked: {_mse.code}: {_mse.cause}")
+        seg_qc = {
+            "error": f"{_mse.code}: {str(_mse.cause)[:260]}",
+            "segmentation_qc_policy_version": None,
+            "review_required": True,
+            "export_blocked": True,
+            "mandatory_stage_error": _mse.code,
+        }
 
     # 11. QC
     qc = qc_report(cues_in_count, cues, protected_phrases)
@@ -1139,6 +1238,14 @@ def process_caption_job(
         # Condensation verdict counts — persisted onto CCFormatRun.summary by
         # the Base44 ingesters so the rewrite stage is never a black box.
         "condensation_stats": condensation_stats or None,
+        # FAIL-CLOSED signal. Non-null ONLY when a MANDATORY deterministic stage
+        # (final sequence reconsideration / CPL reflow / frame-grid / label
+        # suppression / capitalization / segmentation QC) failed. A stable
+        # machine-readable code (MANDATORY_STAGE_*). When present, the run is
+        # export_blocked + review_required — the deliverable is NOT shippable
+        # until the failure is resolved. Null on every healthy run. SOC 2 CC7.4 /
+        # CC8.1 — a correctness-stage failure is attributable, never silent.
+        "mandatory_stage_error": mandatory_stage_error,
         # NOTE: there is deliberately NO top-level unresolved_content /
         # unresolved_content_count / publishable / review_required field. An
         # all-untimed group is adjudicated into a canonical UNRESOLVED_UNTIMED_
