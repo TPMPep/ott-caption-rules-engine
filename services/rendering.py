@@ -640,14 +640,6 @@ def suppress_repeat_speaker_labels(
     boundaries = scene_boundary_idxs or set()
     prev_speaker = None          # last dialogue cue's speaker
 
-    # DIAGNOSTIC (no-op unless CC_DEBUG_SUPPRESS=1). Prints the turn-tracking
-    # decision for every cue so we can see, from the real engine, exactly why a
-    # speaker-change cue arrived with or without a bracket label. Gated so it is
-    # a true no-op in production. SOC 2 — never logs cue TEXT, only structure.
-    _dbg = (_rule_get("CC_DEBUG_SUPPRESS", "") or "").strip() in ("1", "true", "True")
-    if _dbg:
-        print("[SUPPRESS] mode=%s cues=%d" % (mode, len(cues)))
-
     def _strip_cue_label(cue: Dict[str, Any]) -> None:
         """Strip the leading bracket/paren label off this cue's lines and re-wrap
         the now-shorter text. Shortening can never overflow, so this is safe."""
@@ -664,21 +656,12 @@ def suppress_repeat_speaker_labels(
             # and must not break the turn run — skip without touching prev_speaker
             # so a music cue between two same-speaker lines doesn't spuriously
             # re-label the second one.
-            if _dbg:
-                print("[SUPPRESS] i=%d type=%s (skip, prev=%r)"
-                      % (i, cue.get("type"), prev_speaker))
             continue
         speaker = None
         for run in ((cue.get("meta") or {}).get("runs") or []):
             if run.get("speaker") is not None:
                 speaker = run.get("speaker")
                 break
-        if _dbg:
-            has_label = any(_line_has_bracket_label(l) for l in cue.get("lines", []))
-            print("[SUPPRESS] i=%d speaker=%r prev=%r same=%s has_label=%s runs=%r lines0=%r"
-                  % (i, speaker, prev_speaker, speaker == prev_speaker, has_label,
-                     (cue.get("meta") or {}).get("runs"),
-                     (cue.get("lines") or [""])[0][:24]))
         # A cue with no resolvable speaker carries no identity; leave it exactly
         # as rendered and don't let it advance the turn run.
         if speaker is None:
