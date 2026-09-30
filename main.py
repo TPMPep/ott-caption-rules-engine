@@ -34,9 +34,9 @@ A completed job carries:
   result._used_rules       — every env-driven rule value applied to this run.
 
 Auth:
-  If env var ENGINE_SHARED_SECRET is set, every POST/GET must carry
-  X-Engine-Secret header matching it. If unset (today's default), the
-  service is open — relies on the obscure Railway URL.
+  ENGINE_SHARED_SECRET is mandatory for every job and diagnostic request.
+  Missing configuration or an invalid X-Engine-Secret fails closed. Only the
+  liveness /health endpoint is public.
 
 Provider selection (auditor-grade default):
   Scribe v2 is the DEFAULT transcription provider for CC projects because it
@@ -75,10 +75,11 @@ from services.canonical_hash import canonical_sha256
 import json
 import hashlib
 import urllib.request
+from services.request_security import require_engine_secret, validate_url, safe_urlopen, admit_job
 
 # Bump this on every meaningful edit. /health reports it so Base44 can
 # verify a deploy landed without grepping Railway logs.
-VERSION = "5.42.0-final-presentation-order-failclosed"
+VERSION = "5.42.1-authenticated-egress-failclosed"
 
 app = FastAPI(title="OTT Caption Rules Engine", version=VERSION)
 
@@ -100,11 +101,7 @@ JOBS_LOCK = threading.Lock()
 # ─── Auth ───────────────────────────────────────────────────────────
 
 def _check_secret(x_engine_secret: Optional[str]) -> None:
-    expected = os.getenv("ENGINE_SHARED_SECRET", "").strip()
-    if not expected:
-        return  # open mode
-    if x_engine_secret != expected:
-        raise HTTPException(status_code=401, detail="invalid X-Engine-Secret")
+    require_engine_secret(x_engine_secret)
 
 
 # ─── Request Models ─────────────────────────────────────────────────
@@ -127,7 +124,7 @@ class CreateJobRequest(BaseModel):
     reformat_only: bool = False
     speakerLabels: bool = True
     languageDetection: bool = True
-    allowHttp: bool = True
+    allowHttp: bool = False
     captionRules: Optional[CaptionRules] = None
     captionOptions: Optional[Dict[str, Any]] = None
     env: Optional[Dict[str, Any]] = None
@@ -270,7 +267,7 @@ def fetch_baseline_json(baseline_url: str):
     evidence the original transcription produced.
     """
     req = urllib.request.Request(baseline_url, method="GET")
-    with urllib.request.urlopen(req, timeout=BASELINE_FETCH_TIMEOUT_SECONDS) as resp:
+    with safe_urlopen(req, timeout=BASELINE_FETCH_TIMEOUT_SECONDS) as resp:
         raw = resp.read(BASELINE_FETCH_MAX_BYTES + 1)
     if len(raw) > BASELINE_FETCH_MAX_BYTES:
         raise ValueError(
@@ -541,7 +538,7 @@ def fire_completion_callback(job_id: str, status: str) -> None:
                 "X-Callback-Secret": callback_secret,
             },
         )
-        with urllib.request.urlopen(req, timeout=CALLBACK_TIMEOUT_SECONDS) as resp:
+        with safe_urlopen(req, timeout=CALLBACK_TIMEOUT_SECONDS, kind="callback") as resp:
             print(f"[{job_id}] Completion callback → HTTP {resp.status} (status={status})")
     except Exception as e:
         # Swallow — the poller is the durable path. Log for observability only.
@@ -828,6 +825,16 @@ def create_job(payload: CreateJobRequest, x_engine_secret: Optional[str] = Heade
     else:
         if not payload_data.get("mediaUrl"):
             raise HTTPException(status_code=400, detail="mediaUrl is required for new transcription jobs")
+
+    try:
+        for field in ("mediaUrl", "baselineUrl"):
+            if payload_data.get(field):
+                validate_url(payload_data[field])
+        if payload_data.get("callbackUrl"):
+            validate_url(payload_data["callbackUrl"], kind="callback")
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    admit_job()
 
     created_at = utc_now()
     provider_transcript_id = payload_data.get("transcript_id")
